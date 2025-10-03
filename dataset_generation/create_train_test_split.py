@@ -57,11 +57,13 @@ def create_train_test_split(
     output_p.mkdir(exist_ok=True, parents=True)
 
     train_dataset = json.load(open(data_path))[:split_index]
+    print(f"Split train dataset into {len(train_dataset)} samples")
 
     train_key_embds = np.load(embedding_keys_path).astype("float32")[:split_index]
     train_value_embds = np.load(embeddings_values_path).astype("float32")[:split_index]
 
     test_dataset = json.load(open(data_path))[split_index:]
+    print(f"Split test dataset into {len(test_dataset)} samples")
 
     test_key_embds = np.load(embedding_keys_path).astype("float32")[split_index:]
     test_value_embds = np.load(embeddings_values_path).astype("float32")[split_index:]

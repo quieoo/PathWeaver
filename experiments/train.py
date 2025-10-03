@@ -27,7 +27,8 @@ from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
-
+import re
+import shutil
 LOGFORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOGFORMAT_RICH = "%(message)s"
 
@@ -70,7 +71,9 @@ parser.add_argument("--use_data_aug", action="store_true", help="Randomly pick t
 parser.add_argument("--use_lr_decay", action="store_true")
 parser.add_argument("--dataset_dir", type=str, default="synthetic_data")
 parser.add_argument("--model_dir_to_resume", type=str, default=None, help="Checkpoint directory to resume training")
-parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
+# parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
+parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+
 parser.add_argument("--hf_token", type=str,default=None,help="Huggingface token")
 parser.add_argument("--model_save_dir", type=str, default="output", help="Place to save the checkpoints")
 parser.add_argument("--kb_size", type=int, default=None, help="The size of the KB set size")
@@ -86,6 +89,7 @@ parser.add_argument("--verbose", action="store_true", help="Set logging to debug
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
 parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
+parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 # fmt: on
 
 
@@ -695,7 +699,7 @@ class Trainer:
                         self.accelerator.wait_for_everyone()
 
                         if self.accelerator.is_main_process:
-
+                            
                             self.logger.info("Saving checkpoint...")
                             self.logger.info("Making dirs...")
                             # Save model - using proper directory creation
@@ -726,6 +730,37 @@ class Trainer:
                             with open(config_path, 'w') as f:
                                 f.write(kb_config.to_json_string())
 
+                            # 删除旧的checkpoint
+                            self.logger.info("Removing old checkpoints...")
+
+                            # 获取所有checkpoint目录
+                            for item in self.output_path.iterdir():
+                                if item.is_dir():
+                                    # 匹配checkpoint目录名
+                                    match = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)", item.name)
+                                    if match:
+                                        old_step = int(match.group(1))
+                                        if old_step < step:
+                                            # 删除旧的模型checkpoint
+                                            try:
+                                                shutil.rmtree(item)
+                                                self.logger.info(f"Removed old model checkpoint: {item}")
+                                            except FileNotFoundError:
+                                                # 目录可能已被其他进程删除
+                                                self.logger.info(f"Old model checkpoint already removed: {item}")
+                                    
+                                    # 匹配encoder目录名
+                                    match_encoder = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)_encoder", item.name)
+                                    if match_encoder:
+                                        old_step = int(match_encoder.group(1))
+                                        if old_step < step:
+                                            # 删除旧的encoder checkpoint
+                                            try:
+                                                shutil.rmtree(item)
+                                                self.logger.info(f"Removed old encoder checkpoint: {item}")
+                                            except FileNotFoundError:
+                                                # 目录可能已被其他进程删除
+                                                self.logger.info(f"Old encoder checkpoint already removed: {item}")
                     except Exception as e:
                         self.logger.error(f"Error saving checkpoint: {e}")
                         self.logger.error(f"Error details: {str(e)}")
@@ -782,6 +817,8 @@ def main():
     hf_token = args.hf_token
     if not hf_token:
         hf_token = os.getenv("HF_TOKEN")
+
+    print(f"[DEBUG]: hf_token: {hf_token}")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -847,16 +884,20 @@ def main():
         dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}.json")))
 
     training_set = dataset[:N]
+    print(f"[INFO]: Loaded {N} samples from {dataset_name} for training")
 
     # Set up the LLM
     llm_model_spec = model_dir_to_resume if model_dir_to_resume else hf_model_spec
 
     resumed_step = 0 if not model_dir_to_resume else int(model_dir_to_resume.split("_")[-1])
 
+    if model_dir_to_resume:
+        print(f"[INFO]: Resuming from {model_dir_to_resume}, step: {resumed_step}")
     if llm_model_spec is None:
         raise ValueError("Either supply model_dir_to_resume or hf_model_spec")
 
-    if hf_token is None and args.llm_type == "llama3":
+    # 如果hf_model_spec不是本地路径，则需要检查hf_token
+    if hf_token is None and args.llm_type == "llama3" and not os.path.exists(llm_model_spec):
         raise ValueError("Please supply HuggingFace token(hf_token) when loading model Llama weights from HuggingFace")
 
     # Tokenizer comes from the base model
@@ -885,6 +926,7 @@ def main():
     else:
         ValueError(f"LLM type {args.llm_type} not recognised")
 
+    print(f"[INFO]: Initialised model {llm_model_spec}")
     logger.info(model.config)  # type: ignore
 
     model.eval()  # type: ignore
@@ -904,8 +946,15 @@ def main():
     )
 
     if model_dir_to_resume:
-        encoder.load_state_dict(torch.load(os.path.join(model_dir_to_resume, "encoder.pt")))
-        kb_config = KBLaMConfig.from_pretrained(os.path.join(model_dir_to_resume, "kb_config.json"))
+        encoder_path=os.path.join(model_dir_to_resume+"_encoder", "encoder.pt")
+        if not os.path.exists(encoder_path):
+            raise ValueError(f"[ERROR]: Encoder path {encoder_path} does not exist")
+        encoder.load_state_dict(torch.load(encoder_path))
+
+        kb_config_file=os.path.join(model_dir_to_resume, "kb_config_explicit.json")
+        if not os.path.exists(kb_config_file):
+            raise ValueError(f"[ERROR]: KB config file {kb_config_file} does not exist")
+        kb_config = KBLaMConfig.from_pretrained(kb_config_file)
     else:
         kb_config = KBLaMConfig(
             sep_query_head=sep_query_head,
@@ -913,6 +962,8 @@ def main():
         )
 
     encoder.train()
+
+    print(f"[INFO]: Initialised embedding encoder {encoder_spec}")
 
     kbretriever = KBRetriever(
         encoder,
@@ -922,6 +973,8 @@ def main():
     )
 
     logger.info("Model ready")
+
+    print(f"[INFO]: Retriever ready")
 
     # Get the training started
     llm_ckpt_name = f"{prefix_string}KeyFrom{key_embd_src}_{encoder_spec}_{dataset_name}_{llm_type}"
@@ -944,6 +997,8 @@ def main():
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")
 
+    print("[INFO]: Training started")
+
     trainer.train(
         training_set,
         B,
@@ -952,10 +1007,13 @@ def main():
         use_data_aug=use_data_aug,
         multi_entities=multi_entities,
         use_extended_qa=use_extended_qa,
-        save_period=3000,
+        save_period=args.save_period,
         resumed_step=resumed_step,
         kb_config=kb_config,
     )
+
+    # save model
+    trainer.save_state()
 
 
 if __name__ == "__main__":

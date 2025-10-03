@@ -20,7 +20,9 @@ from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
-from kblam.utils.data_utils import aug_row, generate_multi_entity_qa
+# from kblam.utils.data_utils import aug_row, generate_multi_entity_qa
+from kblam.utils.data_utils import generate_multi_entity_qa
+
 from kblam.utils.eval_utils import (
     instruction_prompts,
     instruction_prompts_multi_entities,
@@ -89,9 +91,9 @@ def perform_eval(
     eval_mode: str = "kb",
     kb_size: int = 250,
     seed: int = 1,
-    topk_size: int = -1,
     multi_entites: int = -1,
     remove_sorry: bool = False,
+    query_size: int = 250,
 ):
     np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
@@ -110,10 +112,7 @@ def perform_eval(
     full_outputs = []
     # answer_question
     subset_size = min(
-        400, len(test_kb)
-    )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    subset_size = min(
-        400, len(test_kb)
+        query_size, len(test_kb)
     )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
     # subset_size = 50
     for row in tqdm(test_kb[:subset_size]):
@@ -135,9 +134,11 @@ def perform_eval(
                 model,
                 Q,
                 kb=kb_embedding,
-                topk_size=topk_size,
                 kb_config=kb_config,
             ).split(Q)[1]
+            # 去除输出中的前两个换行符
+            model_output = model_output[2:]
+            # print(f"raw model output: {model_output}")
         elif eval_mode == "icl":
             if multi_entites != -1:
                 ins_prompt = instruction_prompts_multi_entities
@@ -333,6 +334,14 @@ parent_parser.add_argument(
 parent_parser.add_argument(
     "--kb_size", type=int, default=200, help="Size of the knowledge base"
 )
+
+parent_parser.add_argument(
+    "--query_size",
+    type=int,
+    default=100,
+    help="Number of queries to generate per KB entry",
+)
+
 parent_parser.add_argument(
     "--llm_base_dir",
     type=str,
@@ -552,8 +561,12 @@ def eval_generate():
     args = parser.parse_args()
 
     dataset_dir = args.dataset_dir
+
+    # adapter
     encoder_model_spec = args.encoder_spec
     encoder_path = args.encoder_dir
+
+
     eval_mode = args.eval_mode
     exp_config = args.exp_config_name
     kb_layer_frequency = args.kb_layer_frequency
@@ -565,6 +578,8 @@ def eval_generate():
     seed = args.seed
     test_dataset = args.test_dataset
     query_head_path = args.query_head_path
+
+    # embeddings 
     precomputed_embed_keys_path = args.precomputed_embed_keys_path
     precomputed_embed_values_path = args.precomputed_embed_values_path
 
@@ -597,8 +612,8 @@ def eval_generate():
         eval_mode,
         seed=seed,
         kb_size=kb_size,
-        topk_size=args.topk_size,
         multi_entites=args.multi_entites,
+        query_size=args.query_size,
     )
     mem_cost = torch.cuda.max_memory_reserved("cuda")
     score_results["mem_cost"] = mem_cost
@@ -711,7 +726,8 @@ def eval_accuracy(
     if not fancy_question:
         input_strs_gen = (dataset_subset[i]["Q"] for i in range(test_batch_size))
     else:
-        input_strs_gen = (aug_row(dataset_subset[i]) for i in range(test_batch_size))
+        # input_strs_gen = (aug_row(dataset_subset[i]) for i in range(test_batch_size))
+        print("ERROR: aug_row not implemented")
     input_strs = [format_func_map[llm_type](ex) for ex in input_strs_gen]
 
     tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(
