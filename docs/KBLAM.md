@@ -32,6 +32,12 @@ python generate_kb_embeddings.py \
     --model_name all-MiniLM-L6-v2 \
     --dataset_name synthetic --dataset_path ../datasets/synthetic.json \
     --output_path ../datasets/     
+
+
+python tools/1.embedding.py \
+    --dataset_name musique_train \
+    --model_name all-MiniLM-L6-v2 \
+    --dataset_path ./datasets/musique/train_6000.json
 ````
 
 1.1 训练集/测试集分割
@@ -73,6 +79,26 @@ nohup python train.py \
 # 最后生成两个文件夹：
     *_step_* 为模型保存的文件夹
     *_step_*_encoder 为encoder保存的文件夹
+
+
+
+nohup python train.py \
+  --seed 1 --N 1160 --B 10  --lr 5e-4 --total_steps 4800 \
+  --sep_query_head --use_cached_embd --use_lr_decay \
+  --dynamic_kb_size 10 100 --kb_token_layer_frequency 1 \
+  --encoder_spec all-MiniLM-L6-v2 --key_embd_src key \
+  --dataset_dir ../datasets/ --train_dataset multi_wiki_qa_train \
+  --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+  --model_save_dir ./train/multi_wiki_qa \
+  --gradient_accm_step 10 --save_period 100 \
+  --verbose \
+  > train.log 2>&1 &
+
+# train musique
+python train.py   --seed 1 --B 1  --lr 5e-4 --total_steps 4800   --sep_query_head --use_cached_embd --use_lr_decay   --kb_size -1 --kb_token_layer_frequency 1   --encoder_spec all-MiniLM-L6-v2 --key_embd_src key   --dataset_dir ../datasets/ --train_dataset musique_6000   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3   --model_save_dir ./train/musique   --gradient_accm_step 10 --save_period 1000   --verbose
+
+export CUDA_VISIBLE_DEVICES=3
+nohup python train.py   --seed 1 --B 1  --lr 5e-4 --total_steps 4800   --sep_query_head --use_cached_embd --use_lr_decay   --kb_size 1 --kb_token_layer_frequency 1   --encoder_spec all-MiniLM-L6-v2 --key_embd_src key   --dataset_dir ../datasets/ --train_dataset musique_6000   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3   --model_save_dir ./train/musique_kbsize1   --gradient_accm_step 10 --save_period 1000   --verbose > train_musique_kbsize1.log 2>&1 &
 ````
     参数：
         train_dataset: 训练数据集名称
@@ -106,23 +132,21 @@ nohup python train.py \
 3. 推理(eval.py)
     例如：
 ````bash
-python eval.py generation  --dataset_dir ../datasets/synthetic_embd  --encoder_dir /home/sdu/KBLaM/KBLaM/experiments/train/synthetic/stage1_lr_0.0005KBTokenLayerFreq3UseExtendedQAMultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_18000_encoder/encoder.pt  --encoder_spec all-MiniLM-L6-v2  --llm_base_dir /home/sdu/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3-8B --llm_type llama3  --model_dir /home/sdu/KBLaM/KBLaM/experiments/train/synthetic/stage1_lr_0.0005KBTokenLayerFreq3UseExtendedQAMultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_18000 --save_dir ./gen_output0  --seed 42  --test_dataset test_synthetic_augmented.json  --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy  --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy  --eval_mode kb --kb_size=100
-
 # 运行似乎需要开启代理:Downloading package wordnet to /home/sdu/nltk_data...
-
+# 新增参数 query_size, seed (-1代表不随机)
 python eval.py generation \
     --eval_mode kb --kb_size=100 \
     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec all-MiniLM-L6-v2 \
     --encoder_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt \
     --model_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700 \
-    --kb_layer_frequency 1 --kb_scale_factor 100 \
+    --kb_layer_frequency 1 --kb_scale_factor 1 \
     --dataset_dir ../datasets/synthetic_embd \
     --test_dataset test_synthetic.json \
     --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
     --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
-    --query_size 10 \
-    --save_dir ./gen_output0
+    --query_size 10 --seed -1 \
+    --save_dir ./gen_output1_kbscale1
 ````
 
     参数：
@@ -148,8 +172,171 @@ python eval.py generation \
         
         
         
+# 准确率分析
+````bash
+# 新增参数 query_size=10, seed (-1代表不随机)
+python eval.py generation \
+    --eval_mode kb --kb_size=20 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt \
+    --model_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700 \
+    --kb_layer_frequency 1 --kb_scale_factor 1 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 10 --seed -1 \
+    --save_dir ./gen_output_kbscale1
+````
+## seperate query head
+结论：开启或者关闭query head分离，准确率基本无变化
 
-    
+开启query head分离之后，输出中会包含很多"sorry。。。"，如下：
+````
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The description of Boltzmann's Bastion is a luxury yacht offering private charters and premium services.
+-------
+Model output: The objectives of Boltzmann's Bastion is provide comfortable and unique accommodations, promote sustainability, and attract guests.
+True answer: The objectives of Boltzmann's Bastion is provide exceptional service, ensure guest comfort, and offer unique experiences.
+-------
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The purpose of Boltzmann's Bastion is to create an unforgettable maritime adventure.
+````
+
+关闭query head分离之后，输出中虽然没有"sorry"，但是会输出一些与正确结果差异较大的结果，如下：
+````
+Model output:  The purpose of Boltzmann’s Bastion is a vibrant cultural hub.
+True answer: The description of Boltzmann's Bastion is a luxury yacht offering private charters and premium services.
+-------
+Model output: The objectives of the Viking Harbor is to offer a rich maritime experience.
+True answer: The objectives of Boltzmann's Bastion is provide exceptional service, ensure guest comfort, and offer unique experiences.
+-------
+Model output:  The objectives of the Heritage Site is to showcase the beauty of the Mediterranean.
+True answer: The purpose of Boltzmann's Bastion is to create an unforgettable maritime adventure.
+````
+
+## kb scale factor
+
+结论： 
+0的话相当于关闭知识库，使用原始模型进行推理，因此会输出”can't find information"
+1是允许输入的最小整数，相对的准确率最高
+之后随着kbsf的值增大，准确率会下降，当达到10000的时候，输出基本变得没有意义
+(不过实验使用的kb size为20，事实上随着kb size增大，整体精度都会下降，此时kbsf的影响会怎样暂时未知)
+kbsf    f1_score    recall (1-sorry_ratio)
+0         0.47       I don't have information
+1         0.85       0.9
+10        0.77       0.7
+100       0.74       0.7
+1000      0.71       0.6
+10000     0.28       nonesense output
 
 
+## unstructured answer
+````bash
+python eval.py generation \
+    --eval_mode kb --kb_size=20 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt \
+    --model_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700 \
+    --kb_layer_frequency 1 --kb_scale_factor 1 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 10 --seed -1 \
+    --save_dir ./gen_output_kbscale1_natural
+````
 
+结论：使用非结构化问题，准确率会轻微下降；输出结果仍旧有原来的结构化输出格式风格为主
+
+
+使用原本的结构化的问题：
+````
+Question: What is the description of Boltzmann's Bastion?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The description of Boltzmann's Bastion is a luxury yacht offering private charters and premium services.
+-------
+Question: What is the objectives of Boltzmann's Bastion?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The objectives of Boltzmann's Bastion is provide exceptional service, ensure guest comfort, and offer unique experiences.
+-------
+Question: What is the purpose of Boltzmann's Bastion?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The purpose of Boltzmann's Bastion is to create an unforgettable maritime adventure.
+-------
+Question: What is the description of Ampère's Alcove?
+Model output: The description of Ampère's Alcove is a cozy café with a variety of artisanal coffees and pastries.
+True answer: The description of Ampère's Alcove is a cozy café with a focus on artisanal coffee and pastries.
+-------
+Question: What is the objectives of Ampère's Alcove?
+Model output: The objectives of Ampère's Alcove is provide delicious food, support local vendors, and create a welcoming atmosphere.
+True answer: The objectives of Ampère's Alcove is provide delicious food and drinks, ensure a welcoming atmosphere, and support local suppliers.
+-------
+Question: What is the purpose of Ampère's Alcove?
+Model output: The purpose of Ampère's Alcove is to create a relaxing environment for guests to unwind and enjoy.
+True answer: The purpose of Ampère's Alcove is to create a relaxing and enjoyable café experience.
+-------
+Question: What is the description of Gauss' Gallery?
+Model output: The description of Gauss' Gallery is a high-end fashion boutique with exclusive designer collections.
+True answer: The description of Gauss' Gallery is a high-end fashion boutique with exclusive designer collections.
+-------
+Question: What is the objectives of Gauss' Gallery?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The objectives of Gauss' Gallery is provide exceptional service, offer unique products, and ensure customer satisfaction.
+-------
+Question: What is the purpose of Gauss' Gallery?
+Model output: The purpose of Gauss' Gallery is to cater to fashion enthusiasts and luxury shoppers.
+True answer: The purpose of Gauss' Gallery is to cater to fashion enthusiasts and provide a premium shopping experience.
+-------
+Question: What is the description of Euler's Edifice?
+Model output: The description of Euler's Edifice is a luxury resort with spa services and outdoor activities. Relax and recharge.
+True answer: The description of Euler's Edifice is a luxury spa resort with a focus on wellness and relaxation.
+-------
+
+````
+转换成非结构化问题之后：
+````
+Question: Can you tell me what Boltzmann’s Bastion is like?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The description of Boltzmann's Bastion is a luxury yacht offering private charters and premium services.
+-------
+Question: What are the main goals or objectives of Boltzmann’s Bastion?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The objectives of Boltzmann's Bastion is provide exceptional service, ensure guest comfort, and offer unique experiences.
+-------
+Question: What’s the main purpose of Boltzmann’s Bastion?
+Model output: The main purpose of Boltzmann's Bastion is to offer a unique and adventurous experience.
+True answer: The purpose of Boltzmann's Bastion is to create an unforgettable maritime adventure.
+-------
+Question: How would you describe Ampère’s Alcove?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The description of Ampère's Alcove is a cozy café with a focus on artisanal coffee and pastries.
+-------
+Question: What are the objectives or aims of Ampère’s Alcove?
+Model output: The objectives of Ampère’s Alcove is provide delicious food, support local vendors, and create a welcoming atmosphere.
+True answer: The objectives of Ampère's Alcove is provide delicious food and drinks, ensure a welcoming atmosphere, and support local suppliers.
+-------
+Question: What’s the purpose of Ampère’s Alcove?
+Model output: The purpose of Ampère’s Alcove is to create a relaxing and enjoyable dining experience.
+True answer: The purpose of Ampère's Alcove is to create a relaxing and enjoyable café experience.
+-------
+Question: What kind of place is Gauss’ Gallery?
+Model output: The description of Gauss’ Gallery is a high-end fashion boutique with exclusive designer collections.
+True answer: The description of Gauss' Gallery is a high-end fashion boutique with exclusive designer collections.
+-------
+Question: What are Gauss’ Gallery’s main objectives or goals?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The objectives of Gauss' Gallery is provide exceptional service, offer unique products, and ensure customer satisfaction.
+-------
+Question: What’s the main purpose of Gauss’ Gallery?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The purpose of Gauss' Gallery is to cater to fashion enthusiasts and provide a premium shopping experience.
+-------
+Question: How would you describe Euler’s Edifice?
+Model output: I am sorry I cannot find relevant information in the KB.
+True answer: The description of Euler's Edifice is a luxury spa resort with a focus on wellness and relaxation.
+-------
+
+````
