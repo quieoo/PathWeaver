@@ -61,7 +61,7 @@ logging.basicConfig(
 # fmt: off
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=1)
-parser.add_argument("--train_dataset",type=str,default="synthetic")
+parser.add_argument("--dataset_type",type=str,default="synthetic")
 parser.add_argument("--N", type=int, default=120000, help="Size of training set, select the first N samples for training")
 parser.add_argument("--B", type=int, default=10, help="Batch size")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -526,7 +526,7 @@ def get_prefix_str(args):
     return prefix_string
 
 # 加载缓存的KB embedding
-def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_name: str, key_embd_src: str):
+def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, key_embd_src: str):
     if encoder_model_spec == "OAI":
         encoder_model_spec_str = "oai"
     else:
@@ -534,7 +534,6 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_n
     key_embds = np.load(
         os.path.join(
             dataset_dir,
-            dataset_name,
             f"{encoder_model_spec_str}_embd_{key_embd_src}.npy",
         )
     ).astype("float32")
@@ -543,7 +542,6 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_n
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                dataset_name,
                 f"{encoder_model_spec_str}_embd_answer.npy",
             )
         ).astype("float32")
@@ -551,7 +549,6 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_n
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                dataset_name,
                 f"{encoder_model_spec_str}_embd_value.npy",
             )
         ).astype("float32")
@@ -1235,7 +1232,7 @@ def main():
         logger.setLevel(logging.INFO)
 
     print(vars(args))
-    dataset_name = args.train_dataset
+    dataset_name = args.dataset_type
     seed = args.seed
     N = args.N
     B = args.B
@@ -1327,7 +1324,8 @@ def main():
         # We load the pre-computed version stored on the disk rather
         # than computing them on the fly to make things faster
         logger.info(f"Using pre-computed {encoder_spec} embedding")
-        key_embds, value_embds = _load_cached_embeddings(encoder_spec, dataset_dir, dataset_name, key_embd_src)
+        key_embds, value_embds = _load_cached_embeddings(encoder_spec, dataset_dir, key_embd_src)
+
 
     prefix_string = get_prefix_str(args)
     logger.info(f"Experiment prefix {get_prefix_str(args)}")
@@ -1342,7 +1340,7 @@ def main():
                 dataset = [json.loads(line.strip()) for line in f]
         elif "musique" in dataset_name:
             # search for dataset file: end with "json", include "train"
-            dataset_path = glob.glob(os.path.join(dataset_dir, dataset_name, "*train*.json"))[0]
+            dataset_path = glob.glob(os.path.join(dataset_dir, "*train*.json"))[0]
             print(f"[INFO]: Using dataset file {dataset_path}")
             with open(dataset_path, "r", encoding="utf-8") as f:
                 dataset = json.load(f)

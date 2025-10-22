@@ -9,7 +9,6 @@ export CUDA_VISIBLE_DEVICES=1
 export HF_ENDPOINT=https://hf-mirror.com
 ````
 
-
 0. 生成三元组
     json文件（例如enron.json)，每条包含以下内容:
      name, description_type, description
@@ -99,6 +98,8 @@ python train.py   --seed 1 --B 1  --lr 5e-4 --total_steps 4800   --sep_query_hea
 
 export CUDA_VISIBLE_DEVICES=3
 nohup python train.py   --seed 1 --B 1  --lr 5e-4 --total_steps 4800   --sep_query_head --use_cached_embd --use_lr_decay   --kb_size 1 --kb_token_layer_frequency 1   --encoder_spec all-MiniLM-L6-v2 --key_embd_src key   --dataset_dir ../datasets/ --train_dataset musique_6000   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3   --model_save_dir ./train/musique_kbsize1   --gradient_accm_step 10 --save_period 1000   --verbose > train_musique_kbsize1.log 2>&1 &
+
+nohup python train.py   --seed 1 --B 1  --lr 5e-4 --total_steps 6000   --sep_query_head --use_cached_embd --use_lr_decay   --kb_size 1 --kb_token_layer_frequency 8   --encoder_spec all-MiniLM-L6-v2 --key_embd_src key   --dataset_dir ../datasets/ --train_dataset musique_6000   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3   --model_save_dir ./train/musique_kbsize1_6000   --gradient_accm_step 10 --save_period 100   --verbose > train_musique_kbsize1_v4.log 2>&1 &
 ````
     参数：
         train_dataset: 训练数据集名称

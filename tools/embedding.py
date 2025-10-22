@@ -14,7 +14,7 @@ def parser_args():
         default="text-embedding-3-large",
         choices=["all-MiniLM-L6-v2", "text-embedding-3-large", "ada-embeddings", "text-embedding-v4"],
     )
-    parser.add_argument("--dataset_name", type=str, default="synthetic_data")
+    parser.add_argument("--dataset_type", type=str, default="synthetic_data")
     parser.add_argument("--endpoint_url", type=str)
     parser.add_argument("--api_key", type=str)
     parser.add_argument(
@@ -53,7 +53,7 @@ if __name__ == "__main__":
     key_strings = []
     value_strings = []
     
-    if args.dataset_name == "multi_wiki_qa_train":
+    if args.dataset_type == "multi_wiki_qa_train":
         sid=0
         reformatted_data = []
 
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 
         with open(args.dataset_path, "w", encoding="utf-8") as f:
             f.write("\n".join(reformatted_data))
-    elif args.dataset_name == "musique_train":
+    elif args.dataset_type == "musique":
         sid=0
         reformatted_data = []
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
                     "answer_aliases": sample["answer_aliases"],
                     "answerable": sample["answerable"],
                 })
-        with open("new_dataset.json", 'w') as f:
+        with open(args.dataset_path, 'w') as f:
             json.dump(reformatted_data, f, indent=4, ensure_ascii=False)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset_name}")                

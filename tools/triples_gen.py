@@ -7,6 +7,7 @@ import argparse
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 from triple_extraction_prompt import TRIPLE_INSTRUCTIONS,stage_to_prompt_type
+import os, time
 
 
 def create_batch_instructions(batch_data, inst_type):
@@ -27,7 +28,6 @@ def generate_and_format(model, contexts, batch_size, triplet_inst_id=1):
         max_tokens=512, 
         stop=["\n\n", "}\n\n", "]", "]\n"]  # Stop at common JSON endings
     )
-
 
     total_batches = (len(contexts) + batch_size - 1) // batch_size
     
@@ -130,148 +130,88 @@ def dedup_triples(triples_in_paragraph):
     return merged_triples
 
 
-def process_musique(llm, data_path, batch_size, model_name, num_sample=-1):
+
+
+def process_musique(llm, data_path, batch_size, model_name, num_sample=-1, start_idx=0, save_every=-1):
+    """
+    改进版：按 save_every 分块生成三元组，每块单独保存，避免长时间运行丢失。
+    """
+    # --- 1️⃣ 加载数据 ---
     data = []
     with open(data_path, 'r') as f:
         for line in f:
             if line.strip():
                 data.append(json.loads(line))
-    
-    print(f"Total number of samples: {len(data)}")
 
-    if num_sample > 0:
-        data=data[:num_sample]
+    total_data = len(data)
+    print(f"Total number of samples in file: {total_data}")
 
-    all_contexts = []  
-    sample_paragraph_counts = []  
-    
-    # --- Flatten all paragraphs ---
-    for sample in data:
-        paragraphs = sample['paragraphs']
-        sample_paragraph_counts.append(len(paragraphs))
-        all_contexts.extend([paragraph['paragraph_text'] for paragraph in paragraphs])
-
-    inst_id=6
-    triples_results = generate_and_format(llm, all_contexts, batch_size, inst_id)
-
-    print(f"Total number of triples: {len(triples_results)}")
-
-    output = []
-    triple_index = 0
-    
-    for i, sample in enumerate(data):
-        sample_id = sample.get('id', i) 
-        paragraphs_data = []
-
-        for j in range(sample_paragraph_counts[i]):
-            triples_in_paragraph = triples_results[triple_index] if triple_index < len(triples_results) else []
-            triples_in_paragraph=dedup_triples(triples_in_paragraph)
-
-            paragraphs_data.append({
-                "paragraph_id": j,
-                "paragraph_text": sample["paragraphs"][j]["paragraph_text"],
-                "triples": triples_in_paragraph,
-            })
-            triple_index += 1
-            
-        output.append({
-            "sample_id": sample_id,
-            "paragraphs": paragraphs_data
-        })
-    
-    suffix_str=f"_triple_{model_name}_inst{str(inst_id)}_num_sample{str(num_sample)}.json"
-    output_path = data_path.replace(".jsonl", suffix_str)
-    with open(output_path, 'w') as f:
-        json.dump(output, f, indent=4, ensure_ascii=False)
-
-
-# TODO:fix
-def process_musique_on_save(
-    llm, data_path, batch_size, model_name, num_sample=-1, save_every=1
-):
-    data = []
-    with open(data_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                data.append(json.loads(line))
-    print(f"Total number of samples: {len(data)}")
-
+    # --- 2️⃣ 应用样本范围 ---
     if num_sample > 0:
         data = data[:num_sample]
+    data = data[start_idx:]
 
-    # --- flatten all paragraphs ---
-    all_contexts = []
-    sample_paragraph_counts = []
-    for sample in data:
-        paragraphs = sample["paragraphs"]
-        sample_paragraph_counts.append(len(paragraphs))
-        all_contexts.extend([p["paragraph_text"] for p in paragraphs])
+    total_to_process = len(data)
+    print(f"Processing samples from index {start_idx} to {start_idx + total_to_process}")
 
-    inst_id = 6
-    total_batches = (len(all_contexts) + batch_size - 1) // batch_size
-    print(f"Total batches to process: {total_batches}")
+    # --- 3️⃣ 设定 save_every ---
+    if save_every <= 0 or save_every > total_to_process:
+        save_every = total_to_process
+    print(f"Each chunk will process {save_every} samples before saving.")
 
-    output = []
-    triple_index = 0
-    processed_batches = 0
-    accumulated_paragraphs = 0
+    # --- 4️⃣ 分块循环 ---
+    for chunk_start in range(0, total_to_process, save_every):
+        chunk_end = min(chunk_start + save_every, total_to_process)
+        sub_data = data[chunk_start:chunk_end]
 
-    for batch_start in tqdm(range(0, len(all_contexts), batch_size), desc="Processing batches"):
-        batch_end = min(batch_start + batch_size, len(all_contexts))
-        batch_contexts = all_contexts[batch_start:batch_end]
-        processed_batches += 1
+        all_contexts = []
+        sample_paragraph_counts = []
 
-        # --- Generate triples for this batch ---
-        triples_results = generate_and_format(llm, batch_contexts, batch_size, inst_id)
+        # --- 扁平化段落 ---
+        for sample in sub_data:
+            paragraphs = sample['paragraphs']
+            sample_paragraph_counts.append(len(paragraphs))
+            all_contexts.extend([p['paragraph_text'] for p in paragraphs])
 
-        # --- Attach triples back to their samples ---
-        for i, sample in enumerate(data):
-            print(f"Periodicly printing progress: {processed_batches}/{total_batches}")
-            sample_id = sample.get("id", i)
+        inst_id = 6
+        print(f"[Chunk {chunk_start}-{chunk_end}] Total paragraphs: {len(all_contexts)}")
+
+        # --- 调用生成 ---
+        triples_results = generate_and_format(llm, all_contexts, batch_size, inst_id)
+        print(f"Generated triples for {len(triples_results)} paragraphs.")
+
+        # --- 构造输出 ---
+        output = []
+        triple_index = 0
+
+        for i, sample in enumerate(sub_data):
+            sample_uid = sample.get('id', i + start_idx + chunk_start)
             paragraphs_data = []
+
             for j in range(sample_paragraph_counts[i]):
-                if triple_index < len(triples_results):
-                    triples_in_paragraph = triples_results[triple_index]
-                    triple_index += 1
-                else:
-                    triples_in_paragraph = []
-
-                # Deduplicate per paragraph
-                before = len(triples_in_paragraph)
+                triples_in_paragraph = triples_results[triple_index] if triple_index < len(triples_results) else []
                 triples_in_paragraph = dedup_triples(triples_in_paragraph)
-                after = len(triples_in_paragraph)
-                if before != after:
-                    print(f"[Dedup] Sample {sample_id}, Paragraph {j}: {before}→{after}")
+                paragraphs_data.append({
+                    "paragraph_id": j,
+                    "paragraph_text": sample["paragraphs"][j]["paragraph_text"],
+                    "triples": triples_in_paragraph
+                })
+                triple_index += 1
 
-                paragraphs_data.append(
-                    {
-                        "paragraph_id": j,
-                        "paragraph_text": sample["paragraphs"][j]["paragraph_text"],
-                        "triples": triples_in_paragraph,
-                    }
-                )
-            output.append({"sample_id": sample_id, "paragraphs": paragraphs_data})
+            output.append({
+                "sample_id": sample_uid,
+                "paragraphs": paragraphs_data
+            })
 
-        accumulated_paragraphs += len(batch_contexts)
+        # --- 保存结果 ---
+        suffix_str = f"_triple_{model_name}_inst{inst_id}_{chunk_start+start_idx}_{chunk_end+start_idx}.json"
+        output_path = data_path.replace(".jsonl", suffix_str)
+        with open(output_path, 'w') as f:
+            json.dump(output, f, indent=4, ensure_ascii=False)
 
-        # --- Periodic save ---
-        if processed_batches % save_every == 0:
-            partial_path = data_path.replace(
-                ".json",
-                f"_partial_batch{processed_batches}_triple_{model_name}_inst{inst_id}.json",
-            )
-            with open(partial_path, "w", encoding="utf-8") as f:
-                json.dump(output, f, indent=4, ensure_ascii=False)
-            print(f"[Checkpoint Saved] {partial_path} (Processed {accumulated_paragraphs} paragraphs)")
+        print(f"✅ Saved chunk {chunk_start}-{chunk_end} → {output_path}")
 
-    # --- Final save ---
-    suffix_str = f"_triple_{model_name}_inst{inst_id}_num_sample{num_sample}.json"
-    output_path = data_path.replace(".json", suffix_str)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=4, ensure_ascii=False)
-
-    print(f"[Final Saved] {output_path}")
-    return output
+    print("🎯 All chunks processed successfully.")
 
 
 if __name__ == "__main__":
@@ -281,7 +221,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True, help="path of local model")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--num_sample", type=int, default=-1, help="number of samples to process")
-    
+    parser.add_argument("--start_from", type=int, default=0, help="start from which sample")
+    parser.add_argument("--save_every", type=int, default=-1, help="save every n samples")
     args = parser.parse_args()
     llm = LLM(
         model=args.model_path,
@@ -291,7 +232,7 @@ if __name__ == "__main__":
     )
 
     if args.dataset_type == "musique":
-        process_musique(llm, args.dataset_path, args.batch_size, args.model_path.split('/')[-1], args.num_sample)
+        process_musique(llm, args.dataset_path, args.batch_size, args.model_path.split('/')[-1], args.num_sample, args.start_from, args.save_every)
     else:
         print(f"Unsupported dataset type: {args.dataset_type}")
 
@@ -300,3 +241,5 @@ if __name__ == "__main__":
 
 
 # nohup python 0.triples_gen.py --dataset_path /mnt/n0/datasets/MuSiQue/musique_ans_v1.0_train.jsonl  --dataset_type musique --model_path /mnt/n0/models/llama3_8B_instruct --batch_size 20 --num_sample 6000 > triple.log 2>&1 &
+
+# nohup python 0.triples_gen.py --dataset_path /mnt/n0/datasets/MuSiQue/musique_ans_v1.0_train.jsonl  --dataset_type musique --model_path /mnt/n0/models/llama3_8B_instruct --batch_size 20 --start_from 6000 --save_every 1000 > triple_v2.log 2>&1 &
