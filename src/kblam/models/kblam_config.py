@@ -6,7 +6,7 @@ class KBLaMConfig(PretrainedConfig):
         self,
         base_model_name_or_path: str = "",
         kb_layer_frequency: int = 3,
-        kb_scale_factor: int | None = None,
+        kb_scale_factor: float | None = None,
         top_k_kb: int = 100,
         dynamic_sparsify: bool = False,
         sep_query_head: bool = False,

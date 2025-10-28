@@ -169,3 +169,4 @@ datasets/
 wandb/
 gen_output*
 experiments/train/*
+experiments/attn*

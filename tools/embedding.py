@@ -23,9 +23,16 @@ def parser_args():
         required=True,
         help="Path to the dataset in JSON format.",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=100,
+        help="Batch size for computing embeddings.",
+    )
 
     args = parser.parse_args()
     return args
+
 
 
 def compute_embeddings(
@@ -115,8 +122,8 @@ if __name__ == "__main__":
     
     print(f"Computing embeddings for {len(key_strings)} entities using {args.model_name}")
     if args.model_name == "all-MiniLM-L6-v2":
-        key_embeds = compute_embeddings(args.model_name, key_strings)
-        value_embeds = compute_embeddings(args.model_name, value_strings)
+        key_embeds = compute_embeddings(args.model_name, key_strings, args.batch_size)
+        value_embeds = compute_embeddings(args.model_name, value_strings, args.batch_size)
     else:
         raise NotImplementedError(f"Embedding model '{args.model_name}' is not implemented yet.")
 

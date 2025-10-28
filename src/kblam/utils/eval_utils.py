@@ -105,3 +105,48 @@ def answer_question(
         if isinstance(model, m):
             pruned_output = model_prune_format_mapping[m](outputs)
     return pruned_output
+
+
+def answer_question_deterministic(
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    Q: str,
+    kb=None,
+    kb_config: Optional[KBLaMConfig] = None,
+    attention_save_loc: Optional[str] = None,
+    save_attention_weights: bool = False,
+    attention_file_base_name: Optional[str] = None,
+    save_attn_weights_policy: str = "prefill-all-layer",
+):
+    for m in model_question_format_mapping:
+        if isinstance(model, m):
+            input_str = model_question_format_mapping[m](Q)
+    tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+    input_ids, attention_masks = (
+        tokenizer_output["input_ids"],
+        tokenizer_output["attention_mask"],
+    )
+
+    with torch.autograd.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_masks,
+            kb_kvs=kb,
+            max_new_tokens=150,
+            tokenizer=tokenizer,
+            output_attentions=True,
+            kb_config=kb_config,
+            pad_token_id=tokenizer.eos_token_id,
+            save_attention_weights=save_attention_weights,
+            attention_file_base_name=attention_file_base_name,
+            attention_save_loc=attention_save_loc,
+            save_attn_weights_policy=save_attn_weights_policy,
+            do_sample=False,    # 确定性结果
+            top_p=None,
+        ).squeeze()
+    outputs = tokenizer.decode(outputs, skip_special_tokens=False)
+
+    for m in model_prune_format_mapping:
+        if isinstance(model, m):
+            pruned_output = model_prune_format_mapping[m](outputs)
+    return pruned_output

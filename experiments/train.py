@@ -30,11 +30,16 @@ from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
+from kblam.kb_retriever import KBRetriever
+
 import re
 import shutil
 import random
 LOGFORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOGFORMAT_RICH = "%(message)s"
+
+debug_level=1
+
 
 # setup logging
 # Create a custom theme for Rich
@@ -449,9 +454,19 @@ def get_batch_musique(
     include_outlier=False,
     multi_entities=None,
     use_extended_qa=False,
+    global_step: int = 0,
 ):
+    # 暂不开启随机采样
+    random_sample = False
+
     labels = []
-    batch_indices = np.random.choice(len(dataset), B, replace=False)
+    if random_sample:
+        batch_indices = np.random.choice(len(dataset), B, replace=False)
+    else:
+        batch_indices = list(range(global_step * B, (global_step + 1) * B))
+        # 确保索引不超出数据集范围
+        batch_indices = [idx % len(dataset) for idx in batch_indices]
+
 
     def get_question_and_answer(idx) -> tuple[str | None, str | None]:
         sample = dataset[idx]
@@ -470,6 +485,8 @@ def get_batch_musique(
             else:
                 print("Q or Answer is none")
         batch_indices = real_batch_indices
+        # print(f"---- real_batch_indices: {real_batch_indices}")
+        # print(f"---- input_strs: {input_strs}")
         tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(device)
         input_ids, attention_masks = (
             tokenizer_output["input_ids"],
@@ -534,7 +551,7 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, key_embd_
     key_embds = np.load(
         os.path.join(
             dataset_dir,
-            f"{encoder_model_spec_str}_embd_{key_embd_src}.npy",
+            f"train_datasets_{encoder_model_spec_str}_embd_{key_embd_src}.npy",
         )
     ).astype("float32")
     if key_embd_src == "answer":
@@ -542,20 +559,21 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, key_embd_
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                f"{encoder_model_spec_str}_embd_answer.npy",
+                f"train_datasets_{encoder_model_spec_str}_embd_answer.npy",
             )
         ).astype("float32")
     else:
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                f"{encoder_model_spec_str}_embd_value.npy",
+                f"train_datasets_{encoder_model_spec_str}_embd_value.npy",
             )
         ).astype("float32")
     return key_embds, value_embds
 
 
 def get_step_config(
+    step: int,
     current_accum_step: int,
     total_accum_step: int,
     use_data_aug: bool,
@@ -571,7 +589,9 @@ def get_step_config(
     Extended QA (if included) takes 1/3 of the rest accum_steps;
     Standard QA takes the rest.
     """
-    config = {}
+    config = {
+        "global_step": step*total_accum_step + current_accum_step,
+    }
     config["use_data_aug"] = use_data_aug
     config["include_outlier"] = False
     config["multi_entities"] = None
@@ -656,218 +676,6 @@ def _get_llama3_query_head_parameters(
     return llm_q_params
 
 
-class KBRetriever:
-    def __init__(
-        self,
-        encoder: KBEncoder,
-        dataset: List[Dict],
-        key_embds: Optional[np.ndarray],
-        value_embds: Optional[np.ndarray],
-    ):
-        self.encoder = encoder
-        self.key_embds = key_embds
-        self.value_embds = value_embds
-        self.dataset = dataset
-
-    def _use_cached_embd(self):
-        if self.key_embds is not None and self.value_embds is not None:
-            return True
-        else:
-            return False
-    # 为当前训练批次生成KB embedding：与当前批次直接相关的KB和随机采样的上下文KB
-    def get_key_embeddings(self, batch_indices, batch_size, step, kb_size):
-        # 索引KB embedding并应用encoder
-        if self._use_cached_embd():
-            train_set_key, train_set_val = get_kb_embd(
-                self.encoder,
-                batch_indices,
-                precomputed_embd=(self.key_embds, self.value_embds),
-            )
-        else:
-            train_set_key, train_set_val = get_kb_embd(self.encoder, batch_indices, kb_dict=self.dataset)
-        # train_set形状应该是(batch_size, embedding_dim)
-
-        # 形状变为(batch_size, 1, embedding_dim)
-        if len(train_set_key.shape) == 2:
-            train_set_key = train_set_key.unsqueeze(0).transpose(0, 1)
-            train_set_val = train_set_val.unsqueeze(0).transpose(0, 1)
-
-        # 获得实时的知识库大小以及随机的知识库内容，获取其键值embedding
-        context_set_size = context_set_size_scheduler(step, kb_size)
-        context_set_index = np.random.choice(len(self.dataset), context_set_size, replace=False)  # type: ignore
-        if self._use_cached_embd():
-            context_set_key, context_set_val = get_kb_embd(
-                self.encoder,
-                context_set_index,
-                precomputed_embd=(self.key_embds, self.value_embds),
-            )
-        else:
-            context_set_key, context_set_val = get_kb_embd(self.encoder, context_set_index, kb_dict=self.dataset)
-        # context_set形状应该是(context_set_size, embedding_dim)
-        
-        # 形状变为(batch_size, context_set_size, embedding_dim)
-        context_set_key = context_set_key.unsqueeze(0).expand(batch_size, *context_set_key.shape)
-        context_set_val = context_set_val.unsqueeze(0).expand(batch_size, *context_set_val.shape)
-        # context_set_val = torch.randn_like(context_set_val)
-        # Idea: Try torch.randn here context_set_tokens??
-
-        true_kb_copy = 1
-        kb_embedding = (
-            torch.concat([*([train_set_key] * true_kb_copy), context_set_key], 1),
-            torch.concat([*([train_set_val] * true_kb_copy), context_set_val], 1),
-        )
-        # 最后形状变为(batch_size, 1+context_set_size, embedding_dim)
-        return kb_embedding
-
-# DATASET_SUPPORT
-    def get_key_embeddings_document(self, start_ids, num_triples, batch_size, step, kb_size):
-        if not self._use_cached_embd():
-            print("Current only supports cached KB embedding")
-            return None
-        if len(start_ids) != batch_size:
-            print("Batch size mismatch")
-            return None
-
-        # 先收集三元组并执行编码
-        key_embeddings = [[] for _ in range(batch_size)]
-        value_embeddings = [[] for _ in range(batch_size)]
-
-        for i in range(batch_size):
-            start_id = start_ids[i]
-            for j in range(num_triples[i]):
-                k_embed = self.encoder.encode_key(base_emb=self.key_embds[start_id + j])  # pyright: ignore[reportOptionalSubscript]
-                v_embed = self.encoder.encode_val(base_emb=self.value_embds[start_id + j])  # pyright: ignore[reportOptionalSubscript]
-                key_embeddings[i].append(k_embed)
-                value_embeddings[i].append(v_embed)
-
-        # 处理变长序列：首先将每个样本的嵌入堆叠成张量
-        # 然后进行填充使所有样本具有相同的序列长度
-        key_tensor_list = []
-        value_tensor_list = []
-        
-        for i in range(batch_size):
-            # 将每个样本的嵌入列表转换为张量
-            key_tensor_list.append(torch.stack(key_embeddings[i]))
-            value_tensor_list.append(torch.stack(value_embeddings[i]))
-            
-        # 获取最大序列长度
-        max_seq_len = max([t.size(0) for t in key_tensor_list])
-        
-        # 对所有张量进行填充以匹配最大序列长度
-        padded_key_tensors = []
-        padded_value_tensors = []
-        
-        for i in range(batch_size):
-            current_seq_len = key_tensor_list[i].size(0)
-            if current_seq_len < max_seq_len:
-                # 计算需要填充的数量
-                padding_size = max_seq_len - current_seq_len
-                # 创建填充张量（使用0填充）
-                key_padding = torch.zeros(padding_size, key_tensor_list[i].size(1), 
-                                          dtype=key_tensor_list[i].dtype, 
-                                          device=key_tensor_list[i].device)
-                value_padding = torch.zeros(padding_size, value_tensor_list[i].size(1), 
-                                            dtype=value_tensor_list[i].dtype, 
-                                            device=value_tensor_list[i].device)
-                # 拼接原始张量和填充张量
-                padded_key = torch.cat([key_tensor_list[i], key_padding], dim=0)
-                padded_value = torch.cat([value_tensor_list[i], value_padding], dim=0)
-            else:
-                # 如果已经是最大长度，则不需要填充
-                padded_key = key_tensor_list[i]
-                padded_value = value_tensor_list[i]
-                
-            padded_key_tensors.append(padded_key)
-            padded_value_tensors.append(padded_value)
-        
-        # 最后堆叠所有样本的张量
-        key_embeddings = torch.stack(padded_key_tensors, dim=0)
-        value_embeddings = torch.stack(padded_value_tensors, dim=0)
-
-        # print(f"----shape of key embeddings: {key_embeddings.shape}")
-        return (key_embeddings, value_embeddings)
-    def get_embeddings(self, start_id_lists, num_triples_lists, batch_size):
-        if not self._use_cached_embd():
-            print("Currently only supports cached KB embedding")
-            return None
-
-        if len(start_id_lists) != batch_size or len(num_triples_lists) != batch_size:
-            print("Batch size mismatch")
-            return None
-
-        # Step 1: Collect all indices needed across the batch
-        all_indices = []
-        seq_lengths = []  # number of triples per sample
-
-        for i in range(batch_size):
-            starts = start_id_lists[i] if isinstance(start_id_lists[i], list) else [start_id_lists[i]]
-            nums = num_triples_lists[i] if isinstance(num_triples_lists[i], list) else [num_triples_lists[i]]
-
-            sample_indices = []
-            for start, num in zip(starts, nums):
-                if num > 0:
-                    # Ensure we don't go out of bounds (optional safety check)
-                    if start + num > len(self.key_embds):
-                        raise IndexError(f"Index out of range: start={start}, num={num}, total={len(self.key_embds)}")
-                    sample_indices.extend(range(start, start + num))
-            all_indices.extend(sample_indices)
-            seq_lengths.append(len(sample_indices))
-
-        total_triples = len(all_indices)
-        if total_triples == 0:
-            print("WARNING: No triples found in batch.")
-            # Edge case: no triples in entire batch
-            # Create dummy tensors with correct embedding dim
-            dummy_key = self.encoder.encode_key(base_emb=np.zeros_like(self.key_embds[0:1]))  # (1, Dk)
-            dummy_val = self.encoder.encode_val(base_emb=np.zeros_like(self.value_embds[0:1]))  # (1, Dv)
-            dim_k = dummy_key.shape[1]
-            dim_v = dummy_val.shape[1]
-            max_len = 1
-            padded_keys = torch.zeros(batch_size, max_len, dim_k, dtype=dummy_key.dtype, device=dummy_key.device)
-            padded_vals = torch.zeros(batch_size, max_len, dim_v, dtype=dummy_val.dtype, device=dummy_val.device)
-            return padded_keys, padded_vals
-
-        # Step 2: Batch extract embeddings (as numpy)
-        key_batch_np = self.key_embds[all_indices]      # (total_triples, Dk)
-        val_batch_np = self.value_embds[all_indices]    # (total_triples, Dv)
-
-        # Step 3: Batch encode via encoder (only 2 calls!)
-        key_encoded = self.encoder.encode_key(base_emb=key_batch_np)    # (total_triples, Dk')
-        val_encoded = self.encoder.encode_val(base_emb=val_batch_np)  # (total_triples, Dv')
-
-        # Step 4: Split into per-sample sequences
-        key_seq_list = []
-        val_seq_list = []
-        start = 0
-        for length in seq_lengths:
-            if length == 0:
-                # Create empty tensor with correct feature dim
-                k = torch.empty(0, key_encoded.shape[1], device=key_encoded.device, dtype=key_encoded.dtype)
-                v = torch.empty(0, val_encoded.shape[1], device=val_encoded.device, dtype=val_encoded.dtype)
-            else:
-                k = key_encoded[start:start + length]
-                v = val_encoded[start:start + length]
-                start += length
-            key_seq_list.append(k)
-            val_seq_list.append(v)
-
-        # Step 5: Post-padding (pad at the end of sequence)
-        max_seq_len = max(t.size(0) for t in key_seq_list)
-        padded_keys = []
-        padded_vals = []
-
-        for k, v in zip(key_seq_list, val_seq_list):
-            cur_len = k.size(0)
-            if cur_len < max_seq_len:
-                pad_len = max_seq_len - cur_len
-                k_pad = torch.zeros(pad_len, k.size(1), dtype=k.dtype, device=k.device)
-                v_pad = torch.zeros(pad_len, v.size(1), dtype=v.dtype, device=v.device)
-                k = torch.cat([k, k_pad], dim=0)
-                v = torch.cat([v, v_pad], dim=0)
-            padded_keys.append(k)
-            padded_vals.append(v)
-
-        return torch.stack(padded_keys, dim=0), torch.stack(padded_vals, dim=0)
 class Trainer:
     def __init__(
         self,
@@ -910,7 +718,6 @@ class Trainer:
             self._get_batch = partial(get_batch, _format_QA_phi3, _create_labels_for_phi3)
             self._get_params = _get_phi3_query_head_parameters
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
-# DATASET_SUPPORT
             if dataset_format == "default":            
                 self._get_batch = partial(get_batch, _format_QA_llama, _create_labels_for_llama)
             elif dataset_format == "autoschemakg":
@@ -995,6 +802,7 @@ class Trainer:
                 for a_step in range(start_accum_step, end_accum_step):
                     # 获取当前批次数据：输入IDs，注意力掩码，标签，批次索引
                     step_config = get_step_config(
+                        step,
                         a_step,
                         grad_accum_steps,
                         use_data_aug,
@@ -1010,7 +818,6 @@ class Trainer:
                         random_sample=True,
                         **step_config,
                     )
-
                     if a_step == 0 and step % 10 == 0:
                         self.logger.info(f"INPUT IDs SHAPE: {input_ids.shape}")
                     # 截断输入
@@ -1057,28 +864,70 @@ class Trainer:
 
                             elif self.kb_size == 1:
                                 # Use only ground-truth supporting paragraphs
+                                true_paras = []
                                 for qd in sample["question_decomposition"]:
                                     true_idx = qd["paragraph_support_idx"]
                                     para = paragraphs[true_idx]
                                     start_ids[i].append(para["start_id"])
                                     num_triples[i].append(para["num_triples"])
-
+                                    if debug_level > 1:
+                                        print(f"True paragraph: {para}")
+                                    true_paras.append(true_idx)
+                                if debug_level>0:
+                                    print(f"----TRAIN: {batch_indices[i]}-{true_paras}")
+                                
+                            elif self.kb_size > 2 and self.kb_size < 20:
+                                print("WARNING: using the sample more than once seems not a good idea")
+                                # use true_para (2) + random_para (kb_size-2)。
+                                selected_paras = set()
+                                for qd in sample["question_decomposition"]:
+                                    true_idx = qd["paragraph_support_idx"]
+                                    para = paragraphs[true_idx]
+                                    start_ids[i].append(para["start_id"])
+                                    num_triples[i].append(para["num_triples"])
+                                    selected_paras.add(true_idx)
+                                    if debug_level > 1:
+                                        print(f"True paragraph: {para}")
+                                # 从剩下18个段落随机选择kb_size-2个段落，不能重复
+                                random_paras = random.sample(
+                                    [p for p in range(len(paragraphs)) if p not in selected_paras],
+                                    self.kb_size - 2,
+                                )
+                                selected_paras.update(random_paras)
+                                for p in random_paras:
+                                    para = paragraphs[p]
+                                    num_triples[i].append(para["num_triples"])
+                                    start_ids[i].append(para["start_id"])
+                                if debug_level>0:
+                                    print(f"-----TRAIN: {batch_indices[i]}-{selected_paras}")
                             else:
                                 raise ValueError(f"Unsupported kb_size: {self.kb_size}")
                         # print(f"using {num_triples} triples")
                         kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size)
                     else:
                         raise ValueError(f"Unknown data set format: {self.dataset_format}")
-                    out = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_masks,
-                        kb_kvs=kb_embedding,
-                        output_attentions=True,
-                        kb_config=kb_config,
-                    )
+                    if debug_level > 1:
+                        out = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_masks,
+                            kb_kvs=kb_embedding,
+                            output_attentions=True,
+                            kb_config=kb_config,
+                            save_attention_weights=True,
+                            attention_save_loc="./attn_weights/",
+                            attention_file_base_name=f"debug_train_kbscale{kb_config.kb_scale_factor}",
+                        )
+                    else:
+                        out = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_masks,
+                            kb_kvs=kb_embedding,
+                            output_attentions=True,
+                            kb_config=kb_config,
+                        )
                     logits = out["logits"]
                     # 打印部分结果
-                    if a_step == 0 and step % 10 == 0:
+                    if (a_step == 0 and step % 10 == 0) or debug_level > 1:
                         batch_index = 0  # Which example in the batch to select
                         max_logits = logits.argmax(axis=2)
                         decoded_pred = self.tokenizer.decode(max_logits[batch_index, :-1])
@@ -1129,14 +978,15 @@ class Trainer:
 
                 # Only log from main process
                 if self.accelerator.is_main_process:
-                    self.logger.info(f"step: {step}, loss: {avg_loss}")
+                    self.logger.info(f"step: {step} , loss: {avg_loss}")
                     num_candidates=0
                     wandb.log({'train_loss': np.mean(losses)})
                     train_losses.append(avg_loss)
                     pbar.update(task, advance=1, loss=avg_loss)
 
                 # 保存模型参数
-                if (step % save_period) == 0 and (step != start_step):
+                # 如果是最后一步
+                if ((step == self.num_steps-1) or ((step % save_period) == 0 and (step != start_step))) and (debug_level < 2) :
                     try:
                         # Log memory usage before synchronization
                         self.logger.info(
@@ -1217,7 +1067,7 @@ class Trainer:
                         self.logger.error(f"Error details: {str(e)}")
                         raise e
 
-
+    
 def main():
     os.environ["NCCL_TIMEOUT"] = "1200000"
     logger = logging.getLogger("training")
@@ -1271,8 +1121,10 @@ def main():
 
     print(f"[DEBUG]: hf_token: {hf_token}")
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # if seed is None:
+    #     seed = time.time()
+    # torch.manual_seed(seed)
+    # np.random.seed(seed)
 
     pathlib.Path(model_save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1484,8 +1336,6 @@ def main():
         kb_config=kb_config,
     )
 
-    # save model
-    trainer.save_state()
 
 
 if __name__ == "__main__":

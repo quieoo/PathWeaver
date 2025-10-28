@@ -164,6 +164,11 @@ class KblamLlamaAttention(nn.Module):
             kb_values = kb_values.gather(-2, top_idx)
         return kb_keys, kb_values, attn_weights[..., :topk_size]
 
+    save_attn_weights_policy = [
+        "prefill-all-layer",
+        "all-step-last-layer",
+    ]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -178,6 +183,7 @@ class KblamLlamaAttention(nn.Module):
         save_attention_weights: bool = True,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
+        save_attn_weights_policy: str = "prefill-all-layer",
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if save_attention_weights:
@@ -346,9 +352,10 @@ class KblamLlamaAttention(nn.Module):
                         ) / math.sqrt(self.head_dim)
                     attn_weights = attn_weights[:, :, :, kb_len:]
                     if kb_scale_factor is not None:
-                        attn_weights_2 = (
-                            attn_weights_2 - np.log(kb_len) + np.log(kb_scale_factor)
-                        )
+                        # attn_weights_2 = (
+                        #     attn_weights_2 + math.log(kb_scale_factor)
+                        # )
+                        attn_weights_2 *= kb_scale_factor
                     attn_weights = torch.concat([attn_weights_2, attn_weights], -1)
 
         if attention_mask is not None:  # no matter the length, we just slice it
@@ -359,15 +366,32 @@ class KblamLlamaAttention(nn.Module):
         if not attn_weights.requires_grad:
             # TODO: Make this function injectable
             if save_attention_weights:
-                if q_len > 1:
-                    save_path = os.path.join(
-                        attention_save_loc,
-                        f"{attention_file_base_name}_{self.layer_idx}.npy",
-                    )
-                    np.save(
-                        save_path,
-                        attn_weights.to(torch.float32).cpu().detach().numpy(),
-                    )
+                os.makedirs(attention_save_loc, exist_ok=True)
+                if save_attn_weights_policy == "prefill-all-layer":
+                    if q_len > 1:
+                        # only prefill stage
+                        save_path = os.path.join(
+                            attention_save_loc,
+                            f"{attention_file_base_name}_{self.layer_idx}.npy",
+                        )
+                        np.save(
+                            save_path,
+                            attn_weights.to(torch.float32).cpu().detach().numpy(),
+                        )
+                elif save_attn_weights_policy == "all-step-last-layer":
+                    if self.layer_idx == self.config.num_hidden_layers - 1:
+                        step_id = int(cache_position.max().item()) if cache_position is not None else 0
+                        save_path = os.path.join(
+                            attention_save_loc,
+                            f"{attention_file_base_name}_step{step_id}_layer{self.layer_idx}.npy",
+                        )
+                        np.save(
+                            save_path,
+                            attn_weights.to(torch.float32).cpu().detach().numpy(),
+                        )
+                else:
+                    raise ValueError(f"Unknown save_attn_weights_policy: {save_attn_weights_policy}")
+
         attn_weights = attn_weights.to(query_states.dtype)
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.attention_dropout, training=self.training
@@ -442,6 +466,7 @@ class LlamaDecoderLayer(nn.Module):
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
+        save_attn_weights_policy: str = "prefill-all-layer",
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -477,6 +502,7 @@ class LlamaDecoderLayer(nn.Module):
             save_attention_weights=save_attention_weights,
             attention_save_loc=attention_save_loc,
             attention_file_base_name=attention_file_base_name,
+            save_attn_weights_policy=save_attn_weights_policy,
         )
         hidden_states = residual + hidden_states
 
@@ -553,6 +579,7 @@ class LlamaModel(LlamaPreTrainedModel):
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
+        save_attn_weights_policy: str = "prefill-all-layer",
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -652,6 +679,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     save_attention_weights=save_attention_weights,
                     attention_save_loc=attention_save_loc,
                     attention_file_base_name=attention_file_base_name,
+                    save_attn_weights_policy=save_attn_weights_policy,
                 )
 
             hidden_states = layer_outputs[0]
@@ -873,6 +901,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
+        save_attn_weights_policy: str = "prefill-all-layer",
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -931,6 +960,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
             save_attention_weights=save_attention_weights,
             attention_save_loc=attention_save_loc,
             attention_file_base_name=attention_file_base_name,
+            save_attn_weights_policy=save_attn_weights_policy,
         )
 
         hidden_states = outputs[0]
