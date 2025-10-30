@@ -99,6 +99,7 @@ parser.add_argument("--log_to_file", action="store_true", help="Log to file as w
 parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
+parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
 # fmt: on
 
 
@@ -457,7 +458,7 @@ def get_batch_musique(
     global_step: int = 0,
 ):
     # 暂不开启随机采样
-    random_sample = False
+    # random_sample = False
 
     labels = []
     if random_sample:
@@ -751,7 +752,89 @@ class Trainer:
                 self.kbretriever.encoder.parameters(), self.lr, self.num_steps
             )
             self.logger.info("Optimizer recreated")
+        
+        # ==== 验证 V-Adapter 是否生效 ====
+        # # 1) 列出 encoder 里含有 value 映射的参数（名字可能叫 projector_v / value_proj 等）
+        # for n, p in self.kbretriever.encoder.named_parameters():
+        #     if "projector_v" in n or "value" in n:
+        #         print("[V-ADAPTER PARAM]", n, p.shape, "requires_grad=", p.requires_grad)
+        # # 打印所有参数
+        # print("All Parameters:")
+        # for n, p in self.kbretriever.encoder.named_parameters():
+        #     print(n, p.shape, "requires_grad=", p.requires_grad)
+
+        # # 2) 列出被 optimizer 管理的第一组参数名字，确认包含上面这些 name
+        # pg0 = list(scheduler.optimizer.param_groups[0]["params"])
+        # name_of = {id(p): n for n,p in self.kbretriever.encoder.named_parameters()}
+        # hit = [name_of.get(id(p)) for p in pg0 if id(p) in name_of]
+        # print("[IN OPTIMIZER GROUP0 V-params]:", hit)   
         return scheduler, optim
+
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        val_set: List[Dict],
+        query_size: int,
+        kb_config: KBLaMConfig,
+    ):
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+        input_ids, attn_masks, labels, batch_indices = self._get_batch(
+            val_set,
+            self.tokenizer,
+            self.device,
+            B=query_size,
+            random_sample=True,
+        )
+
+        validate_samples = [val_set[idx] for idx in batch_indices]
+        # get kb embeddings
+        start_ids = [[] for _ in range(query_size)]
+        num_triples = [[] for _ in range(query_size)]
+        paras=[[] for _ in range(query_size)]
+
+        for i in range(len(validate_samples)):
+            sample = validate_samples[i]
+            paragraphs = sample["paragraphs"]
+            support_paras = []
+            for qd in sample["question_decomposition"]:
+                true_idx = int(qd["paragraph_support_idx"])
+                support_paras.append(paragraphs[true_idx])
+
+            blocks = _normalize_blocks(support_paras, sample_id=i)
+
+            start_ids[i]   = [s for (s, n, p) in blocks]
+            num_triples[i] = [n for (s, n, p) in blocks]
+            paras[i]       = [p for (s, n, p) in blocks]
+
+        kb_embs = kb_retriever.get_embeddings(start_ids, num_triples, query_size, is_inference=True)
+
+        for i in range(query_size):
+            out = self.model(
+                input_ids=input_ids[i],
+                attention_mask=attn_masks[i],
+                kb_kvs=kb_embs[i],
+                kb_config=kb_config,
+            )
+            logits = out["logits"]
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+            total_loss += loss.item()
+            count += 1
+
+        self.model.train()
+        return total_loss / max(count, 1)
 
     def train(
         self,
@@ -876,34 +959,74 @@ class Trainer:
                                 if debug_level>0:
                                     print(f"----TRAIN: {batch_indices[i]}-{true_paras}")
                                 
-                            elif self.kb_size > 2 and self.kb_size < 20:
-                                print("WARNING: using the sample more than once seems not a good idea")
-                                # use true_para (2) + random_para (kb_size-2)。
-                                selected_paras = set()
+                            elif isinstance(self.kb_size, int) and self.kb_size >= 2:
+                                # 1) 真段落（去重 & 过滤空三元组）
+                                true_paras = []
+                                seen = set()
                                 for qd in sample["question_decomposition"]:
-                                    true_idx = qd["paragraph_support_idx"]
-                                    para = paragraphs[true_idx]
-                                    start_ids[i].append(para["start_id"])
-                                    num_triples[i].append(para["num_triples"])
-                                    selected_paras.add(true_idx)
-                                    if debug_level > 1:
-                                        print(f"True paragraph: {para}")
-                                # 从剩下18个段落随机选择kb_size-2个段落，不能重复
-                                random_paras = random.sample(
-                                    [p for p in range(len(paragraphs)) if p not in selected_paras],
-                                    self.kb_size - 2,
-                                )
-                                selected_paras.update(random_paras)
-                                for p in random_paras:
-                                    para = paragraphs[p]
-                                    num_triples[i].append(para["num_triples"])
-                                    start_ids[i].append(para["start_id"])
-                                if debug_level>0:
-                                    print(f"-----TRAIN: {batch_indices[i]}-{selected_paras}")
+                                    idx = qd["paragraph_support_idx"]
+                                    if idx not in seen and paragraphs[idx]["num_triples"] > 0:
+                                        seen.add(idx)
+                                        true_paras.append(idx)
+
+                                # 2) 负样本池（非真段 & 非空）
+                                neg_pool = [p for p in range(len(paragraphs))
+                                            if (p not in seen) and (paragraphs[p]["num_triples"] > 0)]
+
+                                # 3) 预算上限（段落数）：优先用 self.kb_size，否则以 20 为上限；同时不超过非空段落总数
+                                nonempty_total = len(true_paras) + len(neg_pool)
+                                hard_cap = self.kb_size if isinstance(self.kb_size, int) else 20
+                                max_budget = min(hard_cap, nonempty_total)
+
+                                # 4) 动态增长：从真段落数线性涨到 max_budget
+                                #    alpha ∈ [0.2, 1.0]
+                                denom = max(1, self.num_steps)  # 防止除 0
+                                progress = min(1.0, max(0.0, float(step) / float(denom)))  # 归一化进度 [0,1]
+                                alpha = 0.2 + 0.8 * progress  # 起点0.2，终点1.0
+
+                                target_paras_float = len(true_paras) + (max_budget - len(true_paras)) * alpha
+                                target_paras = int(round(target_paras_float))
+
+                                # 保障范围与单调：至少覆盖真段落，不超过 max_budget
+                                target_paras = max(len(true_paras), min(target_paras, max_budget))
+
+                                # 5) 先放入真段落，再补负样本到 target_paras
+                                selected = list(true_paras)
+                                need_neg = max(0, target_paras - len(selected))
+                                if need_neg > 0 and len(neg_pool) > 0:
+                                    take_neg = min(need_neg, len(neg_pool))
+                                    selected.extend(random.sample(neg_pool, take_neg))
+
+                                # 6) 如总数仍超过目标（真段太多等），做裁剪（尽量保真段）
+                                if len(selected) > target_paras:
+                                    # 若真段落超过或等于预算，只保留随机 target_paras 个真段
+                                    if len(true_paras) >= target_paras:
+                                        selected = random.sample(true_paras, target_paras)
+                                    else:
+                                        remain = target_paras - len(true_paras)
+                                        neg_selected = [p for p in selected if p not in true_paras]
+                                        if remain < len(neg_selected):
+                                            neg_selected = random.sample(neg_selected, remain)
+                                        selected = true_paras + neg_selected
+
+                                # 7) 打乱避免位置偏置
+                                random.shuffle(selected)
+
+                                # 8) 写回
+                                start_ids[i].extend([paragraphs[p]["start_id"] for p in selected])
+                                num_triples[i].extend([paragraphs[p]["num_triples"] for p in selected])
+
+                                # if debug_level > 0 and (step % 10 == 0):
+                                #     sid = sample.get("id", "?")
+                                #     print(f"---- sample-{batch_indices[i]}, id: {sid}, "
+                                #         f"true={sorted(true_paras)}, selected={sorted(selected)}, "
+                                #         f"target={target_paras}, max_budget={max_budget}, nonempty_total={nonempty_total}")
+
+                                
                             else:
                                 raise ValueError(f"Unsupported kb_size: {self.kb_size}")
                         # print(f"using {num_triples} triples")
-                        kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size)
+                        kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size, is_inference=False)
                     else:
                         raise ValueError(f"Unknown data set format: {self.dataset_format}")
                     if debug_level > 1:
@@ -1069,6 +1192,7 @@ class Trainer:
 
     
 def main():
+
     os.environ["NCCL_TIMEOUT"] = "1200000"
     logger = logging.getLogger("training")
 
@@ -1080,6 +1204,9 @@ def main():
         logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.INFO)
+    
+    global debug_level
+    debug_level = args.debug_level
 
     print(vars(args))
     dataset_name = args.dataset_type

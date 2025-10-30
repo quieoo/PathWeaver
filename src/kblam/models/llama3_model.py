@@ -363,23 +363,30 @@ class KblamLlamaAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+        # if self.layer_idx % kb_config.kb_layer_frequency == 0 and save_attention_weights:
+        #     attn = attn_weights[0, 0].detach().cpu().numpy()  # shape: (1, kb_len + ...)
+        #     print(f"[Layer {self.layer_idx}] KB区注意力均值: {attn[:, :kb_len-1].mean():.4f}, 最大值: {attn[:, :kb_len-1].max():.4f}")
+        # save attention weights
         if not attn_weights.requires_grad:
             # TODO: Make this function injectable
             if save_attention_weights:
                 os.makedirs(attention_save_loc, exist_ok=True)
                 if save_attn_weights_policy == "prefill-all-layer":
                     if q_len > 1:
-                        # only prefill stage
-                        save_path = os.path.join(
-                            attention_save_loc,
-                            f"{attention_file_base_name}_{self.layer_idx}.npy",
-                        )
-                        np.save(
-                            save_path,
-                            attn_weights.to(torch.float32).cpu().detach().numpy(),
-                        )
+                        if self.layer_idx % kb_layer_frequency == 0:
+                            # only prefill stage
+                            save_path = os.path.join(
+                                attention_save_loc,
+                                f"{attention_file_base_name}_{self.layer_idx}.npy",
+                            )
+                            np.save(
+                                save_path,
+                                attn_weights.to(torch.float32).cpu().detach().numpy(),
+                            )
                 elif save_attn_weights_policy == "all-step-last-layer":
-                    if self.layer_idx == self.config.num_hidden_layers - 1:
+                    # 判断是否是能够整除kb_layer_frequency的最大层
+                    if self.layer_idx == (self.config.num_hidden_layers - 1) // kb_layer_frequency * kb_layer_frequency:
                         step_id = int(cache_position.max().item()) if cache_position is not None else 0
                         save_path = os.path.join(
                             attention_save_loc,

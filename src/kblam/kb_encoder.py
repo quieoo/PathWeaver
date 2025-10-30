@@ -63,33 +63,36 @@ class KBEncoder(nn.Module, FeatureExtractionMixin):
         # Define the KB encoder backbone
         self.encoder_spec = encoder_name
 
-        if encoder_name in ["OAI", "BigOAI"]:
-            big = "Big" in encoder_name
-            if get_oai_embd_online:
-                if big:
-                    self.gs = GPT("text-embedding-3-large", endpoint_url)
-                else:
-                    self.gs = GPT("ada-embeddings", endpoint_url)
-
-                self.base_model_encode = lambda s: torch.tensor(
-                    self.gs.generate_embedding(s)
-                ).to(self.device)
-            else:
-                self.base_model_encode = None
-            self.in_dim = 3072 if big else 1536
+        if encoder_name == "QWEN-EMBEDDING-0.6B" or encoder_name == "qwen-embedding-0.6B":
+            self.in_dim=1024
         else:
-            self.base_model = SentenceTransformer(encoder_name)
-            self.base_model_encode = lambda s: self.base_model.encode(
-                s, convert_to_numpy=False
-            )
-            self.frozen_base_model = frozen_base_model
-            if frozen_base_model:
-                self.base_model.eval()
-                for param in self.base_model.parameters():
-                    param.requires_grad = False
+            if encoder_name in ["OAI", "BigOAI"]:
+                big = "Big" in encoder_name
+                if get_oai_embd_online:
+                    if big:
+                        self.gs = GPT("text-embedding-3-large", endpoint_url)
+                    else:
+                        self.gs = GPT("ada-embeddings", endpoint_url)
+
+                    self.base_model_encode = lambda s: torch.tensor(
+                        self.gs.generate_embedding(s)
+                    ).to(self.device)
+                else:
+                    self.base_model_encode = None
+                self.in_dim = 3072 if big else 1536
             else:
-                self.base_model.train()
-            self.in_dim = self.base_model.get_sentence_embedding_dimension()
+                self.base_model = SentenceTransformer(encoder_name)
+                self.base_model_encode = lambda s: self.base_model.encode(
+                    s, convert_to_numpy=False
+                )
+                self.frozen_base_model = frozen_base_model
+                if frozen_base_model:
+                    self.base_model.eval()
+                    for param in self.base_model.parameters():
+                        param.requires_grad = False
+                else:
+                    self.base_model.train()
+                self.in_dim = self.base_model.get_sentence_embedding_dimension()
         self.out_dim = out_dim
         self.projector_k = get_projector(
             projector_type, self.in_dim, self.out_dim, projector_kwargs

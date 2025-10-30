@@ -40,16 +40,10 @@ from kblam.kb_retriever import KBRetriever
 from kblam.metrics_evaluator import full_evaluation
 import time
 
-
-
-nltk.download("wordnet")
+debug_flag = True
 logging.set_verbosity_warning()
 
-rouge = evaluate.load("rouge")
-bert_score = evaluate.load("bertscore")
 
-
-debug_flag = True
 
 def perform_eval_musique(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
@@ -102,7 +96,10 @@ def perform_eval_musique(
         sample_idx=np.random.randint(0, len(kb_retriever.dataset), query_size)
     if debug_flag:
         query_size=1
+        # sample_idx=[22]
         sample_idx=[24]
+        
+        
     
     test_samples=[kb_retriever.dataset[idx] for idx in sample_idx]
     
@@ -137,18 +134,14 @@ def perform_eval_musique(
                 f"[sample {i}] start_ids not non-decreasing after normalization."
         else:
             raise ValueError(f"Unsupported kb_size: {kb_size}")
-    start_ids[0][0]=start_ids[0][0]+1
-    num_triples[0][0]=1
-    num_triples[0][1]=1
-
-
-
+    
     if debug_flag:
-        print(f"chosen triples {start_ids} {num_triples}")
+        print(f"sample {sample['id']} chosen triples {start_ids[i]} {num_triples[i]}")
         # 逐条打印三元组id加内容
         for para_in_sample in paras:
             t_id=0
             for para in para_in_sample:
+                print(f"True para: {para['paragraph_text']}")
                 triples=para["triples"]
                 for triple in triples:
                     print(f"Triple {t_id} : {triple}")
@@ -171,7 +164,8 @@ def perform_eval_musique(
 
         kb_i=(kb_keys[i], kb_values[i])
 
-
+        # zoro Value 测试
+        # kb_i=(kb_keys[i], torch.zeros_like(kb_values[i]))
         
         if debug_flag:
             model_output=answer_question_deterministic(
@@ -183,6 +177,7 @@ def perform_eval_musique(
                 save_attention_weights=True,
                 attention_save_loc="./attn_weights/",
                 attention_file_base_name=f"debug_kbscale{kb_config.kb_scale_factor}_sample-{sample['id']}",
+                # save_attn_weights_policy="all-step-last-layer",
             )
             print(f"model_output: {model_output}")
             model_output=model_output.split(Q)[1]
@@ -198,7 +193,7 @@ def perform_eval_musique(
         model_output = model_output[2:]
         full_outputs.append((model_output,answer))
         answers.append(answer)
-        print("---------------------------------------")
+        print(f"------------------sample {i}----------")
         print(f"Q: {Q}")
         print(f"PRED: {model_output}")
         print(f"GT: {answer}")
@@ -209,7 +204,6 @@ def perform_eval_musique(
     
     end_time=time.time()
     print(f"query per second: {query_size/(end_time-start_time)}")
-
     if debug_flag:
         exit(0)
 
@@ -231,7 +225,7 @@ def eval_musique_scale(
     for sf in scale_factors:
         print(f"------- kb_scale_factor: {sf} -------")
         kb_config.kb_scale_factor=sf
-        perform_eval_musique(
+        comparison_str, metrics=perform_eval_musique(
             model,
             tokenizer,
             kb_retriever,
@@ -242,6 +236,7 @@ def eval_musique_scale(
             seed,
             query_size,
         )
+        print(metrics)
     exit(0)
 
 
@@ -261,6 +256,11 @@ def perform_eval(
 ):
     np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
+
+    # if debug_flag:
+    #     query_size=1
+
+    print(f"kb_idx: {kb_idx}")
     test_kb = [kb_retriever.dataset[idx] for idx in kb_idx]
     kb_embedding = ()
     key_str = [row["key_string"] for row in test_kb]
@@ -271,6 +271,7 @@ def perform_eval(
 
     kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
 
+
     model_outputs = []
     answers = []
     full_outputs = []
@@ -279,7 +280,10 @@ def perform_eval(
         query_size, len(test_kb)
     )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
     # subset_size = 50
-    for row in tqdm(test_kb[:subset_size]):
+    # for row in tqdm(test_kb[:subset_size]):
+    for i in range(subset_size):
+        row=test_kb[i]
+        idx=kb_idx[i]
         if multi_entites == -1:
             Q = row["Q"]
             answer = row["A"]
@@ -292,13 +296,26 @@ def perform_eval(
             )
             answer = A
 
+        # k_emb, v_emb=(kb_embedding)
+        # # 切割kb embed，只要其中第一个Token
+        # # row_i = k_emb[i:i+1, :]
+        # # v_i = v_emb[i:i+1, :]
+        # row_i = k_emb[0:1, :]
+        # v_i = v_emb[0:1, :]
+        # kb_i=(row_i, v_i)
+        kb_i=kb_embedding
+
         if eval_mode == "kb":
-            model_output = answer_question(
+            model_output = answer_question_deterministic(
                 tokenizer,
                 model,
                 Q,
-                kb=kb_embedding,
+                kb=kb_i,
                 kb_config=kb_config,
+                save_attention_weights=True,
+                attention_save_loc="./attn_weights_kblam/",
+                attention_file_base_name=f"kb-{idx}",
+                save_attn_weights_policy="all-step-last-layer",
             ).split(Q)[1]
             # 去除输出中的前两个换行符
             model_output = model_output[2:]
@@ -341,17 +358,21 @@ def perform_eval(
             answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
         model_outputs.append(model_output)
 
-    print(f"KB size: {kb_size}, mode: {eval_mode}")
-    rouge = evaluate.load("rouge")
 
     for pred, gt in zip(model_outputs, answers):
         print(f"PREDICTION: {pred}")
         print(f"GT: {gt}")
+    print(f"KB size: {kb_size}, mode: {eval_mode}")
+
+    if debug_flag:
+        exit(0)
+    rouge = evaluate.load("rouge")
     rouge_scores = rouge.compute(predictions=model_outputs, references=answers)
     print(rouge_scores)
 
     results_dict = {k: float(v) for k, v in rouge_scores.items()}
-
+    
+    bert_score = evaluate.load("bertscore")
     bertscore = bert_score.compute(
         predictions=model_outputs,
         references=answers,
@@ -543,6 +564,13 @@ parent_parser.add_argument(
     type=str,
     default="",
     help="Type of dataset to use",
+)
+
+parent_parser.add_argument(
+    "--debug_flag",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable debug mode",
 )
 
 # Create subparsers
@@ -1393,6 +1421,13 @@ def eval():
 
 def main():
     args = parser.parse_args()
+    global debug_flag
+    if args.debug_flag:
+        print("Debug mode enabled")
+        debug_flag = True
+    else:
+        debug_flag = False
+
     print(args)
     if args.command == "generation":
         eval_generate()

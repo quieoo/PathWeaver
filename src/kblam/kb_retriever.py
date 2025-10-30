@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from typing import List, Dict, Optional
-
+import random
 from kblam.kb_encoder import KBEncoder
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd
 
@@ -149,17 +149,15 @@ class KBRetriever:
         # print(f"----shape of key embeddings: {key_embeddings.shape}")
         return (key_embeddings, value_embeddings)
     def get_embeddings(self, start_id_lists, num_triples_lists, batch_size, is_inference=False):
+        import random
         if not self._use_cached_embd():
-            print("Currently only supports cached KB embedding")
-            return None
+            raise RuntimeError("Only supports cached KB embeddings")
 
         if len(start_id_lists) != batch_size or len(num_triples_lists) != batch_size:
-            print("Batch size mismatch")
-            return None
+            raise ValueError("Batch size mismatch")
 
-        # Step 1: Collect all indices needed across the batch
-        all_indices = []
-        seq_lengths = []  # number of triples per sample
+        all_indices, seq_lengths = [], []
+        total_keys = len(self.key_embds)
 
         for i in range(batch_size):
             starts = start_id_lists[i] if isinstance(start_id_lists[i], list) else [start_id_lists[i]]
@@ -168,69 +166,54 @@ class KBRetriever:
             sample_indices = []
             for start, num in zip(starts, nums):
                 if num > 0:
-                    # Ensure we don't go out of bounds (optional safety check)
-                    if start + num > len(self.key_embds):
-                        raise IndexError(f"Index out of range: start={start}, num={num}, total={len(self.key_embds)}")
+                    if start < 0 or start + num > total_keys:
+                        raise IndexError(f"Triple index out of range: {start}-{start+num}, total={total_keys}")
                     sample_indices.extend(range(start, start + num))
+
+            if not is_inference and len(sample_indices) > 1:
+                random.shuffle(sample_indices)
+
             all_indices.extend(sample_indices)
             seq_lengths.append(len(sample_indices))
 
         total_triples = len(all_indices)
         if total_triples == 0:
-            print("WARNING: No triples found in batch.")
-            # Edge case: no triples in entire batch
-            # Create dummy tensors with correct embedding dim
-            dummy_key = self.encoder.encode_key(base_emb=np.zeros_like(self.key_embds[0:1]))  # (1, Dk)
-            dummy_val = self.encoder.encode_val(base_emb=np.zeros_like(self.value_embds[0:1]))  # (1, Dv)
-            dim_k = dummy_key.shape[1]
-            dim_v = dummy_val.shape[1]
-            max_len = 1
-            padded_keys = torch.zeros(batch_size, max_len, dim_k, dtype=dummy_key.dtype, device=dummy_key.device)
-            padded_vals = torch.zeros(batch_size, max_len, dim_v, dtype=dummy_val.dtype, device=dummy_val.device)
-            return padded_keys, padded_vals
+            dummy_key = self.encoder.encode_key(base_emb=np.zeros_like(self.key_embds[0:1]))
+            dummy_val = self.encoder.encode_val(base_emb=np.zeros_like(self.value_embds[0:1]))
+            dim_k, dim_v = dummy_key.shape[1], dummy_val.shape[1]
+            return (
+                torch.zeros(batch_size, 1, dim_k, device=dummy_key.device, dtype=dummy_key.dtype),
+                torch.zeros(batch_size, 1, dim_v, device=dummy_val.device, dtype=dummy_val.dtype),
+            )
 
-        # Step 2: Batch extract embeddings (as numpy)
-        key_batch_np = self.key_embds[all_indices]      # (total_triples, Dk)
-        val_batch_np = self.value_embds[all_indices]    # (total_triples, Dv)
+        key_batch_np = self.key_embds[all_indices]
+        val_batch_np = self.value_embds[all_indices]
+        key_encoded = self.encoder.encode_key(base_emb=key_batch_np)
+        val_encoded = self.encoder.encode_val(base_emb=val_batch_np)
 
-        # Step 3: Batch encode via encoder (only 2 calls!)
-        key_encoded = self.encoder.encode_key(base_emb=key_batch_np)    # (total_triples, Dk')
-        val_encoded = self.encoder.encode_val(base_emb=val_batch_np)  # (total_triples, Dv')
-
-        # Step 4: Split into per-sample sequences
-        key_seq_list = []
-        val_seq_list = []
-        start = 0
+        key_seq_list, val_seq_list = [], []
+        offset = 0
         for length in seq_lengths:
-            if length == 0:
-                # Create empty tensor with correct feature dim
-                k = torch.empty(0, key_encoded.shape[1], device=key_encoded.device, dtype=key_encoded.dtype)
-                v = torch.empty(0, val_encoded.shape[1], device=val_encoded.device, dtype=val_encoded.dtype)
-            else:
-                k = key_encoded[start:start + length]
-                v = val_encoded[start:start + length]
-                start += length
+            k = key_encoded[offset:offset + length]
+            v = val_encoded[offset:offset + length]
+            offset += length
             key_seq_list.append(k)
             val_seq_list.append(v)
 
-        # if is_inference:
-        #     kv_list = list(zip(key_seq_list, val_seq_list))
-        #     return kv_list
+        if not is_inference:
+            for i, (k, v) in enumerate(zip(key_seq_list, val_seq_list)):
+                if k.size(0) > 1:
+                    perm = torch.randperm(k.size(0), device=k.device)
+                    key_seq_list[i] = k.index_select(0, perm)
+                    val_seq_list[i] = v.index_select(0, perm)
 
-        # Step 5: Post-padding (pad at the end of sequence)
-        max_seq_len = max(t.size(0) for t in key_seq_list)
-        padded_keys = []
-        padded_vals = []
-
+        max_len = max(k.size(0) for k in key_seq_list) or 1
+        padded_keys, padded_vals = [], []
         for k, v in zip(key_seq_list, val_seq_list):
-            cur_len = k.size(0)
-            if cur_len < max_seq_len:
-                pad_len = max_seq_len - cur_len
-                k_pad = torch.zeros(pad_len, k.size(1), dtype=k.dtype, device=k.device)
-                v_pad = torch.zeros(pad_len, v.size(1), dtype=v.dtype, device=v.device)
-                k = torch.cat([k, k_pad], dim=0)
-                v = torch.cat([v, v_pad], dim=0)
-            padded_keys.append(k)
-            padded_vals.append(v)
+            pad_k = torch.zeros(max_len - k.size(0), k.size(1), dtype=k.dtype, device=k.device)
+            pad_v = torch.zeros(max_len - v.size(0), v.size(1), dtype=v.dtype, device=v.device)
+            padded_keys.append(torch.cat([k, pad_k], dim=0))
+            padded_vals.append(torch.cat([v, pad_v], dim=0))
 
         return torch.stack(padded_keys, dim=0), torch.stack(padded_vals, dim=0)
+

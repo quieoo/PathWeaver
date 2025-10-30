@@ -187,7 +187,7 @@ python eval.py generation \
     --test_dataset test_synthetic.json \
     --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
     --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
-    --query_size 10 --seed -1 \
+    --query_size 10 --seed 1 \
     --save_dir ./gen_output_kbscale1
 ````
 ## seperate query head
@@ -339,5 +339,13 @@ Question: How would you describe Euler’s Edifice?
 Model output: I am sorry I cannot find relevant information in the KB.
 True answer: The description of Euler's Edifice is a luxury spa resort with a focus on wellness and relaxation.
 -------
+
+````
+
+
+## 注意力分数
+
+````bash
+python eval.py generation     --eval_mode kb --kb_size=20     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec all-MiniLM-L6-v2     --encoder_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt     --model_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700     --kb_layer_frequency 1 --kb_scale_factor 1     --dataset_dir ../datasets/synthetic_embd     --test_dataset test_synthetic.json     --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy     --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy     --query_size 10 --seed 1 --debug_flag
 
 ````
