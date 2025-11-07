@@ -312,6 +312,27 @@ def full_evaluation(model_outputs: list[str], references: list[str], lang: str =
     return comparison_str, metrics
 
 
+# 只执行EM、ROUGE评估
+def simple_evaluation(model_outputs: list[str], references: list[str], lang: str = "en") -> dict:
+    results_dict = {}
+    # --- Exact Match ---
+    try:
+        em_score = calculate_exact_match(model_outputs, references)
+        results_dict["exact_match"] = float(em_score)
+    except Exception as e:
+        print(f"❌ Error calculating Exact Match: {e}")
+
+    # --- ROUGE ---
+    try:
+        rouge = evaluate.load("rouge")
+        rouge_scores = rouge.compute(predictions=model_outputs, references=references)
+        for key, value in rouge_scores.items():
+            results_dict[key] = float(value)
+    except Exception as e:
+        print(f"❌ Error calculating ROUGE: {e}")
+
+    return results_dict
+
 # ======================
 # 🔹 示例用法
 # ======================

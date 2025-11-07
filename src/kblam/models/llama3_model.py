@@ -66,6 +66,21 @@ logger = logging.get_logger(__name__)
 
 PADDING_VALUE = torch.finfo(torch.bfloat16).min
 
+import time
+# ---- NEW: KBLaM 轻量计时缓存 ----
+KBLaM_PROFILE = {
+    "prefill_s": 0.0,      # 首 token 前（prompt prefill）累计时长（秒）
+    "decode_s": 0.0,       # 解码阶段累计时长（秒）
+    "decode_tokens": 0,    # 解码阶段累计输出 token 数
+}
+
+def kblam_profile_reset():
+    KBLaM_PROFILE["prefill_s"] = 0.0
+    KBLaM_PROFILE["decode_s"] = 0.0
+    KBLaM_PROFILE["decode_tokens"] = 0
+
+def kblam_profile_get():
+    return dict(KBLaM_PROFILE)
 
 class KblamLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' implemented as Rectangular attention"""
@@ -603,6 +618,11 @@ class LlamaModel(LlamaPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
+        # --- (forward 计时起点) ---
+        _stage_timer_start = time.perf_counter()
+        _is_prefill_call = None   # 本次 forward 是否属于 prefill
+        _q_len_this_call = None   # 本次 forward 处理的 token 数
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -643,6 +663,15 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values,
             output_attentions,
         )
+
+         # --- (prefill / decode 判定) ---
+        try:
+            _past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        except Exception:
+            _past_seen = 0
+        _q_len_this_call = inputs_embeds.shape[1]
+        # 经验定义：首次整段 prompt（q_len>1 且 past==0）视为 prefill；其后通常 q_len==1 视为 decode
+        _is_prefill_call = (_past_seen == 0 and _q_len_this_call > 1)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -708,11 +737,27 @@ class LlamaModel(LlamaPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
+            # --- (计时累计) ---
+            _elapsed = time.perf_counter() - _stage_timer_start
+            if _is_prefill_call:
+                KBLaM_PROFILE["prefill_s"] += float(_elapsed)
+            else:
+                KBLaM_PROFILE["decode_s"] += float(_elapsed)
+                KBLaM_PROFILE["decode_tokens"] += int(_q_len_this_call or 0)
+            
             return tuple(
                 v
                 for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
                 if v is not None
             )
+        # --- (计时累计) ---
+        _elapsed = time.perf_counter() - _stage_timer_start
+        if _is_prefill_call:
+            KBLaM_PROFILE["prefill_s"] += float(_elapsed)
+        else:
+            KBLaM_PROFILE["decode_s"] += float(_elapsed)
+            KBLaM_PROFILE["decode_tokens"] += int(_q_len_this_call or 0)
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -949,6 +994,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(

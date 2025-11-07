@@ -52,27 +52,6 @@ python datasets_gen.py -t musique -p1 /mnt/n0/datasets/MuSiQue/musique_ans_v1.0_
 
 ## 生成KB-Embedding
 ````bash
-python embedding.py \
-    --dataset_type musique \
-    --model_name all-MiniLM-L6-v2 \
-    --dataset_path ../datasets/musique_train_6000/train_datasets.json
-
-python embedding.py \
-    --dataset_type musique \
-    --model_name all-MiniLM-L6-v2 \
-    --dataset_path ../datasets/musique_dev_100/test_datasets.json
-
-
-# 这个版本更快
-python embedding_v2.py     --dataset_type musique     --model_name all-MiniLM-L6-v2     --dataset_path ../datasets/musique_train_19938/train_datasets.json --batch_size 1024
-
-# 保持测试集一致
-python embedding_v2.py \
-    --dataset_type musique \
-    --model_name all-MiniLM-L6-v2 \
-    --dataset_path ../datasets/musique_dev_100/test_datasets.json \
-    --batch_size 1024
-
 # 使用qwen3模型#qwen需要更高级别的transformers库
 
 conda activate qwen-embedding 
@@ -93,6 +72,14 @@ nohup python embedding_v2.py \
   --dataset_type musique \
   --dataset_path ../datasets/musique_train_19938/train_datasets.json \
   --batch_size 2048 > embed.log 2>&1 &
+
+python embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B \
+  --dataset_type synthetic \
+  --dataset_path ../datasets/synthetic_embd/test_synthetic.json \
+  --batch_size 1024
+
 ````
 功能：
     - 生成KB-Embedding，存储在dataset_path同目录下
@@ -122,6 +109,8 @@ nohup python train.py   --seed 1 --B 16 --lr 1e-4   --sep_query_head --use_cache
 nohup python train.py   --seed 1 --B 16 --lr 1e-4   --sep_query_head --use_cached_embd --use_lr_decay   --kb_token_layer_frequency 1   --encoder_spec qwen-embedding-0.6B  --key_embd_src key   --dataset_dir ../datasets/musique_train_19938/   --dataset_type musique   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/   --llm_type llama3   --model_save_dir ./train/musique_kbsize20_14000step_qemb   --gradient_accm_step 30   --save_period 500   --total_steps 5000   --kb_size 20   --outlier_num -9999   --verbose --debug_level 1 > train_musique_kbsize20_14000step_qemb.log  2>&1 &
 
 
+nohup python train.py   --seed 1 --B 16 --lr 1e-4   --sep_query_head --use_cached_embd --use_lr_decay   --kb_token_layer_frequency 1   --encoder_spec qwen-embedding-0.6B  --key_embd_src key   --dataset_dir ../datasets/musique_train_19938/   --dataset_type musique   --hf_model_spec /mnt/n0/models/llama3_8B_instruct/   --llm_type llama3   --model_save_dir ./train/debug   --gradient_accm_step 30   --save_period 100   --total_steps 5000   --kb_size 10   --outlier_num -9999   --verbose --debug_level 1 > train.debug.log  2>&1 &
+
 
 ````
 
@@ -146,7 +135,7 @@ python llama_rag_v2.py \
     --model-path /mnt/n0/models/llama3_8B_instruct \
     --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
     --n-samples 100 \
-    --similarity-top-k 3
+    --similarity-top-k 1
 
 # Oracle-RAG (Ground Truth Context)
 python llama_rag_v2.py \
@@ -186,68 +175,7 @@ conda activate llama311
 ````
 ## Token-RAG
 ````bash
-python eval.py generation \
-    --eval_mode kb \
-    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
-    --encoder_spec all-MiniLM-L6-v2 \
-    --dataset_type musique \
-    --encoder_dir ./train/musique_kbsize5_6000_nooutlier/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-9999KBSize5SepQueryHeadKeyFromkey_all-MiniLM-L6-v2_musique_llama3_step_599_encoder/encoder.pt \
-    --model_dir ./train/musique_kbsize5_6000_nooutlier/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-9999KBSize5SepQueryHeadKeyFromkey_all-MiniLM-L6-v2_musique_llama3_step_599 \
-    --kb_layer_frequency 1 \
-    --dataset_dir ../datasets/musique_dev_100 \
-    --test_dataset test_datasets.json \
-    --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_all-MiniLM-L6-v2_embd_key.npy \
-    --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_all-MiniLM-L6-v2_embd_value.npy \
-    --query_size 100 --seed -1 \
-    --kb_scale_factor 1.0 --kb_size 1
-
-
-python eval.py generation \
-    --eval_mode kb \
-    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
-    --encoder_spec all-MiniLM-L6-v2 \
-    --dataset_type musique \
-    --encoder_dir ./train/musique_kbsize1_19938_nooutlier/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-9999KBSize1SepQueryHeadKeyFromkey_all-MiniLM-L6-v2_musique_llama3_step_200_encoder/encoder.pt \
-    --model_dir ./train/musique_kbsize1_19938_nooutlier/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-9999KBSize1SepQueryHeadKeyFromkey_all-MiniLM-L6-v2_musique_llama3_step_200 \
-    --kb_layer_frequency 1 \
-    --dataset_dir ../datasets/musique_dev_100 \
-    --test_dataset test_datasets.json \
-    --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_all-MiniLM-L6-v2_embd_key.npy \
-    --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_all-MiniLM-L6-v2_embd_value.npy \
-    --query_size 100 --seed -1 \
-    --kb_scale_factor 0.125 --kb_size 1
-
-# 注意kb_layer_frequency 3, 应该和训练时一样
-python eval.py generation \
-    --eval_mode kb \
-    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
-    --encoder_spec qwen-embedding-0.6B \
-    --dataset_type musique \
-    --encoder_dir ./train/musique_kbsize10_14000step_qemb/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_4999_encoder/encoder.pt \
-    --model_dir ./train/musique_kbsize10_14000step_qemb/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_4999 \
-    --kb_layer_frequency 3 \
-    --dataset_dir ../datasets/musique_dev_100 \
-    --test_dataset test_datasets.json \
-    --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_key.npy \
-    --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_value.npy \
-    --query_size 100 --seed -1 \
-    --kb_scale_factor 1 --kb_size 1
-
-
-python eval.py generation \
-    --eval_mode kb \
-    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
-    --encoder_spec qwen-embedding-0.6B \
-    --dataset_type musique \
-    --encoder_dir ./train/debug/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_700_encoder/encoder.pt \
-    --model_dir ./train/debug/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_700 \
-    --kb_layer_frequency 3 \
-    --dataset_dir ../datasets/musique_dev_100 \
-    --test_dataset test_datasets.json \
-    --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_key.npy \
-    --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_value.npy \
-    --query_size 100 --seed -1 \
-    --kb_scale_factor 0.55 --kb_size 1
+python eval.py generation     --eval_mode kb     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec qwen-embedding-0.6B     --dataset_type musique     --encoder_dir ./train/debug/stage1_lr_0.0001KBTokenLayerFreq1UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_2500_encoder/encoder.pt     --model_dir ./train/debug/stage1_lr_0.001KBTokenLayerFreq1UseOutlier-9999KBSize10SepQueryHeadKeyFromkey_qwen-embedding-0.6B_musique_llama3_step_2500     --kb_layer_frequency 1     --dataset_dir ../datasets/musique_dev_100     --test_dataset test_datasets.json     --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_key.npy     --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_value.npy     --query_size 100 --seed -1     --kb_scale_factor 0.5 --kb_size 1
 
 ````
 
@@ -512,4 +440,34 @@ python eval.py generation \
     --kb_scale_factor 0.5 --kb_size 1 --debug_flag >> debug_eval_attention_weights.log 2>&1 &
 
 python ../tools/show_attn_weights.py     --attn_dir ./attn_weights/     --keyword "821197"     --output_dir ./attn_heatmaps/     --show max --kb_len 10
+````
+
+
+# synthetic training model
+
+````bash
+
+
+python eval.py generation     --eval_mode kb --kb_size=20     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec qwen-embedding-0.6B     --encoder_dir ./train/synthetic_qwen_lf3/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSizedynamicSepQueryHeadKeyFromkey_Qwen/Qwen3-Embedding-0.6B_train_synthetic_llama3_step_10000_encoder/encoder.pt     --model_dir ./train/synthetic_qwen_lf3/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSizedynamicSepQueryHeadKeyFromkey_Qwen/Qwen3-Embedding-0.6B_train_synthetic_llama3_step_10000     --kb_layer_frequency 3 --kb_scale_factor 1     --dataset_dir ../datasets/synthetic_embd     --test_dataset test_synthetic.json     --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_qwen-embedding-0.6B_embd_key.npy     --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_qwen-embedding-0.6B_embd_value.npy     --query_size 10 --seed 1 --debug_flag
+
+python ../tools/show_attn_weights.py     --attn_dir ./attn_weights_kblam/     --keyword ""     --output_dir ./attn_heatmaps_kblam/     --show max
+
+
+
+python eval.py generation \
+    --eval_mode kb \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --dataset_type musique \
+    --encoder_dir ./train/synthetic_qwen_lf3/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSizedynamicSepQueryHeadKeyFromkey_Qwen/Qwen3-Embedding-0.6B_train_synthetic_llama3_step_10000_encoder/encoder.pt \
+    --model_dir ./train/synthetic_qwen_lf3/stage1_lr_0.0001KBTokenLayerFreq3UseOutlier-9999KBSizedynamicSepQueryHeadKeyFromkey_Qwen/Qwen3-Embedding-0.6B_train_synthetic_llama3_step_10000 \
+    --kb_layer_frequency 3 \
+    --dataset_dir ../datasets/musique_dev_100 \
+    --test_dataset test_datasets.json \
+    --precomputed_embed_keys_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/musique_dev_100/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+    --query_size 100 --seed -1 \
+    --kb_scale_factor 0.5 --kb_size 1 --debug_flag
+# 使用synthetic训练的模型推理Musique，完全不能理解问题
+
 ````

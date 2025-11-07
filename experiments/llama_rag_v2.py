@@ -1,17 +1,28 @@
-import re
+# -*- coding: utf-8 -*-
+"""
+RAG + vLLM 推理，统计：
+- TTFT = Retrieval(检索) + Prefill(模型首 token 前)
+- TPOT = Decode 时间 / 输出 token 数（排除特殊 token）
+并输出总体统计与 full_evaluation 指标。
+"""
+
 import os
+import re
+import gc
 import json
+import time
 import argparse
+import statistics
+from collections import Counter
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
 import torch
-# 设置环境变量以优化CUDA内存分配
+
+# 优化 CUDA 内存分配
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-from collections import Counter
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from llama_index.llms.huggingface import HuggingFaceLLM
-from llama_index.core.query_engine import SubQuestionQueryEngine
-from llama_index.core.tools import QueryEngineTool
+# -------- LlamaIndex (RAG) --------
 from llama_index.core import Document, VectorStoreIndex
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 try:
@@ -19,91 +30,85 @@ try:
 except ImportError:
     from llama_index import Settings
 
+# -------- vLLM --------
+from vllm import LLM, SamplingParams
 
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from vllm import LLM
-from vllm import SamplingParams
-
+# -------- 你项目中的评测 --------
 from kblam.metrics_evaluator import full_evaluation
-import gc, time
 
 
-# ----------------------------
-# 1. 评价指标函数
-# ----------------------------
-def normalize_text(s):
-    def remove_articles(text):
-        return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text):
-        return " ".join(text.split())
-    def remove_punc(text):
-        return re.sub(r"[^\w\s]", " ", text)
-    def lower(text):
-        return text.lower()
+# =========================
+# 1) 文本归一化与基础评测
+# =========================
+def normalize_text(s: str) -> str:
+    def remove_articles(text): return re.sub(r"\b(a|an|the)\b", " ", text)
+    def white_space_fix(text): return " ".join(text.split())
+    def remove_punc(text): return re.sub(r"[^\w\s]", " ", text)
+    def lower(text): return text.lower()
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-def f1_score(prediction, ground_truth):
+
+def f1_score(prediction: str, ground_truth: str) -> float:
     pred_tokens = normalize_text(prediction).split()
     gt_tokens = normalize_text(ground_truth).split()
     common = Counter(pred_tokens) & Counter(gt_tokens)
     num_same = sum(common.values())
     if num_same == 0:
         return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(gt_tokens)
+    precision = num_same / max(1, len(pred_tokens))
+    recall = num_same / max(1, len(gt_tokens))
     return 2 * precision * recall / (precision + recall)
 
-def exact_match_score(prediction, ground_truth):
+
+def exact_match_score(prediction: str, ground_truth: str) -> bool:
     return normalize_text(prediction) == normalize_text(ground_truth)
 
-def info_contain_score(prediction, ground_truth):
+
+def info_contain_score(prediction: str, ground_truth: str) -> bool:
     return normalize_text(ground_truth) in normalize_text(prediction)
 
+
+# =========================
+# 2) 参数与数据加载
+# =========================
 def parse_args():
-    parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue Dataset')
-    
-    # 数据集参数
-    parser.add_argument('--dataset-path', type=str, default='/mnt/n0/datasets/MuSiQue/',
-                        help='MuSiQue数据集本地路径')
-    parser.add_argument('--n-samples', type=int, default=10,
-                        help='测试样本数量，建议从 5-10 开始测试')
-    
+    parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue (TTFT & TPOT)')
+    # 数据集参数（建议直接给到 jsonl 路径）
+    parser.add_argument('--dataset-path', type=str,
+                        default='/mnt/n0/datasets/MuSiQue/musique_ans_v1.0_dev.jsonl',
+                        help='MuSiQue 数据集（jsonl）本地路径')
+    parser.add_argument('--n-samples', type=int, default=10, help='测试样本数量')
+
     # 模型参数
-    parser.add_argument('--model-path', type=str, default='/mnt/n0/models/llama3_8B_instruct/',
-                        help='模型路径')
-    
+    parser.add_argument('--model-path', type=str,
+                        default='/mnt/n0/models/llama3_8B_instruct/',
+                        help='vLLM 模型路径（llama/deepseek/qwen 等）')
+
     # 检索参数
-    parser.add_argument('--similarity-top-k', type=int, default=5,
-                        help='相似度搜索返回的top k个结果')
-    parser.add_argument('--embedding-model', type=str, default='sentence-transformers/all-MiniLM-L6-v2',
+    parser.add_argument('--similarity-top-k', type=int, default=5, help='相似度检索 Top-K')
+    parser.add_argument('--embedding-model', type=str,
+                        default='sentence-transformers/all-MiniLM-L6-v2',
                         help='嵌入模型名称')
-    
     parser.add_argument('--oracle-retrieval', action='store_true',
-                        help='是否使用oracle检索（基于段落）')
+                        help='使用 oracle 检索：用 is_supporting 段落直接拼接为上下文')
+
     return parser.parse_args()
 
-# ----------------------------
-# 2. 加载 MuSiQue 数据（取前 N 个样本）
-# ----------------------------
-# 参数将在main函数中通过argparse获取
 
-# 从本地加载MuSiQue数据集
-def load_musique_dataset(dataset_path, max_samples=None):
+def load_musique_dataset(dataset_path: str, max_samples: int | None = None):
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"数据集文件不存在: {dataset_path}")
-    
     dataset = []
     with open(dataset_path, 'r', encoding='utf-8') as f:
         for line in f:
             item = json.loads(line)
             dataset.append(item)
-            
             if max_samples and len(dataset) >= max_samples:
                 break
-    
-    print(f"从本地加载了 {len(dataset)} 个MuSiQue样本")
+    print(f"从本地加载了 {len(dataset)} 个 MuSiQue 样本")
     return dataset
-# 加载数据集
+
+
 def load_data(args):
     return load_musique_dataset(args.dataset_path, args.n_samples)
 
@@ -138,8 +143,8 @@ def setup_models(args):
     
     return llm
 
+
 def clean_model(llm):
-    import torch, gc
     if llm is not None:
         if hasattr(llm, "engine") and llm.engine is not None:
             try:
@@ -149,47 +154,129 @@ def clean_model(llm):
                 print(f"⚠️ engine shutdown failed: {e}")
         del llm
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    torch.cuda.reset_peak_memory_stats()
-    print(f"✅ CUDA memory cleared. Remaining allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+        print(f"✅ CUDA memory cleared. Remaining allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-    
-# ----------------------------
-# 4. 显式检索 + 手动调用 LLM
-# ----------------------------
 
-def retrieve_single_hop(question, paras, args):
-    # 构建文档
+# =========================
+# 4) RAG 检索（计时）
+# =========================
+def retrieve_single_hop(question: str, paras: List[dict], top_k: int) -> Tuple[str, float]:
+    t0 = time.perf_counter()
+
     docs = []
     for p in paras:
         text = f"{p['title']}: {p['paragraph_text']}"
         docs.append(Document(text=text))
 
-    # 构建索引
     index = VectorStoreIndex.from_documents(docs)
-
-    retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+    retriever = index.as_retriever(similarity_top_k=top_k)
     nodes = retriever.retrieve(question)
-
-    # 拼接检索到的上下文
     context = "\n\n".join([node.get_content() for node in nodes])
 
-    return context
+    t1 = time.perf_counter()
+    retrieval_time = t1 - t0
+    return context, retrieval_time
 
-def run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_paragraphs):
-    predictions = []
-    
+
+# =========================
+# 5) vLLM 指标提取与统计
+# =========================
+SPECIAL_TOKEN_THRESHOLD = 128000  # 排除如 <|eot_id|>=128009 等特殊 token
+
+
+def _count_non_special_token_ids(token_ids) -> int:
+    if not token_ids:
+        return 0
+    return sum(1 for tid in token_ids if isinstance(tid, int) and tid < SPECIAL_TOKEN_THRESHOLD)
+
+
+def _extract_latency_from_request_output(req_out) -> Dict[str, Any]:
+    """
+    从 vLLM RequestOutput 中提取：
+      prefill_model = first_token_time - first_scheduled_time
+      decode_time   = finished_time - first_token_time
+      num_output_tokens = 生成 token 数（排除特殊 token）
+    """
+    out = {"prefill_model": None, "decode_time": None, "num_output_tokens": 0}
+    try:
+        m = getattr(req_out, "metrics", None)
+        if m is not None:
+            ft = getattr(m, "first_token_time", None)
+            fs = getattr(m, "first_scheduled_time", None)
+            fin = getattr(m, "finished_time", None)
+            if ft is not None and fs is not None:
+                out["prefill_model"] = float(ft) - float(fs)
+            if ft is not None and fin is not None:
+                out["decode_time"] = max(0.0, float(fin) - float(ft))
+    except Exception:
+        pass
+
+    try:
+        if getattr(req_out, "outputs", None):
+            token_ids = getattr(req_out.outputs[0], "token_ids", None)
+            if token_ids:
+                out["num_output_tokens"] = _count_non_special_token_ids(token_ids)
+    except Exception:
+        pass
+
+    return out
+
+
+def _percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    k = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
+    return sorted(values)[k]
+
+
+def _summarize(name: str, values: List[float], unit: str = "s"):
+    if not values:
+        print(f"[WARN] No values for {name}")
+        return
+    mean_v = statistics.fmean(values)
+    p50_v = _percentile(values, 50)
+    p95_v = _percentile(values, 95)
+    print(f"{name}: mean={mean_v:.4f}{unit}, p50={p50_v:.4f}{unit}, p95={p95_v:.4f}{unit}")
+
+
+# =========================
+# 6) 推理主循环（含 TTFT/TPOT）
+# =========================
+def run_rag_inference(
+    args, llm, questions: List[str], paragraphs_list: List[List[dict]],
+    answers: List[str], correct_paragraphs: List[List[str]]
+):
+    predictions: List[str] = []
+
+    # 统计容器
+    stat_retrieval: List[float] = []
+    stat_prefill: List[float] = []
+    stat_ttft: List[float] = []
+    stat_tpot: List[float] = []
+    stat_tokens: List[int] = []
+    stat_e2e: List[float] = []
+
     for i, (question, paras) in enumerate(zip(questions, paragraphs_list)):
-        print(f"\n[{i+1}/{args.n_samples}] Question: {question}")
+        print(f"\n[{i + 1}/{len(questions)}] Question: {question}")
 
+        # ---- 检索阶段 ----
         if args.oracle_retrieval:
-            context=correct_paragraphs[i]
+            ctx_list = correct_paragraphs[i] if isinstance(correct_paragraphs[i], list) else [str(correct_paragraphs[i])]
+            context = "\n\n".join(ctx_list)
+            retrieval_time = 0.0
         else:
-            context = retrieve_single_hop(question, paras, args)
-        # context = retrieve_multi_hop(question, paras, args, local_llm=llm)
-        if "llama" in args.model_path:
-            em_enhanced_prompt=(
+            context, retrieval_time = retrieve_single_hop(question, paras, args.similarity_top_k)
+
+        # ---- 生成阶段（计时）----
+        gen_start = time.perf_counter()
+
+        # Prompt 构造 + vLLM generate
+        if "llama" in args.model_path.lower():
+            prompt = (
                 f"<|begin_of_text|>"
                 f"<|start_header_id|>system<|end_header_id|>\n"
                 f"You answer questions with ONLY the exact answer phrase. "
@@ -205,14 +292,16 @@ def run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_pa
                 f"Answer exactly: <|eot_id|>\n"
                 f"<|start_header_id|>assistant<|end_header_id|>\n"
             )
-            response = llm.generate(em_enhanced_prompt)
-            pred = str(response[0].outputs[0].text).strip()
-        elif "deepseek" in args.model_path:
-            deepseek_prompt = (
+            resp = llm.generate(prompt)
+            req_out = resp[0]
+            pred = str(req_out.outputs[0].text).strip()
+
+        elif "deepseek" in args.model_path.lower():
+            prompt = (
                 f"<|system|>\n"
                 f"Answer the question using ONLY the given context. "
                 f"Output ONLY the exact answer phrase in English. "
-                f"Do NOT add any explanations, prefixes (like 'Answer:', 'The answer is'), suffixes, or punctuation.\n\n"
+                f"Do NOT add any explanations, prefixes, suffixes, or punctuation.\n\n"
                 f"--- Examples ---\n"
                 f"Question: Who is the spouse of the Green performer? → Miquette Giraudy\n"
                 f"Question: Capital of France? → Paris\n"
@@ -224,43 +313,28 @@ def run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_pa
                 f"Answer:\n"
                 f"<|assistant|>\n"
             )
-
-            sp=SamplingParams(
-                temperature=0.5,
-                top_p=0.95,
-                max_tokens=1024,
-            )
-            response = llm.generate(deepseek_prompt, sampling_params=sp)
-            pred = str(response[0].outputs[0].text).strip()
-
-            if i % 10==0:
-                # print("\n--- 第一个样本全部上下文 ---")
-                # print(paras)
-                # print("\n--- 第一个样本正确段落 ---")
-                # print(correct_paragraphs[i])
-                # print("\n--- RAG输出的上下文 ---")
-                # print(context)
-                print("\n--- 模型输出 ---")
-                print(pred)
-
+            sp = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=1024)
+            resp = llm.generate(prompt, sampling_params=sp)
+            req_out = resp[0]
+            pred = str(req_out.outputs[0].text).strip()
+            # 清理
             try:
                 parts = pred.split("</think>")
                 if len(parts) > 1:
                     pred = parts[1].strip()
-            except Exception as e:
-                print(f"Warning: processing prediction: {e}")
-            
-            # 取“Answer:"后的内容
+            except Exception:
+                pass
             if "Answer: " in pred:
                 pred = pred.split("Answer: ")[-1].strip()
-        elif "qwen" in args.model_path:
+
+        elif "qwen" in args.model_path.lower():
             system_prompt = (
-                f"You answer questions with ONLY the exact answer phrase. "
-                f"Never add explanations, prefixes, or punctuation. "
-                f"Examples:\n"
-                f"Question: Who wrote '1984'? → George Orwell\n"
-                f"Question: Capital of France? → Paris\n"
-                f"Question: When was Einstein born? → 1879\n"
+                "You answer questions with ONLY the exact answer phrase. "
+                "Never add explanations, prefixes, or punctuation. "
+                "Examples:\n"
+                "Question: Who wrote '1984'? → George Orwell\n"
+                "Question: Capital of France? → Paris\n"
+                "Question: When was Einstein born? → 1879\n"
             )
             user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer:"
             prompt = (
@@ -268,87 +342,140 @@ def run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_pa
                 "<|user|>\n" + user_prompt + "\n<|end|>\n"
                 "<|assistant|>\n"
             )
-            response = llm.generate(prompt)
-            pred = str(response[0].outputs[0].text).strip()
-
-            # 去除“<|end|>”及其之后的内容
+            resp = llm.generate(prompt)
+            req_out = resp[0]
+            pred = str(req_out.outputs[0].text).strip()
             if "<|end|>" in pred:
                 pred = pred.split("<|end|>")[0].strip()
-            # 去除“Explanation:”及其之后的内容
             if "Explanation: " in pred:
                 pred = pred.split("Explanation: ")[0].strip()
-            # 只保留第一行
             pred = pred.split("\n")[0].strip()
+
         else:
-            print("Unknown model path")
+            print("Unknown model path (llama/deepseek/qwen).")
+            req_out = None
+            pred = ""
+
+        gen_end = time.perf_counter()
+        gen_elapsed = gen_end - gen_start
+
+        # ---- 解析 vLLM 指标 & 计算 TTFT/TPOT ----
+        metrics = _extract_latency_from_request_output(req_out) if req_out is not None else {}
+        prefill_model = metrics.get("prefill_model", None)
+        decode_time = metrics.get("decode_time", None)
+        num_out = metrics.get("num_output_tokens", 0)
+
+        # 回退策略：拿不到精确 prefill/decode 时，用 gen_elapsed 拆分
+        if prefill_model is None or decode_time is None:
+            # 优先保证非负与拆分合理
+            if prefill_model is None and decode_time is not None:
+                prefill_model = max(0.0, gen_elapsed - decode_time)
+            elif decode_time is None and prefill_model is not None:
+                decode_time = max(0.0, gen_elapsed - prefill_model)
+            else:
+                # 都不可得，平分或置 0
+                prefill_model = max(0.0, gen_elapsed * 0.5)
+                decode_time = max(0.0, gen_elapsed - prefill_model)
+
+        # TTFT = 检索 + 模型 prefill
+        ttft = retrieval_time + prefill_model
+        # TPOT = decode_time / 输出 token 数
+        tpot = decode_time / max(1, num_out)
+
+        # ---- 记录统计 ----
+        stat_retrieval.append(retrieval_time)
+        stat_prefill.append(prefill_model)
+        stat_ttft.append(ttft)
+        stat_tpot.append(tpot)
+        stat_tokens.append(num_out)
+        stat_e2e.append(retrieval_time + gen_elapsed)
+
+        if i % 10 == 0:
+            print("\n--- 模型输出 ---")
+        print(pred)
+        print(f" → Prediction: {pred}")
+        print(f" → Ground Truth: {answers[i]}")
+        print(
+            f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
+            f"prefill(model)={prefill_model*1000:.1f} ms, "
+            f"TTFT={ttft*1000:.1f} ms, "
+            f"decode={decode_time*1000:.1f} ms, "
+            f"TPOT={tpot*1000:.1f} ms/token, "
+            f"out_tokens={num_out}, "
+            f"E2E={(retrieval_time+gen_elapsed):.3f} s"
+        )
 
         predictions.append(pred)
-        print(f"  → Prediction: {pred}")
-        print(f"  → Ground Truth: {answers[i]}")
-    
+
+    # ---- 汇总统计 ----
+    print("\n========== Latency & Throughput ==========")
+    _summarize("Retrieval time", stat_retrieval, "s")
+    _summarize("Prefill time", stat_prefill, "s")
+    _summarize("TTFT (retrieval+prefill)", stat_ttft, "s")
+    _summarize("TPOT (time per output token)", stat_tpot, "s/token")
+    if sum(stat_tokens) > 0 and sum(stat_e2e) > 0:
+        overall_tps = sum(stat_tokens) / sum(stat_e2e)  # 含检索在内的整体 tokens/sec
+        print(f"Throughput (output tokens / E2E seconds): {overall_tps:.2f} tok/s")
+    print("==========================================\n")
+
     return predictions
 
 
-
-# ----------------------------
-# 5. 计算评价指标
-# ----------------------------
-def evaluate_predictions(predictions, answers, n_samples):
+# =========================
+# 7) 额外评测（可选）
+# =========================
+def evaluate_predictions(predictions: List[str], answers: List[str], n_samples: int):
     em_scores = [exact_match_score(p, g) for p, g in zip(predictions, answers)]
     f1_scores = [f1_score(p, g) for p, g in zip(predictions, answers)]
     contain_scores = [info_contain_score(p, g) for p, g in zip(predictions, answers)]
-
-    em = sum(em_scores) / len(em_scores)
-    f1 = sum(f1_scores) / len(f1_scores)
-    contain = sum(contain_scores) / len(contain_scores)
-
-    print("\n" + "="*50)
+    em = sum(em_scores) / max(1, len(em_scores))
+    f1 = sum(f1_scores) / max(1, len(f1_scores))
+    contain = sum(contain_scores) / max(1, len(contain_scores))
+    print("\n" + "=" * 50)
     print(f"Results on {n_samples} MuSiQue samples:")
     print(f"Exact Match (EM): {em:.2%}")
-    print(f"F1 Score:         {f1:.2%}")
-    print(f"Info Contain:     {contain:.2%}")
-    print("="*50)
-    
+    print(f"F1 Score:        {f1:.2%}")
+    print(f"Info Contain:    {contain:.2%}")
+    print("=" * 50)
     return em, f1, contain
 
 
+# =========================
+# 8) 主函数
+# =========================
 def main():
-    # 解析命令行参数
     args = parse_args()
-    
+
     # 加载数据
     dev_set = load_data(args)
     questions = [ex["question"] for ex in dev_set]
     answers = [ex["answer"] for ex in dev_set]
     paragraphs_list = [ex["paragraphs"] for ex in dev_set]
-    
-    # 每个样本中的正确答案所在段落
+
+    # 每个样本的正确段落（oracle 用）
     correct_paragraphs = [[] for _ in dev_set]
     for i, ex in enumerate(dev_set):
-        correct_paragraph = None
         for p in ex["paragraphs"]:
-            if p["is_supporting"]:
+            if p.get("is_supporting", False):
                 correct_paragraphs[i].append(p["paragraph_text"])
-                
-    # 设置模型
+
+    # 模型
     llm = setup_models(args)
-    
-    # 执行RAG推理
+
+    # 推理
     predictions = run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_paragraphs)
-    
-    # 清理模型
+
+    # 清理
     clean_model(llm)
 
-    # 评估结果
-    # evaluate_predictions(predictions_copy, answers_copy, args.n_samples)
+    exit(0)
 
-    # 完整评估
-
+    # 评测（两种）
+    # 1) 简单三指标
+    evaluate_predictions(predictions, answers, args.n_samples)
+    # 2) 你项目内的完整评测
     comparison_str, metrics = full_evaluation(predictions, answers)
     print(metrics)
- 
-
-
 
 
 if __name__ == "__main__":

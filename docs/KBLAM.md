@@ -79,7 +79,137 @@ nohup python train.py \
     *_step_* 为模型保存的文件夹
     *_step_*_encoder 为encoder保存的文件夹
 
+nohup python eval.py generation     --eval_mode kb --kb_size=10     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec all-MiniLM-L6-v2     --encoder_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt     --model_dir ./train/synthetic1/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700     --kb_layer_frequency 1 --kb_scale_factor_range 0.25 4    --dataset_dir ../datasets/synthetic_embd     --test_dataset test_synthetic.json     --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy     --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy     --query_size 100 --seed 1 >> eval_kblam.log 2>&1 &
 
+# =========Train Synthetic2=============
+# 重新训练一次，但是改变学习率和batch size
+nohup python train.py \
+  --seed 1 --N 120000 --B 16  --lr 1e-4 --total_steps 4800 \
+  --sep_query_head --use_cached_embd --use_data_aug --use_lr_decay --duplicate_true_kb \
+  --dynamic_kb_size 10 100 --kb_token_layer_frequency 1 --outlier_num 2 --multi_entities 2 \
+  --encoder_spec all-MiniLM-L6-v2 --key_embd_src key \
+  --dataset_dir ../datasets/synthetic_embd --dataset_type synthetic \
+  --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+  --model_save_dir ./train/synthetic2 \
+  --gradient_accm_step 30 --save_period 100 \
+  --verbose \
+  >> train_synthetic2.log 2>&1 &
+
+nohup python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic2/stage1_lr_0.0001KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799_encoder/encoder.pt \
+    --model_dir ./train/synthetic2/stage1_lr_0.0001KBTokenLayerFreq1MultiEntities2UseOutlier2KBSizedynamicSepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799 \
+    --kb_layer_frequency 1 --kb_scale_factor_range 0.25 4 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 100 --seed 1 >> eval_kblam.log 2>&1 &
+
+
+# =========Train Synthetic3=============
+# 关闭数据增强
+nohup python train.py \
+  --seed 1 --N 120000 --B 10  --lr 5e-4 --total_steps 4800 \
+  --sep_query_head --use_cached_embd --use_lr_decay --duplicate_true_kb \
+  --dynamic_kb_size 10 100 --kb_token_layer_frequency 1 --outlier_num -999999 \
+  --encoder_spec all-MiniLM-L6-v2 --key_embd_src key \
+  --dataset_dir ../datasets/synthetic_embd --dataset_type synthetic \
+  --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+  --model_save_dir ./train/synthetic3 \
+  --gradient_accm_step 10 --save_period 100 \
+  --verbose \
+  >> train_synthetic3.log 2>&1 &
+
+nohup python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic3/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700_encoder/encoder.pt \
+    --model_dir ./train/synthetic3/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4700 \
+    --kb_layer_frequency 1 --kb_scale_factor_range 0.25 4 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 100 --seed 1 >> eval_kblam.log 2>&1 &
+
+
+# =========Train Synthetic4=============
+# 关闭动态KB， kb_size=10
+# 降低样本总数
+nohup python train.py \
+  --seed 1 --N 20000 --B 10  --lr 5e-4 --total_steps 4800 \
+  --sep_query_head --use_cached_embd --use_data_aug --use_lr_decay --duplicate_true_kb \
+  --kb_token_layer_frequency 1 --outlier_num 2 --kb_size 10 --multi_entities 2 \
+  --encoder_spec all-MiniLM-L6-v2 --key_embd_src key \
+  --dataset_dir ../datasets/synthetic_embd --dataset_type synthetic \
+  --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+  --model_save_dir ./train/synthetic4 \
+  --gradient_accm_step 10 --save_period 100 \
+  --verbose \
+  >> train_synthetic4.log 2>&1 &
+
+nohup python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic4/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799_encoder/encoder.pt \
+    --model_dir ./train/synthetic4/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799 \
+    --kb_layer_frequency 1 --kb_scale_factor_range 0.25 4 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 100 --seed 1 >> eval_kblam.log 2>&1 &
+
+
+
+# 调整KB size
+python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic4/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799_encoder/encoder.pt \
+    --model_dir ./train/synthetic4/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799 \
+    --kb_layer_frequency 1 --kb_scale_factor 1 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 100 --seed 1 
+
+
+# =========Train Synthetic5=============
+# 关闭动态KB， kb_size=10
+nohup python train.py \
+  --seed 1 --N 120000 --B 10  --lr 5e-4 --total_steps 4800 \
+  --sep_query_head --use_cached_embd --use_data_aug --use_lr_decay --duplicate_true_kb \
+  --kb_token_layer_frequency 1 --outlier_num 2 --kb_size 10 --multi_entities 2 \
+  --encoder_spec all-MiniLM-L6-v2 --key_embd_src key \
+  --dataset_dir ../datasets/synthetic_embd --dataset_type synthetic \
+  --hf_model_spec /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+  --model_save_dir ./train/synthetic5 \
+  --gradient_accm_step 10 --save_period 100 \
+  --verbose \
+  >> train_synthetic5.log 2>&1 &
+
+nohup python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec all-MiniLM-L6-v2 \
+    --encoder_dir ./train/synthetic5/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799_encoder/encoder.pt \
+    --model_dir ./train/synthetic5/stage1_lr_0.0005KBTokenLayerFreq1MultiEntities2UseOutlier2KBSize10SepQueryHeadUseDataAugKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799 \
+    --kb_layer_frequency 1 --kb_scale_factor_range 0.25 4 \
+    --dataset_dir ../datasets/synthetic_embd \
+    --test_dataset test_synthetic.json \
+    --precomputed_embed_keys_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy \
+    --precomputed_embed_values_path ../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy \
+    --query_size 100 --seed 1 >> eval_kblam.log 2>&1 &
+
+# ======================================================
 
 nohup python train.py \
   --seed 1 --N 1160 --B 10  --lr 5e-4 --total_steps 4800 \

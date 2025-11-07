@@ -134,6 +134,12 @@ if __name__ == "__main__":
             json.dump(reformatted_data, f, indent=2, ensure_ascii=False)
         args.dataset_path = output_path
 
+    elif args.dataset_type == "synthetic":
+        with open(args.dataset_path, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+        for sample in dataset:
+            key_strings.append(sample["key_string"])
+            value_strings.append(sample["description"])
     else:
         raise ValueError(f"Unsupported dataset type: {args.dataset_type}")
 

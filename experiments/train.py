@@ -31,10 +31,12 @@ from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
 from kblam.kb_retriever import KBRetriever
-
+from eval import eval_main_process
+from kblam.metrics_evaluator import simple_evaluation
 import re
 import shutil
 import random
+import gc
 LOGFORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOGFORMAT_RICH = "%(message)s"
 
@@ -78,7 +80,10 @@ parser.add_argument("--encoder_spec", type=str, default="OAI")
 parser.add_argument("--key_embd_src", type=str, default="key", choices=["key", "answer", "questions", None], help="Source of key embedding")
 parser.add_argument("--use_data_aug", action="store_true", help="Randomly pick templates for the question")
 parser.add_argument("--use_lr_decay", action="store_true")
-parser.add_argument("--dataset_dir", type=str, default="synthetic_data")
+parser.add_argument("--train_data_path", type=str, default="synthetic_data")
+parser.add_argument("--train_precomputed_embed_keys_path", type=str, default=None, help="The path of the precomputed embed keys for training")
+parser.add_argument("--train_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for training")
+
 parser.add_argument("--model_dir_to_resume", type=str, default=None, help="Checkpoint directory to resume training")
 # parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
 parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
@@ -101,6 +106,17 @@ parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
 # fmt: on
+
+# Test arguments
+parser.add_argument("--test_data_path", type=str, default=None, help="The path of the test data")
+parser.add_argument("--test_precomputed_embed_keys_path", type=str, default=None, help="The path of the precomputed embed keys for testing")
+parser.add_argument("--test_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for testing")
+parser.add_argument("--test_kb_size", type=int, default=None, help="The size of the KB set size for testing")
+parser.add_argument("--test_query_size", type=int, default=None, help="The size of the query set size for testing")
+parser.add_argument("--test_kb_scale_factor", type=float, default=None, help="The scale factor of the KB set size for testing")
+parser.add_argument("--test_kb_scale_factor_range", nargs=2, type=float, default=None, help="The range of the scale factor of the KB set size for testing")
+parser.add_argument("--eval_step", type=int, default=50, help="Evaluate every n steps")
+
 
 
 def create_custom_progress_bar(
@@ -233,6 +249,7 @@ def get_batch(
     include_outlier=False,
     multi_entities=None,
     use_extended_qa=False,
+    global_step: int = 0,
 ):
     """
     dataset: List of dictionary, denoting the KB, used to extract QA pairs
@@ -572,6 +589,10 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, key_embd_
         ).astype("float32")
     return key_embds, value_embds
 
+def _load_cached_embeddings_v2(precomputed_embed_keys_path: str, precomputed_embed_values_path: str):
+    key_embds = np.load(precomputed_embed_keys_path).astype("float32")
+    value_embds = np.load(precomputed_embed_values_path).astype("float32")
+    return key_embds, value_embds
 
 def get_step_config(
     step: int,
@@ -694,6 +715,14 @@ class Trainer:
         sep_query_head: bool = False,
         max_seq_len: int | None = None,
         dataset_format: str = "default",
+        test_dataset: list[dict] | None = None,
+        precomputed_test_embed_keys_path: str | None = None,
+        precomputed_test_embed_values_path: str | None = None,
+        test_kb_size: int | None = None,
+        test_query_size: int | None = None,
+        test_kb_scale_factor: float | None = None,
+        test_kb_scale_factor_range: tuple[float, float] | None = None,
+        eval_step: int = 50,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -737,6 +766,17 @@ class Trainer:
             self.model, self.optim, self._get_batch, self.kbretriever.encoder
         )
 
+
+        # ==== 测试集 ====
+        self.test_dataset = test_dataset
+        self.precomputed_test_embed_keys_path = precomputed_test_embed_keys_path
+        self.precomputed_test_embed_values_path = precomputed_test_embed_values_path
+        self.test_kb_size = test_kb_size
+        self.test_query_size = test_query_size
+        self.test_kb_scale_factor = test_kb_scale_factor
+        self.test_kb_scale_factor_range = test_kb_scale_factor_range
+        self.eval_step = eval_step
+
     def setup_scheduler_and_optim(self):
         if self.sep_query_head:
             self.logger.info("Query head being fine tuned!")
@@ -771,70 +811,87 @@ class Trainer:
         return scheduler, optim
 
 
-    @torch.no_grad()
     def evaluate(
         self,
-        val_set: List[Dict],
-        query_size: int,
-        kb_config: KBLaMConfig,
+        seed,
     ):
-        self.model.eval()
-        total_loss = 0.0
-        count = 0
-
-        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-
-        input_ids, attn_masks, labels, batch_indices = self._get_batch(
-            val_set,
-            self.tokenizer,
-            self.device,
-            B=query_size,
-            random_sample=True,
+        test_kb_retriever = KBRetriever(
+            self.kbretriever.encoder,
+            self.test_dataset,
+            precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
+            precomputed_embed_values_path=self.precomputed_test_embed_values_path,
         )
 
-        validate_samples = [val_set[idx] for idx in batch_indices]
-        # get kb embeddings
-        start_ids = [[] for _ in range(query_size)]
-        num_triples = [[] for _ in range(query_size)]
-        paras=[[] for _ in range(query_size)]
+        test_kb_config = KBLaMConfig(
+            sep_query_head=True,
+            kb_layer_frequency=self.kb_token_layer_frequency,
+        )
+        
+        results_pair_list, scale_factor_list = eval_main_process(
+            self.test_dataset,
+            self.tokenizer,
+            self.model,
+            test_kb_retriever,
+            test_kb_config,
+            test_kb_retriever,
+            kb_scale_factor_range=self.test_kb_scale_factor_range,
+            kb_scale_factor=self.test_kb_scale_factor,
+            dataset_type=self.dataset_format,
+            seed=seed,
+            kb_size=self.test_kb_size,
+            query_size=self.test_query_size,
+        )
 
-        for i in range(len(validate_samples)):
-            sample = validate_samples[i]
-            paragraphs = sample["paragraphs"]
-            support_paras = []
-            for qd in sample["question_decomposition"]:
-                true_idx = int(qd["paragraph_support_idx"])
-                support_paras.append(paragraphs[true_idx])
+        for (results_pair, scale_factor) in zip(results_pair_list, scale_factor_list):
+            model_outputs, answers = results_pair
+            simple_score_dict=simple_evaluation(model_outputs, answers)
+            self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
+            # 输出前5个样本的结果
+            for idx in range(5):
+                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
 
-            blocks = _normalize_blocks(support_paras, sample_id=i)
+    def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False):
+        self.logger.info("===== [SAFE EVALUATION START] =====")
 
-            start_ids[i]   = [s for (s, n, p) in blocks]
-            num_triples[i] = [n for (s, n, p) in blocks]
-            paras[i]       = [p for (s, n, p) in blocks]
+        try:
+            # Step 1️⃣ 同步与清理：确保所有GPU空闲
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            gc.collect()
 
-        kb_embs = kb_retriever.get_embeddings(start_ids, num_triples, query_size, is_inference=True)
+            # Step 2️⃣ 保存训练状态
+            was_training_model = self.model.training
+            was_training_encoder = self.kbretriever.encoder.training
+            model_grad_state = torch.is_grad_enabled()
 
-        for i in range(query_size):
-            out = self.model(
-                input_ids=input_ids[i],
-                attention_mask=attn_masks[i],
-                kb_kvs=kb_embs[i],
-                kb_config=kb_config,
-            )
-            logits = out["logits"]
+            # Step 3️⃣ 禁用梯度与 checkpoint
+            torch.set_grad_enabled(False)
+            self.model.gradient_checkpointing_disable()
+            self.model.eval()
+            self.kbretriever.encoder.eval()
+            torch.cuda.synchronize()
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # Step 4️⃣ 执行评估（复用已有 evaluate 逻辑）
+            self.logger.info("Running evaluation under no-grad mode...")
+            self.evaluate(seed=seed)
 
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
-            total_loss += loss.item()
-            count += 1
+        except Exception as e:
+            self.logger.error(f"[SAFE_EVAL ERROR] {type(e).__name__}: {e}")
+            self.logger.error(traceback.format_exc())
+        finally:
+            # Step 5️⃣ 恢复训练状态
+            torch.set_grad_enabled(model_grad_state)
+            if was_training_model:
+                self.model.train()
+                self.model.gradient_checkpointing_enable()
+            if was_training_encoder:
+                self.kbretriever.encoder.train()
 
-        self.model.train()
-        return total_loss / max(count, 1)
+            # Step 6️⃣ 释放显存
+            if not delay_cleanup:
+                torch.cuda.empty_cache()
+                gc.collect()
+
 
     def train(
         self,
@@ -893,6 +950,8 @@ class Trainer:
                         multi_entities,
                         use_extended_qa,
                     )
+                    if debug_level > 0:
+                        print(f"step_config: {step_config}")
                     input_ids, attention_masks, labels, batch_indices = self._get_batch(
                         training_set,
                         self.tokenizer,
@@ -1190,6 +1249,10 @@ class Trainer:
                         self.logger.error(f"Error details: {str(e)}")
                         raise e
 
+
+                # 运行模型验证
+                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :
+                    self.safe_evaluate_wrapper(seed=1)
     
 def main():
 
@@ -1220,7 +1283,6 @@ def main():
     use_data_aug = args.use_data_aug
     use_lr_decay = args.use_lr_decay
     use_cached_embd = args.use_cached_embd
-    dataset_dir = args.dataset_dir
     model_dir_to_resume = args.model_dir_to_resume
     model_save_dir = args.model_save_dir
     sep_query_head = args.sep_query_head
@@ -1300,35 +1362,43 @@ def main():
     os.environ["SCALE_FACTOR"] = ""
 
     if use_cached_embd:
-        # We load the pre-computed version stored on the disk rather
-        # than computing them on the fly to make things faster
-        logger.info(f"Using pre-computed {encoder_spec} embedding")
-        key_embds, value_embds = _load_cached_embeddings(encoder_spec, dataset_dir, key_embd_src)
+        key_embds, value_embds = _load_cached_embeddings_v2(args.train_precomputed_embed_keys_path, args.train_precomputed_embed_values_path)
+
+
 
 
     prefix_string = get_prefix_str(args)
     logger.info(f"Experiment prefix {get_prefix_str(args)}")
 
-    if use_extended_qa:
-        dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
-    else:
-# DATASET_SUPPORT
-        if dataset_name == "multi_wiki_qa_train":
-            dataset_path=os.path.join(dataset_dir, f"{dataset_name}.json")
-            with open(dataset_path, "r", encoding="utf-8") as f:
-                dataset = [json.loads(line.strip()) for line in f]
-        elif "musique" in dataset_name:
-            # search for dataset file: end with "json", include "train"
-            dataset_path = glob.glob(os.path.join(dataset_dir, "*train*.json"))[0]
-            print(f"[INFO]: Using dataset file {dataset_path}")
-            with open(dataset_path, "r", encoding="utf-8") as f:
-                dataset = json.load(f)
-        else:
-            dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}.json")))
+
+    dataset=json.load(open(args.train_data_path))
+
+#     if use_extended_qa:
+#         dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
+#     else:
+# # DATASET_SUPPORT
+#         if dataset_name == "multi_wiki_qa_train":
+#             dataset_path=os.path.join(dataset_dir, f"{dataset_name}.json")
+#             with open(dataset_path, "r", encoding="utf-8") as f:
+#                 dataset = [json.loads(line.strip()) for line in f]
+#         elif "musique" in dataset_name:
+#             # search for dataset file: end with "json", include "train"
+#             dataset_path = glob.glob(os.path.join(dataset_dir, "*train*.json"))[0]
+#             print(f"[INFO]: Using dataset file {dataset_path}")
+#             with open(dataset_path, "r", encoding="utf-8") as f:
+#                 dataset = json.load(f)
+#         else:
+#             dataset = json.load(open(os.path.join(dataset_dir, f"train_datasets.json")))
 
     N = min(N, len(dataset))
     training_set = dataset[:N]
     print(f"[INFO]: Loaded {N} samples for training")
+
+    if args.test_data_path is not None:
+        test_dataset = json.load(open(args.test_data_path))
+        print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
+    else:
+        test_dataset = None
 
     # Set up the LLM
     llm_model_spec = model_dir_to_resume if model_dir_to_resume else hf_model_spec
@@ -1444,6 +1514,14 @@ def main():
         sep_query_head=sep_query_head,
         max_seq_len=max_seq_len,
         dataset_format=dataset_format,
+        test_dataset=test_dataset,
+        precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
+        precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,
+        test_kb_size=args.test_kb_size,
+        test_query_size=args.test_query_size,
+        test_kb_scale_factor=args.test_kb_scale_factor,
+        test_kb_scale_factor_range=args.test_kb_scale_factor_range,
+        eval_step=args.eval_step,
     )
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")

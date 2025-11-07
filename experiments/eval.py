@@ -39,6 +39,8 @@ from kblam.utils.train_utils import get_kb_embd
 from kblam.kb_retriever import KBRetriever
 from kblam.metrics_evaluator import full_evaluation
 import time
+from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
+
 
 debug_flag = True
 logging.set_verbosity_warning()
@@ -49,7 +51,6 @@ def perform_eval_musique(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
     tokenizer: transformers.PreTrainedTokenizer,
     kb_retriever: KBRetriever,
-    encoder_model_spec: str,
     kb_config: KBLaMConfig,
     eval_mode: str = "kb",
     kb_size: int = 1,
@@ -133,8 +134,7 @@ def perform_eval_musique(
             assert all(start_ids[i][k] <= start_ids[i][k+1] for k in range(len(start_ids[i]) - 1)), \
                 f"[sample {i}] start_ids not non-decreasing after normalization."
         else:
-            raise ValueError(f"Unsupported kb_size: {kb_size}")
-    
+            raise ValueError(f"Unsupported kb_size: {kb_size}")   
     if debug_flag:
         print(f"sample {sample['id']} chosen triples {start_ids[i]} {num_triples[i]}")
         # 逐条打印三元组id加内容
@@ -147,9 +147,9 @@ def perform_eval_musique(
                     print(f"Triple {t_id} : {triple}")
                     t_id+=1
             
-
-
     kb_embeddings = kb_retriever.get_embeddings(start_ids, num_triples, query_size, is_inference=True)
+
+    retrieval_time=0.0003
 
     kb_keys, kb_values = kb_embeddings
     
@@ -157,16 +157,17 @@ def perform_eval_musique(
     model_outputs = []
     answers = []
     start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
     for i in range(query_size):
         sample = test_samples[i]
         Q=sample["question"]
         answer=sample["answer"]
-
         kb_i=(kb_keys[i], kb_values[i])
-
         # zoro Value 测试
         # kb_i=(kb_keys[i], torch.zeros_like(kb_values[i]))
         
+        kblam_profile_reset()
         if debug_flag:
             model_output=answer_question_deterministic(
                 tokenizer,
@@ -190,6 +191,16 @@ def perform_eval_musique(
                 kb_config=kb_config,
             ).split(Q)[1]
 
+        prof = kblam_profile_get()
+        prefill_s = prof["prefill_s"]                # 模型 prefill
+        decode_s = prof["decode_s"]
+        decode_tokens = max(1, prof["decode_tokens"])
+        tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+        ttft = retrieval_time + prefill_s
+
+        TTFTs.append(ttft)
+        TPOTs.append(tpot)
+
         model_output = model_output[2:]
         full_outputs.append((model_output,answer))
         answers.append(answer)
@@ -204,48 +215,21 @@ def perform_eval_musique(
     
     end_time=time.time()
     print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
+
     if debug_flag:
         exit(0)
 
-    return full_evaluation(model_outputs, answers)
+    return model_outputs, answers
     
-def eval_musique_scale(
-    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
-    tokenizer: transformers.PreTrainedTokenizer,
-    kb_retriever: KBRetriever,
-    encoder_model_spec: str,
-    kb_config: KBLaMConfig,
-    eval_mode: str = "kb",
-    kb_size: int = 1,
-    seed: int = 1,
-    query_size: int = 100,
-):
-    scale_factors=[0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
-
-    for sf in scale_factors:
-        print(f"------- kb_scale_factor: {sf} -------")
-        kb_config.kb_scale_factor=sf
-        comparison_str, metrics=perform_eval_musique(
-            model,
-            tokenizer,
-            kb_retriever,
-            encoder_model_spec,
-            kb_config,
-            eval_mode,
-            kb_size,
-            seed,
-            query_size,
-        )
-        print(metrics)
-    exit(0)
-
 
 
 def perform_eval(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
     tokenizer: transformers.PreTrainedTokenizer,
     kb_retriever: KBRetriever,
-    encoder_model_spec: str,
     kb_config: KBLaMConfig,
     eval_mode: str = "kb",
     kb_size: int = 250,
@@ -254,7 +238,7 @@ def perform_eval(
     remove_sorry: bool = False,
     query_size: int = 250,
 ):
-    np.random.seed(seed)
+    # np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
 
     # if debug_flag:
@@ -271,7 +255,6 @@ def perform_eval(
 
     kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
 
-
     model_outputs = []
     answers = []
     full_outputs = []
@@ -281,7 +264,8 @@ def perform_eval(
     )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
     # subset_size = 50
     # for row in tqdm(test_kb[:subset_size]):
-    for i in range(subset_size):
+    # for i in range(subset_size):
+    for i in tqdm(range(subset_size)):
         row=test_kb[i]
         idx=kb_idx[i]
         if multi_entites == -1:
@@ -315,7 +299,7 @@ def perform_eval(
                 save_attention_weights=True,
                 attention_save_loc="./attn_weights_kblam/",
                 attention_file_base_name=f"kb-{idx}",
-                save_attn_weights_policy="all-step-last-layer",
+                # save_attn_weights_policy="all-step-last-layer",
             ).split(Q)[1]
             # 去除输出中的前两个换行符
             model_output = model_output[2:]
@@ -364,35 +348,130 @@ def perform_eval(
         print(f"GT: {gt}")
     print(f"KB size: {kb_size}, mode: {eval_mode}")
 
-    if debug_flag:
-        exit(0)
-    rouge = evaluate.load("rouge")
-    rouge_scores = rouge.compute(predictions=model_outputs, references=answers)
-    print(rouge_scores)
+    return model_outputs, answers
+    # results, results_dict=full_evaluation(model_outputs, answers)
+    # return results, results_dict
 
-    results_dict = {k: float(v) for k, v in rouge_scores.items()}
+def perform_eval_v2(
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    kb_retriever: KBRetriever,
+    kb_config: KBLaMConfig,
+    eval_mode: str = "kb",
+    kb_size: int = 250,
+    seed: int = 1,
+    multi_entites: int = -1,
+    remove_sorry: bool = False,
+    query_size: int = 250,
+):
+    if seed < 0:
+        np.random.seed(None)
+    else:
+        np.random.seed(seed)
+
+    if query_size <= kb_size:
+        return perform_eval(
+            model,
+            tokenizer,
+            kb_retriever,
+            encoder_model_spec,
+            kb_config,
+            eval_mode,
+            kb_size,
+            seed,
+            multi_entites,
+            remove_sorry,
+            query_size,
+        )    
+    dataset = kb_retriever.dataset
+    total_N = len(dataset)
+
+    subset_idx=np.random.randint(0, total_N, query_size)
+    subset=[dataset[idx] for idx in subset_idx]
+    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx)
+    key_embeddings, value_embeddings=kb_embeddings
+
+
+    # 统一的结果容器
+    all_model_outputs, all_answers = [], []
+
+    # 计算批次数
+    num_batches = (query_size + kb_size - 1) // kb_size
+
+    print(f"[INFO] Eval mode={eval_mode}, KB size={kb_size}, Query size={query_size}, total_batches={num_batches}")
+
+    for batch_id in tqdm(range(num_batches)):
+        # ---- 当前批的 query 索引范围 ----
+        start_idx = batch_id * kb_size
+        end_idx = min((batch_id + 1) * kb_size, query_size)
+        current_query_num = end_idx - start_idx
+
+        # ---- KB 子集：固定大小 ----
+        sub_kb_embedding=(key_embeddings[start_idx:end_idx], value_embeddings[start_idx:end_idx])
+
+        # ---- Query 子集 ----
+        query_subset=subset[start_idx:end_idx]
+
+        # ---- 处理本批次 ----
+        model_outputs, answers = [], []
+        for i in range(current_query_num):
+            row = query_subset[i]
+            idx = subset_idx[start_idx + i]
+            if multi_entites == -1:
+                Q, A = row["Q"], row["description"]
+            else:
+                kb_subset_idx = np.random.randint(0, total_N, multi_entites)
+                Q, A = generate_multi_entity_qa(
+                    [dataset[j]["name"] for j in kb_subset_idx],
+                    [dataset[j]["description_type"] for j in kb_subset_idx],
+                    [dataset[j]["description"] for j in kb_subset_idx],
+                )
+            if eval_mode != "kb":
+                raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+            output_text = answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=sub_kb_embedding,
+                kb_config=kb_config,
+                save_attention_weights=debug_flag,
+                attention_save_loc="./attn_weights_kblam/",
+                attention_file_base_name=f"kb-{idx}",
+            ).split(Q)[1]
+            model_output=output_text[2:]
+            if remove_sorry and "sorry" in model_output.lower():
+                continue
+
+            if multi_entites == -1:
+                pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
+                match = re.search(pattern, model_output)
+                answers.append(row["description"])
+                if match:
+                    model_output = match.group(1)
+            else:
+                pattern = r"(?:is|are) (.*?)(?:\.|;)"
+                matches = re.findall(pattern, model_output)
+                model_output = "; ".join(matches)
+                answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
+            model_outputs.append(model_output)
+
+        # ---- 聚合 ----
+        all_model_outputs.extend(model_outputs)
+        all_answers.extend(answers)
+
+        # print(f"[INFO] Batch {batch_id+1}/{num_batches} done. Queries={current_query_num}")
+
+    return all_model_outputs, all_answers
+
+    # # ---- 统一计算评估指标 ----
+    # results, results_dict = full_evaluation(all_model_outputs, all_answers)
+    # print(f"[DONE] Evaluated {len(all_model_outputs)} queries with KB size={kb_size}")
+    # print(results)
+    # return results, results_dict
+
+
     
-    bert_score = evaluate.load("bertscore")
-    bertscore = bert_score.compute(
-        predictions=model_outputs,
-        references=answers,
-        lang="en",
-        model_type="microsoft/deberta-xlarge-mnli",
-    )
-    # bert_scores = []
-    # bert_scores = {}
-    for k, v in bertscore.items():
-        if isinstance(v, list):
-            # bert_scores.append(np.mean(v))
-            results_dict[f"bert_score_{k}"] = float(np.mean(v))
-            print(k, np.mean(v))
-    results = ""
-    for a, A in full_outputs:
-        results += f"Model output: {a}\nTrue answer: {A}\n-------\n"
-    if eval_mode == "kb":
-        eval_mode = encoder_model_spec + eval_mode
 
-    return results, results_dict
 
 
 def perform_eval_refusal(
@@ -516,6 +595,15 @@ parent_parser.add_argument(
     default=None,
     help="Scaling factor for knowledge base",
 )
+
+parent_parser.add_argument(
+    "--kb_scale_factor_range",
+    nargs=2,
+    type=float,
+    default=None,
+    help="Range of scaling factor for knowledge base",
+)
+
 parent_parser.add_argument(
     "--kb_size", type=int, default=200, help="Size of the knowledge base"
 )
@@ -755,6 +843,64 @@ basic_parser.add_argument(
 )
 
 
+def eval_main_process(
+    dataset: list[dict],
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    encoder: KBEncoder,
+    kb_config: KBLaMConfig,
+    kb_retriever: KBRetriever,
+    kb_scale_factor_range: list[float] | None = None,
+    kb_scale_factor: float | None = None,
+    dataset_type: str = "default",
+    seed: int = 42,
+    kb_size: int = -1,
+    query_size: int = -1,
+    eval_mode: str = "kb",
+):
+    if kb_scale_factor_range is not None:
+        scale_factor_list=[]
+        start=kb_scale_factor_range[0]
+        end=kb_scale_factor_range[1]
+        while start<=end:
+            scale_factor_list.append(start)
+            start*=2
+    else:
+        scale_factor_list=[kb_scale_factor]
+    print(f"---- kb_scale_factor_range: {scale_factor_list}")
+
+    results_pair_list=[]
+    for sf in scale_factor_list:
+        kb_config.kb_scale_factor = sf
+        if dataset_type == "musique":
+            model_outputs, answers = perform_eval_musique(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            )
+        else:
+            model_outputs, answers = perform_eval_v2(
+            # gen_results, score_results = perform_eval(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            )
+        
+        results_pair_list.append((model_outputs, answers))
+    return results_pair_list, scale_factor_list
+
+
+
 def eval_generate():
     """Evaluate generation using KB"""
     args = parser.parse_args()
@@ -770,6 +916,8 @@ def eval_generate():
     exp_config = args.exp_config_name
     kb_layer_frequency = args.kb_layer_frequency
     kb_scale_factor = args.kb_scale_factor
+    kb_scale_factor_range = args.kb_scale_factor_range
+
     kb_size = args.kb_size
     llm_base_dir = args.llm_base_dir
     llm_type = args.llm_type
@@ -802,40 +950,36 @@ def eval_generate():
         precomputed_embed_values_path=precomputed_embed_values_path,
     )
 
-    if args.dataset_type == "musique":
-        gen_results, score_results = perform_eval_musique(
-        model,
+    results_pair_list, scale_factor_list = eval_main_process(
+        dataset,
         tokenizer,
-        kb_retriever,
-        encoder_model_spec,
+        model,
+        encoder,
         kb_config,
-        eval_mode,
-        seed=seed,
-        kb_size=kb_size,
-        query_size=args.query_size,
+        kb_retriever,
+        kb_scale_factor_range,
+        kb_scale_factor,
+        args.dataset_type,
+        seed,
+        kb_size,
+        args.query_size,
     )
-    else:
-        gen_results, score_results = perform_eval(
-            model,
-            tokenizer,
-            kb_retriever,
-            encoder_model_spec,
-            kb_config,
-            eval_mode,
-            seed=seed,
-            kb_size=kb_size,
-            multi_entites=args.multi_entites,
-            query_size=args.query_size,
-        )
-    mem_cost = torch.cuda.max_memory_reserved("cuda")
-    score_results["mem_cost"] = mem_cost
-    print(score_results)
-    # print(gen_results)
-    if args.save_dir is not None:
-        (Path(args.save_dir) / exp_config).mkdir(exist_ok=True, parents=True)
-        write_to_json(score_results, Path(args.save_dir) / f"{exp_config}.json")
-        text_file = open(os.path.join(args.save_dir, exp_config + ".txt"), "w")
-        text_file.write(gen_results)
+
+    for i in range(len(results_pair_list)):
+        model_outputs, answers = results_pair_list[i]
+        sf = scale_factor_list[i]
+        
+        gen_results, score_results = full_evaluation(model_outputs, answers)
+        # mem_cost = torch.cuda.max_memory_reserved("cuda")
+        # score_results["mem_cost"] = mem_cost
+        # print(score_results)
+        # print(gen_results)
+        print(f"---- kb_scale_factor: {sf}, {score_results}")
+        if args.save_dir is not None:
+            (Path(args.save_dir) / exp_config).mkdir(exist_ok=True, parents=True)
+            write_to_json(score_results, Path(args.save_dir) / f"{exp_config}-{sf}.json")
+            text_file = open(os.path.join(args.save_dir, f"{exp_config}-{sf}.txt"), "w")
+            text_file.write(gen_results)
 
 
 def _prepare_models(
