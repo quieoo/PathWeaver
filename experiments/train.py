@@ -33,6 +33,7 @@ from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, set
 from kblam.kb_retriever import KBRetriever
 from eval import eval_main_process
 from kblam.metrics_evaluator import simple_evaluation
+from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short
 import re
 import shutil
 import random
@@ -163,20 +164,6 @@ def create_custom_progress_bar(
     return progress
 
 
-def _format_QA_llama(Q: str, A: str):
-    return (
-        "<|start_header_id|>user<|end_header_id|> "
-        + Q
-        + "<|eot_id|>"
-        + "<|start_header_id|>assistant<|end_header_id|>"
-        + A
-        + "<|eot_id|>"
-    )
-
-
-def _format_QA_phi3(Q: str, A: str):
-    return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n" + A + "<|end|>\n"
-
 
 # 构建训练标签：只计算模型对assistant回答部分的预测损失，而忽略对用户提问等其他内容的预测
 def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
@@ -192,7 +179,7 @@ def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tok
     labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
     return labels
 
-def _create_labels_for_llama_enhanced(input_ids: torch.Tensor, tokenizer) -> torch.Tensor:
+def _create_labels_for_llama_enhanced(input_ids: torch.Tensor, input_strs: List[str], tokenizer) -> torch.Tensor:
     """
     Create labels for Llama-3-style dialogue:
     - Mask everything before and including <|start_header_id|>assistant<|end_header_id|>
@@ -745,15 +732,17 @@ class Trainer:
         self.dataset_format = dataset_format
 
         if isinstance(llm_model, KBLaMPhi3ForCausalLM):  # Phi3
-            self._get_batch = partial(get_batch, _format_QA_phi3, _create_labels_for_phi3)
+            self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
             self._get_params = _get_phi3_query_head_parameters
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
             if dataset_format == "default":            
-                self._get_batch = partial(get_batch, _format_QA_llama, _create_labels_for_llama)
+                self._get_batch = partial(get_batch, format_QA_llama, _create_labels_for_llama_enhanced)
             elif dataset_format == "autoschemakg":
-                self._get_batch = partial(get_batch_from_document, _format_QA_llama, _create_labels_for_llama)
+                self._get_batch = partial(get_batch_from_document, format_QA_llama, _create_labels_for_llama_enhanced)
             elif dataset_format == "musique":
-                self._get_batch = partial(get_batch_musique, _format_QA_llama, _create_labels_for_llama)
+                self._get_batch = partial(get_batch_musique, format_QA_llama, _create_labels_for_llama_enhanced)
+            elif dataset_format == "squad":
+                self._get_batch = partial(get_batch, format_QA_llama_short, _create_labels_for_llama_enhanced)
             else:
                 raise ValueError(f"{dataset_format} not recognised")
             self._get_params = _get_llama3_query_head_parameters
@@ -831,7 +820,7 @@ class Trainer:
             self.test_dataset,
             self.tokenizer,
             self.model,
-            test_kb_retriever,
+            self.kbretriever.encoder,
             test_kb_config,
             test_kb_retriever,
             kb_scale_factor_range=self.test_kb_scale_factor_range,
@@ -860,16 +849,16 @@ class Trainer:
             gc.collect()
 
             # Step 2️⃣ 保存训练状态
-            was_training_model = self.model.training
             was_training_encoder = self.kbretriever.encoder.training
             model_grad_state = torch.is_grad_enabled()
 
             # Step 3️⃣ 禁用梯度与 checkpoint
             torch.set_grad_enabled(False)
-            self.model.gradient_checkpointing_disable()
-            self.model.eval()
             self.kbretriever.encoder.eval()
             torch.cuda.synchronize()
+
+            np_state = np.random.get_state()
+            torch_state = torch.random.get_rng_state()
 
             # Step 4️⃣ 执行评估（复用已有 evaluate 逻辑）
             self.logger.info("Running evaluation under no-grad mode...")
@@ -880,10 +869,9 @@ class Trainer:
             self.logger.error(traceback.format_exc())
         finally:
             # Step 5️⃣ 恢复训练状态
+            np.random.set_state(np_state)
+            torch.random.set_rng_state(torch_state)
             torch.set_grad_enabled(model_grad_state)
-            if was_training_model:
-                self.model.train()
-                self.model.gradient_checkpointing_enable()
             if was_training_encoder:
                 self.kbretriever.encoder.train()
 
@@ -891,7 +879,21 @@ class Trainer:
             if not delay_cleanup:
                 torch.cuda.empty_cache()
                 gc.collect()
+            
 
+    def _debug_module_modes(self, tag: str = ""):
+    # 汇总部分子模块状态（只打印前几个，避免刷屏）
+        drop_modes, ln_modes = [], []
+        for name, m in self.model.named_modules():
+            if isinstance(m, torch.nn.Dropout) and len(drop_modes) < 5:
+                drop_modes.append((name, m.training))
+            if isinstance(m, torch.nn.LayerNorm) and len(ln_modes) < 5:
+                ln_modes.append((name, m.training))
+        self.logger.info(f"[ModeCheck{(':'+tag) if tag else ''}] "
+                        f"model.training={self.model.training} "
+                        f"encoder.training={self.kbretriever.encoder.training} "
+                        f"dropout={drop_modes} "
+                        f"layernorm={ln_modes}")
 
     def train(
         self,
@@ -1249,10 +1251,17 @@ class Trainer:
                         self.logger.error(f"Error details: {str(e)}")
                         raise e
 
+                
+                
 
                 # 运行模型验证
-                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :
+                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :                    
                     self.safe_evaluate_wrapper(seed=1)
+
+                
+                
+                
+
     
 def main():
 

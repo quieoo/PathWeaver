@@ -51,6 +51,7 @@ def compute_embeddings(
         all_elements[i : i + batch_size]
         for i in range(0, len(all_elements), batch_size)
     ]
+    print(f" {part}: {chunks[0]}")
 
     model = SentenceTransformer(encoder_model_spec, device="cuda")
     for chunk in tqdm(chunks):

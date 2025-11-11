@@ -385,6 +385,20 @@ class KblamLlamaAttention(nn.Module):
         # save attention weights
         if not attn_weights.requires_grad:
             # TODO: Make this function injectable
+            # chosen_layers=[13, 14, 15]
+            # if q_len > 1 and kb_kvs is not None and self.layer_idx % kb_layer_frequency == 0 and self.layer_idx in chosen_layers:
+            #     # 统计正确Token（KB-0）的注意力得分
+            #     kb_len_local = kb_len if "kb_len" in locals() else 0
+            #     if kb_len_local > 0:
+            #         # 所有 Query Token 对 KB Token 的注意力取最大值，再在 head 上平均
+            #         kb_attn = attn_weights[:, :, :, :kb_len_local].max(dim=2).values  # (bsz, num_heads, kb_len)
+            #         kb_mean = kb_attn.mean(dim=1)                # (bsz, kb_len)
+            #         correct = kb_mean[:, 0:1]                    # (bsz,1)
+            #         rank = (kb_mean > correct).sum(dim=1).float() + 1.0
+            #         # 归一化成百分位（1最好 → 0.0）
+            #         percentile = 1.0 - (rank - 1) / (kb_mean.size(1) - 1)
+            #         mass_share = (kb_mean[:, 0] / (kb_mean.sum(dim=1) + 1e-9)).mean().item()
+            #         print(f"[L{self.layer_idx}] KB正确token百分位(均值)= {percentile.mean().item():.3f} ,注意力份额= {mass_share:.3f}")
             if save_attention_weights:
                 os.makedirs(attention_save_loc, exist_ok=True)
                 if save_attn_weights_policy == "prefill-all-layer":

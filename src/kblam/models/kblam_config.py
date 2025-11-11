@@ -11,6 +11,7 @@ class KBLaMConfig(PretrainedConfig):
         dynamic_sparsify: bool = False,
         sep_query_head: bool = False,
         attn_implementation: str = "eager",
+        format_short: bool = False,
         **kwargs,
     ):
         self.base_model_name_or_path = base_model_name_or_path
@@ -20,4 +21,5 @@ class KBLaMConfig(PretrainedConfig):
         self.dynamic_sparsify = dynamic_sparsify
         self.sep_query_head = sep_query_head
         self.attn_implementation = attn_implementation
+        self.format_short = format_short
         super().__init__(**kwargs)

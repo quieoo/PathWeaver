@@ -28,8 +28,8 @@ from kblam.utils.eval_utils import (
     instruction_prompts_multi_entities,
     zero_shot_prompt,
     zero_shot_prompt_multi_entities,
-    _format_Q_llama,
-    _format_Q_phi3,
+    format_Q_llama,
+    format_Q_phi3,
     model_prune_format_mapping,
     answer_question,
     answer_question_deterministic,
@@ -289,6 +289,12 @@ def perform_eval(
         # kb_i=(row_i, v_i)
         kb_i=kb_embedding
 
+        # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+        kb_i = move_true_kb_to_front_inference(
+            kb_i,
+            i,
+        )
+
         if eval_mode == "kb":
             model_output = answer_question_deterministic(
                 tokenizer,
@@ -351,6 +357,46 @@ def perform_eval(
     return model_outputs, answers
     # results, results_dict=full_evaluation(model_outputs, answers)
     # return results, results_dict
+
+
+def move_true_kb_to_front_inference(kb_embedding, true_index: int):
+    """
+    适用于推理阶段的版本：
+    kb_embedding: (N, D)
+    true_index: 正确 key 的索引
+    """
+    if true_index == 0:
+        return kb_embedding  # 已在开头
+
+    kb_keys, kb_vals = kb_embedding
+
+    # 可选，全部置零
+    # kb_keys = torch.zeros_like(kb_keys)
+    # kb_vals = torch.zeros_like(kb_vals)
+    # return (kb_keys, kb_vals)
+
+    # 复制以避免原地修改
+    new_keys = kb_keys.clone()
+    new_vals = kb_vals.clone()
+
+    true_key = new_keys[true_index].clone()
+    true_val = new_vals[true_index].clone()
+
+    # 把第0位和true_index交换
+    new_keys[true_index], new_keys[0] = new_keys[0], true_key
+    new_vals[true_index], new_vals[0] = new_vals[0], true_val
+
+    # 可选：将true_key和true_val设为空，观察模型结果，可以看到模型精度大幅下降，说明正确答案的位置是对的，并且被掩盖
+    # new_keys[0] = torch.zeros_like(true_key)
+    # new_vals[0] = torch.zeros_like(true_val)
+
+    # 可选：将除了true_index之外的其他key设为空，观察模型结果
+    # new_keys[1:] = torch.zeros_like(new_keys[1:])
+    # new_vals[1:] = torch.zeros_like(new_vals[1:])
+
+
+    return (new_keys, new_vals)
+
 
 def perform_eval_v2(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
@@ -428,6 +474,12 @@ def perform_eval_v2(
                 )
             if eval_mode != "kb":
                 raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+
+            # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+            sub_kb_embedding = move_true_kb_to_front_inference(
+                sub_kb_embedding,
+                i,
+            )
             output_text = answer_question_deterministic(
                 tokenizer,
                 model,
@@ -884,6 +936,10 @@ def eval_main_process(
                 query_size=query_size,
             )
         else:
+            
+            if dataset_type == "squad":
+                kb_config.format_short = True
+
             model_outputs, answers = perform_eval_v2(
             # gen_results, score_results = perform_eval(
                 model,
@@ -1044,6 +1100,8 @@ def _prepare_models(
         projector_kwargs={"mlp_depth": 1, "mlp_hidden_dim": 512},
         device=torch.device("cuda"),
     )
+    # print(f"encoder out_dim: {model.config.hidden_size
+        # * (model.config.num_hidden_layers // kb_layer_frequency + 1)}")
 
     encoder.load_state_dict(torch.load(encoder_path))
     return tokenizer, encoder, model, kb_config
@@ -1078,7 +1136,7 @@ def eval_accuracy(
 
     kb_embedding_real = kb_retriever.get_key_embeddings(dataset_subset_idx)
 
-    format_func_map = {"llama3": _format_Q_llama, "phi3": _format_Q_phi3}
+    format_func_map = {"llama3": format_Q_llama, "phi3": format_Q_phi3}
 
     if not fancy_question:
         input_strs_gen = (dataset_subset[i]["Q"] for i in range(test_batch_size))
@@ -1446,7 +1504,7 @@ def eval():
             kb_embedding_key, kb_embedding_val = kb_embedding_real
             kb_embedding_real = (kb_embedding_key, kb_embedding_val)
 
-        format_func_map = {"llama3": _format_Q_llama, "phi3": _format_Q_phi3}
+        format_func_map = {"llama3": format_Q_llama, "phi3": format_Q_phi3}
 
         input_strs = [
             format_func_map[llm_type](dataset_subset[i]["Q"])

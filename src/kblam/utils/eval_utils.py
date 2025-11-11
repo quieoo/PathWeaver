@@ -46,19 +46,53 @@ def softmax(x: np.array, axis: int) -> np.array:
     return e_x / e_x.sum(axis=axis)
 
 
-def _format_Q_llama(Q: str):
+def format_Q_llama(Q: str):
+    return (
+        "<|start_header_id|>user<|end_header_id|> " + Q + "<|eot_id|>" + "<|start_header_id|>assistant<|end_header_id|>"
+    )
+
+def format_Q_llama_short(Q: str):
+    # short answer 
+    Q = f"{Q} Answer with the shortest span from the context, do not add extra words and do not repeat the question."
     return (
         "<|start_header_id|>user<|end_header_id|> " + Q + "<|eot_id|>" + "<|start_header_id|>assistant<|end_header_id|>"
     )
 
 
-def _format_Q_phi3(Q: str):
+def format_Q_phi3(Q: str):
     return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n"
+
+def format_QA_llama(Q: str, A: str):
+
+    return (
+        "<|start_header_id|>user<|end_header_id|> "
+        + Q
+        + "<|eot_id|>"
+        + "<|start_header_id|>assistant<|end_header_id|>"
+        + A
+        + "<|eot_id|>"
+    )
+
+def format_QA_llama_short(Q: str, A: str):
+    # short answer 
+    Q = f"{Q} Answer with the shortest span from the context, do not add extra words and do not repeat the question."
+
+    return (
+        "<|start_header_id|>user<|end_header_id|> "
+        + Q
+        + "<|eot_id|>"
+        + "<|start_header_id|>assistant<|end_header_id|>"
+        + A
+        + "<|eot_id|>"
+    )
+
+def format_QA_phi3(Q: str, A: str):
+    return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n" + A + "<|end|>\n"
 
 
 model_question_format_mapping = {
-    KblamLlamaForCausalLM: _format_Q_llama,
-    KBLaMPhi3ForCausalLM: _format_Q_phi3,
+    KblamLlamaForCausalLM: format_Q_llama,
+    KBLaMPhi3ForCausalLM: format_Q_phi3,
 }
 model_prune_format_mapping = {
     KblamLlamaForCausalLM: _prune_for_llama,
@@ -119,8 +153,11 @@ def answer_question_deterministic(
     save_attn_weights_policy: str = "prefill-all-layer",
 ):
     for m in model_question_format_mapping:
-        if isinstance(model, m):
+        if kb_config.format_short:
+                input_str = format_Q_llama_short(Q)
+        elif isinstance(model, m):
             input_str = model_question_format_mapping[m](Q)
+            
     tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
     input_ids, attention_masks = (
         tokenizer_output["input_ids"],

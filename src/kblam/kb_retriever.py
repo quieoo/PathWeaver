@@ -69,15 +69,40 @@ class KBRetriever:
         # (batch_size, context_set_size, embedding_dim)
         context_set_key = context_set_key.unsqueeze(0).expand(batch_size, *context_set_key.shape)
         context_set_val = context_set_val.unsqueeze(0).expand(batch_size, *context_set_val.shape)
-        # context_set_val = torch.randn_like(context_set_val)
-        # Idea: Try torch.randn here context_set_tokens??
 
         true_kb_copy = 1
-        kb_embedding = (
-            torch.concat([*([train_set_key] * true_kb_copy), context_set_key], 1),
-            torch.concat([*([train_set_val] * true_kb_copy), context_set_val], 1),
-        )
-        # (batch_size, 1+context_set_size, embedding_dim)
+        # kb_embedding = (
+        #     torch.concat([*([train_set_key] * true_kb_copy), context_set_key], 1),
+        #     torch.concat([*([train_set_val] * true_kb_copy), context_set_val], 1),
+        # )
+
+        # return kb_embedding
+
+        # 为每个样本随机插入位置
+        B = batch_size
+        C = context_set_key.size(1)
+        insert_pos = torch.randint(0, C + 1, (B,), device=context_set_key.device)
+
+        new_keys = []
+        new_vals = []
+        for b in range(B):
+            # 在随机位置插入 train_set_key[b]
+            keys = torch.cat(
+                [context_set_key[b, :insert_pos[b]], train_set_key[b], context_set_key[b, insert_pos[b]:]],
+                dim=0,
+            )
+            vals = torch.cat(
+                [context_set_val[b, :insert_pos[b]], train_set_val[b], context_set_val[b, insert_pos[b]:]],
+                dim=0,
+            )
+            new_keys.append(keys.unsqueeze(0))
+            new_vals.append(vals.unsqueeze(0))
+
+        train_set_key = torch.cat(new_keys, dim=0)
+        train_set_val = torch.cat(new_vals, dim=0)
+        # === 🟩 新增部分结束 ===
+
+        kb_embedding = (train_set_key, train_set_val)
         return kb_embedding
 
 
