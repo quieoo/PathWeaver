@@ -1,4 +1,5 @@
 from typing import Optional
+import re
 
 import numpy as np
 import torch
@@ -139,6 +140,27 @@ def answer_question(
         if isinstance(model, m):
             pruned_output = model_prune_format_mapping[m](outputs)
     return pruned_output
+
+def format_output_for_synthetic(model_output: str) -> str:
+
+    text = model_output
+
+    # 找出所有作为「单词」出现的 is / are
+    matches = list(re.finditer(r'\b(is|are)\b', text))
+
+    if matches:
+        # 如果有多个 is/are，就取最后一个；否则就取唯一的那个
+        if len(matches) >= 2:
+            cut_pos = matches[-1].end()
+        else:
+            cut_pos = matches[0].end()
+
+        # 从选定的 is/are 之后截取
+        model_output = text[cut_pos:].strip()
+        # 可选：去掉前导标点和空格，和末尾的句号等
+        model_output = model_output.lstrip(' ,.:;').rstrip(' .;')
+
+    return model_output
 
 
 def answer_question_deterministic(

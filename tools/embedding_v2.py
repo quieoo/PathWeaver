@@ -138,8 +138,18 @@ if __name__ == "__main__":
         with open(args.dataset_path, "r", encoding="utf-8") as f:
             dataset = json.load(f)
         for sample in dataset:
-            key_strings.append(sample["key_string"])
-            value_strings.append(sample["description"])
+            key_strings.append(str(sample["key_string"]))
+            value_strings.append(str(sample["description"]))
+    elif args.dataset_type == "2wiki":
+        with open(args.dataset_path, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+        for sample in dataset:
+            if len(sample["triple_lists"]) != 2:
+                raise ValueError(f"Sample {sample['id']} has {len(sample['triple_lists'])} triple lists, expected 2.")
+            for triple in sample["triple_lists"]:
+                key_strings.append(triple["key_string"])
+                value_strings.append(triple["description"])
+
     else:
         raise ValueError(f"Unsupported dataset type: {args.dataset_type}")
 

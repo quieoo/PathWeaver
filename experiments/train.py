@@ -117,6 +117,7 @@ parser.add_argument("--test_query_size", type=int, default=None, help="The size 
 parser.add_argument("--test_kb_scale_factor", type=float, default=None, help="The scale factor of the KB set size for testing")
 parser.add_argument("--test_kb_scale_factor_range", nargs=2, type=float, default=None, help="The range of the scale factor of the KB set size for testing")
 parser.add_argument("--eval_step", type=int, default=50, help="Evaluate every n steps")
+parser.add_argument("--format_short", type=bool, default=False, help="Use short answer in prompt")
 
 
 
@@ -166,7 +167,7 @@ def create_custom_progress_bar(
 
 
 # 构建训练标签：只计算模型对assistant回答部分的预测损失，而忽略对用户提问等其他内容的预测
-def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
+def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer, attention_masks: torch.Tensor):
     # Not sure this is correct. This method simply masks the <|start_header_id|>user<|end_header_id|> then leaves the rest in the labels
     # Possibly what they want is to mask out the query. To do that swap the index from the tokenizer below from 1 to 2
     answer_indices = torch.argmax(
@@ -179,34 +180,40 @@ def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tok
     labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
     return labels
 
-def _create_labels_for_llama_enhanced(input_ids: torch.Tensor, input_strs: List[str], tokenizer) -> torch.Tensor:
-    """
-    Create labels for Llama-3-style dialogue:
-    - Mask everything before and including <|start_header_id|>assistant<|end_header_id|>
-    - Only compute loss on the assistant's response.
-    """
+def _create_labels_for_llama_enhanced(input_ids: torch.Tensor,
+                                      input_strs: List[str],
+                                      tokenizer,
+                                      attention_masks: torch.Tensor) -> torch.Tensor:
     labels = input_ids.clone()
-    labels[:] = -100  # 默认全部 mask
+    labels[:] = -100
 
-    # Get the token IDs for the assistant header
-    assistant_header = tokenizer("<|start_header_id|>assistant<|end_header_id|>", add_special_tokens=False).input_ids
-    # e.g., [128006, 78191, 128007]
+    assistant_header = tokenizer("<|start_header_id|>assistant<|end_header_id|>",
+                                 add_special_tokens=False).input_ids
 
     for b in range(input_ids.size(0)):
         seq = input_ids[b].tolist()
-        # Find the starting index of the assistant header
+        # 1. 找到 assistant header 起始位置
         start_idx = None
         for i in range(len(seq) - len(assistant_header) + 1):
             if seq[i:i + len(assistant_header)] == assistant_header:
                 start_idx = i
                 break
-        
-        if start_idx is not None:
-            # Assistant response starts AFTER the header
-            response_start = start_idx + len(assistant_header)
-            labels[b, response_start:] = input_ids[b, response_start:]
-        # else: no assistant header found → keep all -100 (no loss)
+        if start_idx is None:
+            continue   # 没找到 header，整行保持 -100
 
+        # 2. 解除 header + 答案的掩码（到末尾非 pad 为止）
+        pad_id = tokenizer("<|eot_id|>", add_special_tokens=False).input_ids[0]
+        # 最后一个非 pad token 位置
+        last_real = (attention_masks[b] == 1).nonzero()[-1].item()
+
+        # header → 答案
+        labels[b, start_idx: last_real + 1] = input_ids[b, start_idx: last_real + 1]
+
+        # 3. 紧跟其后的**第一个** pad 位置强制设为 eot_id
+        if last_real + 1 < labels.size(1):
+            labels[b, last_real + 1] = pad_id   # 仅此 1 个 token 非 -100
+
+        # 4. 再往后所有 padding 仍保持 -100（模型无需关心）
     return labels
 
 def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
@@ -226,7 +233,7 @@ def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], toke
 # 从数据集中构建训练批次：对应输入字符串的Token id，注意力掩码以及标签
 def get_batch(
     qa_format_func: Callable[[str, str], str],
-    label_func: Callable[[torch.Tensor, List, Callable], torch.Tensor],
+    label_func: Callable[[torch.Tensor, List, Callable, torch.Tensor], torch.Tensor],
     dataset: List[Dict],
     tokenizer,
     device: torch.device,
@@ -238,14 +245,6 @@ def get_batch(
     use_extended_qa=False,
     global_step: int = 0,
 ):
-    """
-    dataset: List of dictionary, denoting the KB, used to extract QA pairs
-    model: The LLM, used to provide the embedding
-    kb_embedding: KB embedding (differentiable)
-    B: Batchsize
-    include_outlier : Create a batch of question without answer in the KB.
-    multi_entities : Create a batch of question that involves more than one entities.
-    """
     labels = []
     if multi_entities is not None:
         assert not include_outlier
@@ -280,6 +279,13 @@ def get_batch(
         real_batch_indices = []
         for idx in batch_indices:
             Q, A = get_question_and_answer(idx)
+            
+            # 消除A中的连续padding
+            import re
+            A = re.sub(r'(<\|eot_id\|>)+', '<|eot_id|>', A.strip())
+            if A == '<|eot_id|>': A = 'N/A'   # 防止整段变空
+
+
             if Q is not None and A is not None:
                 input_strs.append(qa_format_func(Q, A))
                 real_batch_indices.append(idx)
@@ -294,7 +300,7 @@ def get_batch(
             tokenizer_output["attention_mask"],
         )
         # 生成训练标签
-        labels = label_func(input_ids, input_strs, tokenizer)
+        labels = label_func(input_ids, input_strs, tokenizer, attention_masks)
     if include_outlier:
         # Generate a new set of indices, such that the KB does not contain the entity where the question comes from
         batch_indices = np.random.choice(len(dataset), B, replace=False)
@@ -701,7 +707,7 @@ class Trainer:
         output_dir: str,
         sep_query_head: bool = False,
         max_seq_len: int | None = None,
-        dataset_format: str = "default",
+        dataset_format: str = "synthetic",
         test_dataset: list[dict] | None = None,
         precomputed_test_embed_keys_path: str | None = None,
         precomputed_test_embed_values_path: str | None = None,
@@ -710,6 +716,7 @@ class Trainer:
         test_kb_scale_factor: float | None = None,
         test_kb_scale_factor_range: tuple[float, float] | None = None,
         eval_step: int = 50,
+        format_short: bool = False,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -735,17 +742,19 @@ class Trainer:
             self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
             self._get_params = _get_phi3_query_head_parameters
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
-            if dataset_format == "default":            
-                self._get_batch = partial(get_batch, format_QA_llama, _create_labels_for_llama_enhanced)
-            elif dataset_format == "autoschemakg":
-                self._get_batch = partial(get_batch_from_document, format_QA_llama, _create_labels_for_llama_enhanced)
+
+            format_func = format_QA_llama if not format_short else format_QA_llama_short
+
+            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad":
+                self._get_batch = partial(get_batch, format_func, _create_labels_for_llama_enhanced)
+            elif dataset_format == "multi_wiki_qa_train":
+                self._get_batch = partial(get_batch_from_document, format_func, _create_labels_for_llama_enhanced)
             elif dataset_format == "musique":
-                self._get_batch = partial(get_batch_musique, format_QA_llama, _create_labels_for_llama_enhanced)
-            elif dataset_format == "squad":
-                self._get_batch = partial(get_batch, format_QA_llama_short, _create_labels_for_llama_enhanced)
+                self._get_batch = partial(get_batch_musique, format_func, _create_labels_for_llama_enhanced)
             else:
                 raise ValueError(f"{dataset_format} not recognised")
             self._get_params = _get_llama3_query_head_parameters
+
         else:
             raise ValueError(f"{llm_model} not recognised")
 
@@ -838,6 +847,13 @@ class Trainer:
             # 输出前5个样本的结果
             for idx in range(5):
                 self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+            
+            # 输出5个随机样本的结果
+            random_idxs = np.random.choice(len(model_outputs), 5, replace=False)
+            for idx in random_idxs:
+                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+
+
 
     def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False):
         self.logger.info("===== [SAFE EVALUATION START] =====")
@@ -971,15 +987,15 @@ class Trainer:
                         labels = labels[:, : self.max_seq_len]
                         if a_step == 0 and step % 10 == 0:
                             self.logger.info(f"TRUNCATED INPUT IDs SHAPE: {input_ids.shape}")
-                    if self.dataset_format == "default":
-                        # 可能是个拼写错误，实际应该是获得kb的键值嵌入，作为模型的kv Cache
-                        # KB Token来自两个源头：当前批次索引所对应的KB Token（一个QA对有一个KB Token）；根据kb_size随机选择一些KB Token
-                        # 使用当前的encoder对KB Token进行编码，获得键值嵌入
+                    if self.dataset_format == "synthetic" or self.dataset_format == "squad":
                         kb_embedding = self.kbretriever.get_key_embeddings(
                             batch_indices, len(input_ids), step, self.kb_size
                         )
-                        # 前向传播（执行一次推理）
-                    elif self.dataset_format == "autoschemakg":
+                    elif self.dataset_format == "2wiki":
+                        kb_embedding = self.kbretriever.get_key_embeddings(
+                            batch_indices, len(input_ids), step, self.kb_size, 2
+                        )
+                    elif self.dataset_format == "multi_wiki_qa_train":
                         # 根据batch_indices从training_set中获取"start_id"和"num_triples"域的值
                         start_ids=[]
                         num_triples=[]
@@ -1281,7 +1297,7 @@ def main():
     debug_level = args.debug_level
 
     print(vars(args))
-    dataset_name = args.dataset_type
+    dataset_type = args.dataset_type
     seed = args.seed
     N = args.N
     B = args.B
@@ -1336,7 +1352,7 @@ def main():
                 'sep_query_head': sep_query_head,
                 'kb_size': kb_size,
                 'length_invariance': length_invariance,
-                'dataset': dataset_name,
+                'dataset': dataset_type,
                 'outlier_num': outlier_num,
                 'multi_entities': multi_entities,
                 'use_extended_qa': use_extended_qa,
@@ -1499,14 +1515,7 @@ def main():
     print(f"[INFO]: Retriever ready")
 
     # Get the training started
-    llm_ckpt_name = f"{prefix_string}KeyFrom{key_embd_src}_{encoder_spec}_{dataset_name}_{llm_type}"
-
-    if dataset_name == "multi_wiki_qa_train":
-        dataset_format = "autoschemakg"
-    elif "musique" in dataset_name:
-        dataset_format = "musique"
-    else:
-        dataset_format = "default"
+    llm_ckpt_name = f"{prefix_string}KeyFrom{key_embd_src}_{encoder_spec}_{dataset_type}_{llm_type}"
 
     trainer = Trainer(
         model,  # type: ignore
@@ -1522,7 +1531,7 @@ def main():
         model_save_dir,
         sep_query_head=sep_query_head,
         max_seq_len=max_seq_len,
-        dataset_format=dataset_format,
+        dataset_format=dataset_type,
         test_dataset=test_dataset,
         precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
         precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,
@@ -1531,6 +1540,7 @@ def main():
         test_kb_scale_factor=args.test_kb_scale_factor,
         test_kb_scale_factor_range=args.test_kb_scale_factor_range,
         eval_step=args.eval_step,
+        format_short=args.format_short,
     )
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")

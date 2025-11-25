@@ -36,7 +36,14 @@ class KBRetriever:
         else:
             return False
 
-    def get_key_embeddings(self, batch_indices:List[int], batch_size:Optional[int]=None, step:Optional[int]=None, kb_size:Optional[int]=None):
+    def get_key_embeddings(self, batch_indices:List[int], batch_size:Optional[int]=None, step:Optional[int]=None, kb_size:Optional[int]=None, hop_num:Optional[int]=None):
+
+        # 如果跳数不为空，一个样本中应该包含hop_num个三元组。在创建embedding时每隔样本的三元组顺序排放。
+        # 为了保持代码的一致性，这里直接将原来的batch_indices展开为hop_num倍: i -> [i*hop_num, i*hop_num+1, ..., i*hop_num+hop_num-1]
+        if hop_num is not None and hop_num > 1:
+            batch_indices = [i*hop_num + j for i in batch_indices for j in range(hop_num)]
+
+
         if self._use_cached_embd():
             train_set_key, train_set_val = get_kb_embd(
                 self.encoder,

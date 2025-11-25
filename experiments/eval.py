@@ -34,6 +34,7 @@ from kblam.utils.eval_utils import (
     answer_question,
     answer_question_deterministic,
     softmax,
+    format_output_for_synthetic,
 )
 from kblam.utils.train_utils import get_kb_embd
 from kblam.kb_retriever import KBRetriever
@@ -237,6 +238,7 @@ def perform_eval(
     multi_entites: int = -1,
     remove_sorry: bool = False,
     query_size: int = 250,
+    hop_num: int = 1,
 ):
     # np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
@@ -253,7 +255,7 @@ def perform_eval(
     for k, v in zip(key_str, value_str):
         prompt_strs += f"{k} is {v}; "
 
-    kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
+    kb_embedding = kb_retriever.get_key_embeddings(kb_idx, hop_num=hop_num)
 
     model_outputs = []
     answers = []
@@ -335,18 +337,21 @@ def perform_eval(
             if "sorry" in model_output:
                 continue
         full_outputs.append((model_output, answer))
-        if multi_entites == -1:
-            pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
-            match = re.search(pattern, model_output)
-            answers.append(row["description"])
-            if match:
-                model_output = match.group(1)
-        else:
-            pattern = r"(?:is|are) (.*?)(?:\.|;)"
-            matches = re.findall(pattern, model_output)
-            model_output = "; ".join(matches)
-            answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
-        model_outputs.append(model_output)
+        
+        answers.append(row["description"])
+        model_outputs.append(format_output_for_synthetic(model_output))
+        # if multi_entites == -1:
+        #     pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
+        #     match = re.search(pattern, model_output)
+        #     answers.append(row["description"])
+        #     if match:
+        #         model_output = match.group(1)
+        # else:
+        #     pattern = r"(?:is|are) (.*?)(?:\.|;)"
+        #     matches = re.findall(pattern, model_output)
+        #     model_output = "; ".join(matches)
+        #     answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
+        # model_outputs.append(model_output)
 
 
     for pred, gt in zip(model_outputs, answers):
@@ -409,6 +414,7 @@ def perform_eval_v2(
     multi_entites: int = -1,
     remove_sorry: bool = False,
     query_size: int = 250,
+    hop_num: int = 1,
 ):
     if seed < 0:
         np.random.seed(None)
@@ -428,13 +434,14 @@ def perform_eval_v2(
             multi_entites,
             remove_sorry,
             query_size,
+            hop_num,
         )    
     dataset = kb_retriever.dataset
     total_N = len(dataset)
 
     subset_idx=np.random.randint(0, total_N, query_size)
     subset=[dataset[idx] for idx in subset_idx]
-    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx)
+    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx, hop_num=hop_num)
     key_embeddings, value_embeddings=kb_embeddings
 
 
@@ -464,7 +471,7 @@ def perform_eval_v2(
             row = query_subset[i]
             idx = subset_idx[start_idx + i]
             if multi_entites == -1:
-                Q, A = row["Q"], row["description"]
+                Q, A = row["Q"], row["A"]
             else:
                 kb_subset_idx = np.random.randint(0, total_N, multi_entites)
                 Q, A = generate_multi_entity_qa(
@@ -494,18 +501,19 @@ def perform_eval_v2(
             if remove_sorry and "sorry" in model_output.lower():
                 continue
 
-            if multi_entites == -1:
-                pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
-                match = re.search(pattern, model_output)
-                answers.append(row["description"])
-                if match:
-                    model_output = match.group(1)
-            else:
-                pattern = r"(?:is|are) (.*?)(?:\.|;)"
-                matches = re.findall(pattern, model_output)
-                model_output = "; ".join(matches)
-                answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
-            model_outputs.append(model_output)
+            # if multi_entites == -1:
+            #     pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
+            #     match = re.search(pattern, model_output)
+            #     answers.append(row["description"])
+            #     if match:
+            #         model_output = match.group(1)
+            # else:
+            #     pattern = r"(?:is|are) (.*?)(?:\.|;)"
+            #     matches = re.findall(pattern, model_output)
+            #     model_output = "; ".join(matches)
+            #     answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
+            answers.append(format_output_for_synthetic(A))
+            model_outputs.append(format_output_for_synthetic(model_output))
 
         # ---- 聚合 ----
         all_model_outputs.extend(model_outputs)
@@ -713,6 +721,14 @@ parent_parser.add_argument(
     help="Enable debug mode",
 )
 
+parent_parser.add_argument(
+    "--format_short",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to use short format",
+)
+
+
 # Create subparsers
 subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -904,7 +920,7 @@ def eval_main_process(
     kb_retriever: KBRetriever,
     kb_scale_factor_range: list[float] | None = None,
     kb_scale_factor: float | None = None,
-    dataset_type: str = "default",
+    dataset_type: str = "synthetic",
     seed: int = 42,
     kb_size: int = -1,
     query_size: int = -1,
@@ -936,10 +952,6 @@ def eval_main_process(
                 query_size=query_size,
             )
         else:
-            
-            if dataset_type == "squad":
-                kb_config.format_short = True
-
             model_outputs, answers = perform_eval_v2(
             # gen_results, score_results = perform_eval(
                 model,
@@ -950,6 +962,7 @@ def eval_main_process(
                 seed=seed,
                 kb_size=kb_size,
                 query_size=query_size,
+                hop_num=2 if dataset_type == "2wiki" else 1,
             )
         
         results_pair_list.append((model_outputs, answers))
@@ -998,6 +1011,7 @@ def eval_generate():
         kb_layer_frequency,
         kb_scale_factor,
     )
+    kb_config.format_short = args.format_short
 
     kb_retriever = KBRetriever(
         encoder,

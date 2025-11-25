@@ -78,6 +78,7 @@ def parse_args():
                         default='/mnt/n0/datasets/MuSiQue/musique_ans_v1.0_dev.jsonl',
                         help='MuSiQue 数据集（jsonl）本地路径')
     parser.add_argument('--n-samples', type=int, default=10, help='测试样本数量')
+    parser.add_argument('--dataset-type', type=str, default='musique', help='数据集类型（musique/squad）')
 
     # 模型参数
     parser.add_argument('--model-path', type=str,
@@ -91,6 +92,8 @@ def parse_args():
                         help='嵌入模型名称')
     parser.add_argument('--oracle-retrieval', action='store_true',
                         help='使用 oracle 检索：用 is_supporting 段落直接拼接为上下文')
+
+
 
     return parser.parse_args()
 
@@ -108,9 +111,45 @@ def load_musique_dataset(dataset_path: str, max_samples: int | None = None):
     print(f"从本地加载了 {len(dataset)} 个 MuSiQue 样本")
     return dataset
 
+def load_squad_dataset(dataset_path: str, max_samples: int | None = None):
+    #读取json文件
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    data=data[:max_samples]
+    #遍历所有样本，获得context列表
+    context_lists=[]
+    questions=[]
+    answers=[]
+    ret=[]
+    for item in data:
+        context_lists.append({
+            "paragraph_text" : item['context'],
+            "is_supporting": False,
+            # 截取第一句话作为title
+            "title": item['context'].split('.')[0]
+        })
+        for qa in item['qas']:
+            questions.append(qa['question'])
+            answers.append(qa['answer'])
+    
+    for q, a in zip(questions, answers):
+        ret.append({
+            'question': q,
+            'answer': a,
+            'paragraphs': context_lists
+        })
+    
+    return ret
+
 
 def load_data(args):
-    return load_musique_dataset(args.dataset_path, args.n_samples)
+    if args.dataset_type == 'musique':
+        return load_musique_dataset(args.dataset_path, args.n_samples)
+    elif args.dataset_type == 'squad':
+        return load_squad_dataset(args.dataset_path, args.n_samples)
+    else:
+        raise ValueError(f"未知数据集类型: {args.dataset_type}")
 
 
 # ----------------------------
@@ -468,11 +507,9 @@ def main():
     # 清理
     clean_model(llm)
 
-    exit(0)
-
-    # 评测（两种）
-    # 1) 简单三指标
-    evaluate_predictions(predictions, answers, args.n_samples)
+    # # 评测（两种）
+    # # 1) 简单三指标
+    # evaluate_predictions(predictions, answers, args.n_samples)
     # 2) 你项目内的完整评测
     comparison_str, metrics = full_evaluation(predictions, answers)
     print(metrics)
