@@ -15,6 +15,7 @@ import argparse
 import statistics
 from collections import Counter
 from typing import Any, Dict, List, Tuple
+import random
 
 import numpy as np
 import torch
@@ -92,6 +93,7 @@ def parse_args():
                         help='嵌入模型名称')
     parser.add_argument('--oracle-retrieval', action='store_true',
                         help='使用 oracle 检索：用 is_supporting 段落直接拼接为上下文')
+    parser.add_argument('--kb-size', type=int, default=10, help='知识库段落数量')
 
 
 
@@ -111,43 +113,138 @@ def load_musique_dataset(dataset_path: str, max_samples: int | None = None):
     print(f"从本地加载了 {len(dataset)} 个 MuSiQue 样本")
     return dataset
 
-def load_squad_dataset(dataset_path: str, max_samples: int | None = None):
+def load_squad_dataset(dataset_path: str, kb_size: int, max_samples: int | None = None):
     #读取json文件
     with open(dataset_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    data=data[:max_samples]
-    #遍历所有样本，获得context列表
-    context_lists=[]
-    questions=[]
-    answers=[]
-    ret=[]
+    data = data[:max_samples]
+    # 首先收集所有可能的段落作为候选知识库
+    all_paragraphs = []
     for item in data:
-        context_lists.append({
-            "paragraph_text" : item['context'],
+        all_paragraphs.append({
+            "paragraph_text": item['context'],
             "is_supporting": False,
             # 截取第一句话作为title
             "title": item['context'].split('.')[0]
         })
-        for qa in item['qas']:
-            questions.append(qa['question'])
-            answers.append(qa['answer'])
     
-    for q, a in zip(questions, answers):
-        ret.append({
-            'question': q,
-            'answer': a,
-            'paragraphs': context_lists
-        })
+    
+    ret = []
+    
+    # 为每个QA对创建样本，确保每个样本的paragraphs包含kb_size个段落，其中必定包含正确段落
+    for item in data:
+        # 当前item的段落是正确段落
+        correct_paragraph = {
+            "paragraph_text": item['context'],
+            "is_supporting": True,  # 标记为支持性段落
+            "title": item['context'].split('.')[0]
+        }
+        
+        # 从其他段落中随机选择kb_size-1个段落
+        other_paragraphs = [p for p in all_paragraphs if p["paragraph_text"] != item['context']]
+        # 如果其他段落不足，就重复使用
+        while len(other_paragraphs) < kb_size - 1:
+            other_paragraphs.extend(other_paragraphs)
+        
+        # 随机选择kb_size-1个其他段落
+        selected_paragraphs = random.sample(other_paragraphs, kb_size - 1)
+        
+        # 组合正确段落和随机选择的段落
+        paragraphs = [correct_paragraph] + selected_paragraphs
+        # 打乱顺序，让正确段落的位置随机
+        random.shuffle(paragraphs)
+        
+        # 为当前item中的每个QA对创建样本
+        for qa in item['qas']:
+            ret.append({
+                'question': qa['question'],
+                'answer': qa['answer'],
+                'paragraphs': paragraphs
+            })
+            if len(ret) >= max_samples:
+                break
+        if len(ret) >= max_samples:
+            break
     
     return ret
+
+def load_2wiki_dataset(dataset_path: str,
+                       kb_size: int,
+                       max_samples: int | None = None):
+    dataset = []
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        dataset=json.load(f)
+    
+    new_dataset = []
+    for item in dataset:
+        if item.get('source') != '2wiki':
+            continue
+        new_dataset.append(item)
+    dataset=new_dataset[:max_samples]
+    print(f"从本地加载了 {len(dataset)} 个 2wiki 样本")
+
+    # 1. 把所有“其它”段落展平成候选池
+    candidate_paras = [p for item in dataset for p in item['paragraphs']]
+
+    ret = []
+    for item in dataset:
+        # 2. 当前样本的正确段落
+        correct_paras = [
+            {
+                "paragraph_text": p['paragraph_text'],
+                "is_supporting": True,
+                "title": p['title']
+            }
+            for p in item['paragraphs']
+        ]
+
+        # 3. 需要再抽多少条
+        need = kb_size - len(correct_paras)
+        if need < 0:
+            # 如果正确段落本身就比 kb_size 多，直接截断或报错
+            raise ValueError(
+                f"kb_size({kb_size}) < 正确段落数({len(correct_paras)})"
+            )
+
+        # 4. 排除掉当前样本的段落，避免重复
+        this_ids = {id(p) for p in item['paragraphs']}
+        available = [p for p in candidate_paras if id(p) not in this_ids]
+
+        if len(available) < need:
+            raise ValueError("候选池不足，无法凑齐 kb_size 段落")
+
+        chosen_wrong = random.sample(available, need)
+        wrong_paras = [
+            {
+                "paragraph_text": p['paragraph_text'],
+                "is_supporting": False,
+                "title": p['title']
+            }
+            for p in chosen_wrong
+        ]
+
+        # 5. 合并 & 洗牌
+        paragraphs = correct_paras + wrong_paras
+        random.shuffle(paragraphs)
+
+        ret.append({
+            'question': item['question'],
+            'answer': item['answer'],
+            'paragraphs': paragraphs
+        })
+
+    return ret
+
 
 
 def load_data(args):
     if args.dataset_type == 'musique':
         return load_musique_dataset(args.dataset_path, args.n_samples)
     elif args.dataset_type == 'squad':
-        return load_squad_dataset(args.dataset_path, args.n_samples)
+        return load_squad_dataset(args.dataset_path, args.kb_size, args.n_samples)
+    elif args.dataset_type == '2wiki':
+        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples)
     else:
         raise ValueError(f"未知数据集类型: {args.dataset_type}")
 

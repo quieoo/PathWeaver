@@ -98,11 +98,16 @@ if __name__ == "__main__":
     args = parser_args()
     key_strings, value_strings = [], []
 
+    if args.dataset_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(args.dataset_path)]
+    elif args.dataset_path.endswith(".json"):
+        dataset=json.load(open(args.dataset_path))
+    else:
+        raise ValueError(f"Unknown dataset format: {args.dataset_path}")
+
     # ---- Step 1: 数据重构 ----
     if args.dataset_type == "multi_wiki_qa_train":
         sid, reformatted_data = 0, []
-        with open(args.dataset_path, "r", encoding="utf-8") as f:
-            dataset = [json.loads(line.strip()) for line in f]
         for doc in dataset:
             for triple in doc["triples"]:
                 key_strings.append(triple["key_string"])
@@ -116,8 +121,6 @@ if __name__ == "__main__":
 
     elif args.dataset_type == "musique":
         sid, reformatted_data = 0, []
-        with open(args.dataset_path, "r", encoding="utf-8") as f:
-            dataset = json.load(f)
         for sample in dataset:
             new_paras = []
             for paragraph in sample["paragraphs"]:
@@ -135,14 +138,10 @@ if __name__ == "__main__":
         args.dataset_path = output_path
 
     elif args.dataset_type == "synthetic":
-        with open(args.dataset_path, "r", encoding="utf-8") as f:
-            dataset = json.load(f)
         for sample in dataset:
             key_strings.append(str(sample["key_string"]))
             value_strings.append(str(sample["description"]))
     elif args.dataset_type == "2wiki":
-        with open(args.dataset_path, "r", encoding="utf-8") as f:
-            dataset = json.load(f)
         for sample in dataset:
             if len(sample["triple_lists"]) != 2:
                 raise ValueError(f"Sample {sample['id']} has {len(sample['triple_lists'])} triple lists, expected 2.")

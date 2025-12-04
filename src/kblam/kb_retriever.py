@@ -36,13 +36,7 @@ class KBRetriever:
         else:
             return False
 
-    def get_key_embeddings(self, batch_indices:List[int], batch_size:Optional[int]=None, step:Optional[int]=None, kb_size:Optional[int]=None, hop_num:Optional[int]=None):
-
-        # 如果跳数不为空，一个样本中应该包含hop_num个三元组。在创建embedding时每隔样本的三元组顺序排放。
-        # 为了保持代码的一致性，这里直接将原来的batch_indices展开为hop_num倍: i -> [i*hop_num, i*hop_num+1, ..., i*hop_num+hop_num-1]
-        if hop_num is not None and hop_num > 1:
-            batch_indices = [i*hop_num + j for i in batch_indices for j in range(hop_num)]
-
+    def get_key_embeddings(self, batch_indices:List[int], batch_size:Optional[int]=None, step:Optional[int]=None, kb_size:Optional[int]=None):
 
         if self._use_cached_embd():
             train_set_key, train_set_val = get_kb_embd(
@@ -111,6 +105,112 @@ class KBRetriever:
 
         kb_embedding = (train_set_key, train_set_val)
         return kb_embedding
+
+    def get_embeddings_with_adj_2wiki(
+        self,
+        batch_indices,
+        kb_size: int | None = None,
+        step: int | None = None,
+        device: torch.device | None = None,
+        hop_num: int = 2,
+    ):
+        if not self._use_cached_embd():
+            raise RuntimeError("get_embeddings_with_adj_2wiki 当前仅支持 cached KB embedding")
+
+        B = len(batch_indices)
+
+        # ------------------------------------------------
+        # 1) 取出每个样本的“真 KB triple”索引
+        #    假设每个样本的两条 triple 在全局 embedding 中是连续的：
+        #    sample i → idx = 2*i, 2*i+1
+        #    如果你有单独的 triple_offset 数组，也可以改成：
+        #      base = triple_offset[idx]
+        #      true_indices.extend([base, base+1])
+        # ------------------------------------------------
+        true_triple_indices = []
+        for idx in batch_indices:
+            base = idx * hop_num
+            true_triple_indices.extend([base, base + 1])
+        true_triple_indices = np.array(true_triple_indices, dtype=np.int64)
+
+        # ------------------------------------------------
+        # 2) 取出真 triple 的 base embedding，并通过 KBEncoder 编码
+        # ------------------------------------------------
+        key_true_np = self.key_embds[true_triple_indices]
+        val_true_np = self.value_embds[true_triple_indices]
+
+        key_true = self.encoder.encode_key(base_emb=key_true_np)   # (B*2, d)
+        val_true = self.encoder.encode_val(base_emb=val_true_np)   # (B*2, d)
+
+
+        # if kb_size is None:
+        # 如果kb_size是单个int值，则认为是推理阶段
+        if kb_size is not None and isinstance(kb_size, int):
+            # 推理阶段key/value_embedding形状为(2*B, d)
+            # kb_adj的形状应该为: B/kb_size * (2*kb_size, 2*kb_size)
+            kb_adjs = []
+            kb_len = hop_num*kb_size
+            for b in range(B):
+                kb_adj = torch.zeros(kb_len, kb_len, dtype=torch.float32, device=device)
+                # 每两个KB之间，第一个KB到第二个KB之间有路径
+                for i in range(0, kb_len, hop_num):
+                    kb_adj[i, i+1] = 1.0  # 只在第 0 → 1 有路径
+                kb_adj = kb_adj.view(1, kb_len, kb_len)
+                kb_adjs.append(kb_adj)
+
+            return key_true, val_true, kb_adjs
+
+        # 形状变为(B, 2, d)
+        key_true = key_true.view(B, hop_num, -1)
+        val_true = val_true.view(B, hop_num, -1)
+
+        # ------------------------------------------------
+        # 4) 有 kb_size 时：仿照 get_key_embeddings，随机采样 context KB
+        #    注意：kb_size 控制“最大 context 数量”，最终每个样本 KB 总长度为：
+        #      kb_len = hop_num + context_set_size
+        # ------------------------------------------------
+        total_samples = int(len(self.key_embds) / hop_num)
+        # 这里用 context_set_size_scheduler 让 context_set_size 随 step 变化
+        context_set_size = context_set_size_scheduler(step, kb_size)
+        context_set_size = min(context_set_size, total_samples)
+
+        # 从全局 KB 中随机采样 context_set_size 个 triple（所有样本共享）
+        random_sample_ids = np.random.choice(total_samples, context_set_size, replace=False)
+
+        random_triple_indices=[]
+        for idx in random_sample_ids:
+            base = idx * hop_num
+            random_triple_indices.extend([base, base + 1])
+        random_triple_indices = np.array(random_triple_indices, dtype=np.int64)
+
+        # 随机选择的 context triple 形状： （C*2, d）
+        key_ctx_np = self.key_embds[random_triple_indices]
+        val_ctx_np = self.value_embds[random_triple_indices]
+
+        key_ctx = self.encoder.encode_key(base_emb=key_ctx_np)   # (C*2, d)
+        val_ctx = self.encoder.encode_val(base_emb=val_ctx_np)   # (C*2, d)
+
+        # 扩展成 (B, C*2, d)，每个样本共享同一批 context KB
+        key_ctx = key_ctx.unsqueeze(0).expand(B, *key_ctx.shape).contiguous()
+        val_ctx = val_ctx.unsqueeze(0).expand(B, *val_ctx.shape).contiguous()
+
+
+        key_emb = torch.cat([key_true, key_ctx], dim=1)  # (B, 2 + C*2, d)
+        val_emb = torch.cat([val_true, val_ctx], dim=1)  # (B, 2 + C*2, d)
+
+        kb_len = hop_num*(1+context_set_size)
+
+        # ------------------------------------------------
+        # 6) 构造路径邻接矩阵 kb_adj
+        #    - 只保留 0->1 的边，其余 context 均视作“孤立节点”
+        # ------------------------------------------------
+        kb_adj = torch.zeros(B, kb_len, kb_len, dtype=torch.float32, device=device)
+        # 每两个KB之间，第一个KB到第二个KB之间有路径
+        for b in range(B):
+            for i in range(0, kb_len, hop_num):
+                kb_adj[b, i, i+1] = 1.0  # 只在第 0 → 1 有路径
+
+        return key_emb, val_emb, kb_adj
 
 
 # DATASET_SUPPORT

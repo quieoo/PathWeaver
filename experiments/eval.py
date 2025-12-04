@@ -238,7 +238,6 @@ def perform_eval(
     multi_entites: int = -1,
     remove_sorry: bool = False,
     query_size: int = 250,
-    hop_num: int = 1,
 ):
     # np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
@@ -255,7 +254,7 @@ def perform_eval(
     for k, v in zip(key_str, value_str):
         prompt_strs += f"{k} is {v}; "
 
-    kb_embedding = kb_retriever.get_key_embeddings(kb_idx, hop_num=hop_num)
+    kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
 
     model_outputs = []
     answers = []
@@ -402,6 +401,119 @@ def move_true_kb_to_front_inference(kb_embedding, true_index: int):
 
     return (new_keys, new_vals)
 
+def perform_eval_2wiki(
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    kb_retriever: KBRetriever,
+    kb_config: KBLaMConfig,
+    eval_mode: str = "kb",
+    kb_size: int = 250,
+    seed: int = 1,
+    multi_entites: int = -1,
+    remove_sorry: bool = False,
+    query_size: int = 250,
+):
+    if seed < 0:
+        np.random.seed(None)
+    else:
+        np.random.seed(seed)
+
+    if query_size <= kb_size:
+        raise ValueError(f"query_size={query_size} must be greater than kb_size={kb_size}")
+    dataset = kb_retriever.dataset
+    total_N = len(dataset)
+
+    subset_idx=np.random.randint(0, total_N, query_size)
+    subset=[dataset[idx] for idx in subset_idx]
+
+    hop_num=2
+    key_embeddings, value_embeddings, kb_adjs=kb_retriever.get_embeddings_with_adj_2wiki(
+        batch_indices=subset_idx,
+        hop_num=hop_num,
+        kb_size=kb_size,
+    )
+
+    # 统一的结果容器
+    all_model_outputs, all_answers = [], []
+
+    # 计算批次数
+    num_batches = (query_size + kb_size - 1) // kb_size
+
+    print(f"[INFO] Eval mode={eval_mode}, KB size={kb_size}, Query size={query_size}, total_batches={num_batches}")
+    
+    start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
+    retrieval_time=0.003
+    
+    for batch_id in tqdm(range(num_batches)):
+        # ---- 当前批的 query 索引范围 ----
+        start_idx = batch_id * kb_size
+        end_idx = min((batch_id + 1) * kb_size, query_size)
+        current_query_num = end_idx - start_idx
+
+        # ---- KB 子集：固定大小 ----
+        sub_kb_embedding=(key_embeddings[hop_num*start_idx:hop_num*end_idx], value_embeddings[hop_num*start_idx:hop_num*end_idx])
+        sub_kb_adj=kb_adjs[batch_id]
+
+        # ---- Query 子集 ----
+        query_subset=subset[start_idx:end_idx]
+
+        # ---- 处理本批次 ----
+        model_outputs, answers = [], []
+        for i in range(current_query_num):
+            row = query_subset[i]
+            idx = subset_idx[start_idx + i]
+            Q, A = row["Q"], row["A"]
+
+            if eval_mode != "kb":
+                raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+
+            # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+            # sub_kb_embedding = move_true_kb_to_front_inference(
+            #     sub_kb_embedding,
+            #     i,
+            # )
+            output_text = answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=sub_kb_embedding,
+                kb_config=kb_config,
+                kb_adj=sub_kb_adj,
+                save_attention_weights=debug_flag,
+                attention_save_loc="./attn_weights_kblam/",
+                attention_file_base_name=f"kb-{idx}",
+            ).split(Q)[1]
+
+            prof = kblam_profile_get()
+            prefill_s = prof["prefill_s"]                # 模型 prefill
+            decode_s = prof["decode_s"]
+            decode_tokens = max(1, prof["decode_tokens"])
+            tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+            ttft = retrieval_time + prefill_s
+
+            TTFTs.append(ttft)
+            TPOTs.append(tpot)
+
+            model_output=output_text[2:]
+            if remove_sorry and "sorry" in model_output.lower():
+                continue
+            answers.append(format_output_for_synthetic(A))
+            model_outputs.append(format_output_for_synthetic(model_output))
+
+        all_model_outputs.extend(model_outputs)
+        all_answers.extend(answers)
+
+    end_time=time.time()
+    print(f"============== 2wiki Performance ==================")
+    print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
+
+    return all_model_outputs, all_answers
+
 
 def perform_eval_v2(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
@@ -414,7 +526,6 @@ def perform_eval_v2(
     multi_entites: int = -1,
     remove_sorry: bool = False,
     query_size: int = 250,
-    hop_num: int = 1,
 ):
     if seed < 0:
         np.random.seed(None)
@@ -434,15 +545,13 @@ def perform_eval_v2(
             multi_entites,
             remove_sorry,
             query_size,
-            hop_num,
         )    
     dataset = kb_retriever.dataset
     total_N = len(dataset)
 
     subset_idx=np.random.randint(0, total_N, query_size)
     subset=[dataset[idx] for idx in subset_idx]
-    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx, hop_num=hop_num)
-    key_embeddings, value_embeddings=kb_embeddings
+    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx)
 
 
     # 统一的结果容器
@@ -493,6 +602,7 @@ def perform_eval_v2(
                 Q,
                 kb=sub_kb_embedding,
                 kb_config=kb_config,
+                kb_adj=kb_adjs[start_idx:end_idx],
                 save_attention_weights=debug_flag,
                 attention_save_loc="./attn_weights_kblam/",
                 attention_file_base_name=f"kb-{idx}",
@@ -951,6 +1061,17 @@ def eval_main_process(
                 kb_size=kb_size,
                 query_size=query_size,
             )
+        elif dataset_type=="2wiki":
+           model_outputs, answers = perform_eval_2wiki(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            ) 
         else:
             model_outputs, answers = perform_eval_v2(
             # gen_results, score_results = perform_eval(
@@ -962,7 +1083,6 @@ def eval_main_process(
                 seed=seed,
                 kb_size=kb_size,
                 query_size=query_size,
-                hop_num=2 if dataset_type == "2wiki" else 1,
             )
         
         results_pair_list.append((model_outputs, answers))
@@ -999,7 +1119,15 @@ def eval_generate():
     precomputed_embed_keys_path = args.precomputed_embed_keys_path
     precomputed_embed_values_path = args.precomputed_embed_values_path
 
-    dataset = json.load(open(os.path.join(dataset_dir, test_dataset)))
+
+    dataset_path=os.path.join(dataset_dir, test_dataset)
+    # 判断数据集是json还是jsonl格式
+    if dataset_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(dataset_path)]
+    elif dataset_path.endswith(".json"):
+        dataset=json.load(open(dataset_path))
+    else:
+        raise ValueError(f"Unknown dataset format: {dataset_path}")
 
     tokenizer, encoder, model, kb_config = _prepare_models(
         encoder_model_spec,

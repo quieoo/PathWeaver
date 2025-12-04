@@ -8,6 +8,8 @@ from functools import partial
 from itertools import chain
 from typing import Callable, Dict, List, Optional, Union, Tuple
 import glob
+import traceback
+
 
 import numpy as np
 import torch
@@ -106,6 +108,9 @@ parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "p
 parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
+parser.add_argument("--path_attn", action="store_true", default=False, help="Use path attention")
+
+
 # fmt: on
 
 # Test arguments
@@ -812,6 +817,7 @@ class Trainer:
     def evaluate(
         self,
         seed,
+        train_config: KBLaMConfig = None,
     ):
         test_kb_retriever = KBRetriever(
             self.kbretriever.encoder,
@@ -823,6 +829,7 @@ class Trainer:
         test_kb_config = KBLaMConfig(
             sep_query_head=True,
             kb_layer_frequency=self.kb_token_layer_frequency,
+            path_attn=train_config.path_attn if train_config is not None else False,
         )
         
         results_pair_list, scale_factor_list = eval_main_process(
@@ -855,7 +862,7 @@ class Trainer:
 
 
 
-    def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False):
+    def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False, train_config: KBLaMConfig = None):
         self.logger.info("===== [SAFE EVALUATION START] =====")
 
         try:
@@ -878,7 +885,7 @@ class Trainer:
 
             # Step 4️⃣ 执行评估（复用已有 evaluate 逻辑）
             self.logger.info("Running evaluation under no-grad mode...")
-            self.evaluate(seed=seed)
+            self.evaluate(seed=seed, train_config=train_config)
 
         except Exception as e:
             self.logger.error(f"[SAFE_EVAL ERROR] {type(e).__name__}: {e}")
@@ -987,14 +994,20 @@ class Trainer:
                         labels = labels[:, : self.max_seq_len]
                         if a_step == 0 and step % 10 == 0:
                             self.logger.info(f"TRUNCATED INPUT IDs SHAPE: {input_ids.shape}")
+                    
+                    kb_adj=None
                     if self.dataset_format == "synthetic" or self.dataset_format == "squad":
                         kb_embedding = self.kbretriever.get_key_embeddings(
                             batch_indices, len(input_ids), step, self.kb_size
                         )
                     elif self.dataset_format == "2wiki":
-                        kb_embedding = self.kbretriever.get_key_embeddings(
-                            batch_indices, len(input_ids), step, self.kb_size, 2
+                        key_embd, value_embd, kb_adj = self.kbretriever.get_embeddings_with_adj_2wiki(
+                            batch_indices=batch_indices,
+                            step=step,
+                            kb_size=self.kb_size,
+                            hop_num=2,
                         )
+                        kb_embedding=(key_embd, value_embd)
                     elif self.dataset_format == "multi_wiki_qa_train":
                         # 根据batch_indices从training_set中获取"start_id"和"num_triples"域的值
                         start_ids=[]
@@ -1122,6 +1135,7 @@ class Trainer:
                             input_ids=input_ids,
                             attention_mask=attention_masks,
                             kb_kvs=kb_embedding,
+                            kb_adj=kb_adj,
                             output_attentions=True,
                             kb_config=kb_config,
                         )
@@ -1272,7 +1286,7 @@ class Trainer:
 
                 # 运行模型验证
                 if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :                    
-                    self.safe_evaluate_wrapper(seed=1)
+                    self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
 
                 
                 
@@ -1395,8 +1409,13 @@ def main():
     prefix_string = get_prefix_str(args)
     logger.info(f"Experiment prefix {get_prefix_str(args)}")
 
-
-    dataset=json.load(open(args.train_data_path))
+    # 判断数据集是json还是jsonl格式
+    if args.train_data_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(args.train_data_path)]
+    elif args.train_data_path.endswith(".json"):
+        dataset=json.load(open(args.train_data_path))
+    else:
+        raise ValueError(f"Unknown dataset format: {args.train_data_path}")
 
 #     if use_extended_qa:
 #         dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
@@ -1420,7 +1439,13 @@ def main():
     print(f"[INFO]: Loaded {N} samples for training")
 
     if args.test_data_path is not None:
-        test_dataset = json.load(open(args.test_data_path))
+        # 判断数据集是json还是jsonl格式
+        if args.test_data_path.endswith(".jsonl"):
+            test_dataset=[json.loads(line.strip()) for line in open(args.test_data_path)]
+        elif args.test_data_path.endswith(".json"):
+            test_dataset=json.load(open(args.test_data_path))
+        else:
+            raise ValueError(f"Unknown dataset format: {args.test_data_path}")
         print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
     else:
         test_dataset = None
@@ -1497,7 +1522,10 @@ def main():
         kb_config = KBLaMConfig(
             sep_query_head=sep_query_head,
             kb_layer_frequency=kb_token_layer_frequency,
+            path_attn=args.path_attn,
         )
+    
+    print(f"[INFO]: KBLaM config: {kb_config}")
 
     encoder.train()
 

@@ -195,6 +195,7 @@ class KblamLlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         kb_kvs: Optional[tuple] = None,
         kb_config: Optional[KBLaMConfig] = None,
+        kb_adj: Optional[torch.Tensor] = None,
         save_attention_weights: bool = True,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
@@ -379,9 +380,57 @@ class KblamLlamaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-        # if self.layer_idx % kb_config.kb_layer_frequency == 0 and save_attention_weights:
-        #     attn = attn_weights[0, 0].detach().cpu().numpy()  # shape: (1, kb_len + ...)
-        #     print(f"[Layer {self.layer_idx}] KB区注意力均值: {attn[:, :kb_len-1].mean():.4f}, 最大值: {attn[:, :kb_len-1].max():.4f}")
+        # ================== 链式注意力 =============
+        # before_memory=torch.cuda.mem_get_info(0)[0] / 1024**3
+        if (
+            kb_config.path_attn 
+            and kb_kvs is not None
+            and kb_adj is not None
+            and self.layer_idx % kb_layer_frequency == 0
+        ):
+            kb_k, kb_v = kb_kvs
+            B, H, Q, total_k = attn_weights.shape
+            kb_len = kb_adj.shape[-1]
+            hop_num = 2          # 与构造脚本保持一致，如会变动请改成参数
+
+            # ---------- 1. 原始 KB 注意力 ----------
+            alpha_kb = attn_weights[:, :, :, :kb_len]          # (B, H, Q, kb_len)
+
+            # ---------- 2. 图路径转发 ----------
+            A = kb_adj.to(attn_weights.device).unsqueeze(1).unsqueeze(2)
+            # print(f"attn_weights.shape={attn_weights.shape}, kb_adj.shape={kb_adj.shape}, A.shape={A.shape}, alpha_kb.shape={alpha_kb.shape}")
+
+            beta_kb = torch.matmul(alpha_kb.unsqueeze(-2), A).squeeze(-2)
+            mix_ratio = getattr(kb_config, 'path_attn_mix_ratio', 1.0)
+            beta_kb = mix_ratio * beta_kb + (1.0 - mix_ratio) * alpha_kb
+            kb_sum = beta_kb.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            beta_kb = beta_kb / kb_sum
+
+            # ---------- 3. 日志：Top-3 before vs after ----------
+            # 只盯 batch-0, head-0, query-0，避免刷屏
+            if False:
+                # 3.1 原始 top-3
+                scores_raw, idx_raw = alpha_kb[0, 0, 0].topk(3, dim=-1)   # (3,)
+                # 3.2 图转发后 top-3
+                scores_new, idx_new = beta_kb[0, 0, 0].topk(3, dim=-1)
+                # 3.3 换算成“样本内 KB token ID”（去掉 context 偏移，更直观）
+                def fmt(ids, scores):
+                    return ' | '.join([f'ID={i.item():<3} score={s.item():.4f}'
+                                    for i, s in zip(ids, scores)])
+                print(f'Layer-{self.layer_idx}  KB-Top3  raw={fmt(idx_raw, scores_raw)}  -->  graph={fmt(idx_new, scores_new)}')
+
+            # ---------- 4. 写回注意力 ----------
+            new_attn = attn_weights.clone()
+            new_attn[:, :, :, :kb_len] = beta_kb
+            total_sum = new_attn.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            new_attn = new_attn / total_sum
+            attn_weights = new_attn
+
+        # after_memory=torch.cuda.mem_get_info(0)[0] / 1024**3
+        # if after_memory < before_memory:
+        #     print(f"[L{self.layer_idx}] 链式注意力内存占用增加，可能存在内存泄漏问题. 占用增加量: {after_memory - before_memory:.2f} GB")
+        #     print(f"当前可用：{after_memory:.2f} GB")
+
         # save attention weights
         if not attn_weights.requires_grad:
             # TODO: Make this function injectable
@@ -499,6 +548,7 @@ class LlamaDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         kb_kvs: Optional[tuple] = None,
         kb_config: Optional[KBLaMConfig] = None,
+        kb_adj: Optional[torch.Tensor] = None,
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
@@ -535,6 +585,7 @@ class LlamaDecoderLayer(nn.Module):
             cache_position=cache_position,
             kb_kvs=kb_kvs,
             kb_config=kb_config,
+            kb_adj=kb_adj,
             save_attention_weights=save_attention_weights,
             attention_save_loc=attention_save_loc,
             attention_file_base_name=attention_file_base_name,
@@ -612,6 +663,7 @@ class LlamaModel(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         kb_config: Optional[KBLaMConfig] = None,
+        kb_adj: Optional[torch.Tensor] = None,
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
@@ -726,6 +778,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position=cache_position,
                     kb_kvs=kb_kvs,
                     kb_config=kb_config,
+                    kb_adj=kb_adj,
                     save_attention_weights=save_attention_weights,
                     attention_save_loc=attention_save_loc,
                     attention_file_base_name=attention_file_base_name,
@@ -964,6 +1017,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         kb_config: Optional[KBLaMConfig] = None,
+        kb_adj: Optional[torch.Tensor] = None,
         save_attention_weights: bool = False,
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
@@ -1024,6 +1078,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
             cache_position=cache_position,
             kb_kvs=kb_kvs,
             kb_config=kb_config,
+            kb_adj=kb_adj,
             save_attention_weights=save_attention_weights,
             attention_save_loc=attention_save_loc,
             attention_file_base_name=attention_file_base_name,

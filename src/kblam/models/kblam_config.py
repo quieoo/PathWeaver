@@ -12,6 +12,7 @@ class KBLaMConfig(PretrainedConfig):
         sep_query_head: bool = False,
         attn_implementation: str = "eager",
         format_short: bool = False,
+        path_attn: bool = False,
         **kwargs,
     ):
         self.base_model_name_or_path = base_model_name_or_path
@@ -22,4 +23,6 @@ class KBLaMConfig(PretrainedConfig):
         self.sep_query_head = sep_query_head
         self.attn_implementation = attn_implementation
         self.format_short = format_short
+        self.path_attn = path_attn
+
         super().__init__(**kwargs)
