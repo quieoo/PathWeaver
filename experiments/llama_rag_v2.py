@@ -171,18 +171,18 @@ def load_squad_dataset(dataset_path: str, kb_size: int, max_samples: int | None 
 
 def load_2wiki_dataset(dataset_path: str,
                        kb_size: int,
-                       max_samples: int | None = None):
+                       max_samples: int | None = None, source_type: str = '2wiki'):
     dataset = []
     with open(dataset_path, 'r', encoding='utf-8') as f:
         dataset=json.load(f)
     
     new_dataset = []
     for item in dataset:
-        if item.get('source') != '2wiki':
+        if item.get('source') != source_type:
             continue
         new_dataset.append(item)
     dataset=new_dataset[:max_samples]
-    print(f"从本地加载了 {len(dataset)} 个 2wiki 样本")
+    print(f"从本地加载了 {len(dataset)} 个 {source_type} 样本")
 
     # 1. 把所有“其它”段落展平成候选池
     candidate_paras = [p for item in dataset for p in item['paragraphs']]
@@ -244,7 +244,9 @@ def load_data(args):
     elif args.dataset_type == 'squad':
         return load_squad_dataset(args.dataset_path, args.kb_size, args.n_samples)
     elif args.dataset_type == '2wiki':
-        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples)
+        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
+    elif args.dataset_type == 'hotpot':
+        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
     else:
         raise ValueError(f"未知数据集类型: {args.dataset_type}")
 

@@ -413,25 +413,22 @@ def perform_eval_2wiki(
     remove_sorry: bool = False,
     query_size: int = 250,
 ):
+
+    if eval_mode != "kb":
+        raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+
     if seed < 0:
         np.random.seed(None)
     else:
         np.random.seed(seed)
 
-    if query_size <= kb_size:
-        raise ValueError(f"query_size={query_size} must be greater than kb_size={kb_size}")
+    # if query_size <= kb_size:
+    #     raise ValueError(f"query_size={query_size} must be greater than kb_size={kb_size}")
     dataset = kb_retriever.dataset
     total_N = len(dataset)
 
-    subset_idx=np.random.randint(0, total_N, query_size)
-    subset=[dataset[idx] for idx in subset_idx]
-
-    hop_num=2
-    key_embeddings, value_embeddings, kb_adjs=kb_retriever.get_embeddings_with_adj_2wiki(
-        batch_indices=subset_idx,
-        hop_num=hop_num,
-        kb_size=kb_size,
-    )
+    query_idx=np.random.randint(0, total_N, query_size)
+    subset=[dataset[idx] for idx in query_idx]
 
     # 统一的结果容器
     all_model_outputs, all_answers = [], []
@@ -451,41 +448,47 @@ def perform_eval_2wiki(
         start_idx = batch_id * kb_size
         end_idx = min((batch_id + 1) * kb_size, query_size)
         current_query_num = end_idx - start_idx
-
-        # ---- KB 子集：固定大小 ----
-        sub_kb_embedding=(key_embeddings[hop_num*start_idx:hop_num*end_idx], value_embeddings[hop_num*start_idx:hop_num*end_idx])
-        sub_kb_adj=kb_adjs[batch_id]
-
-        # ---- Query 子集 ----
+        
+        key_embeddings, value_embeddings, kb_adj=kb_retriever.get_embeddings_with_adj_2wiki(
+            batch_indices=query_idx[start_idx:end_idx],
+            hop_num=2,
+        )
+        
         query_subset=subset[start_idx:end_idx]
 
-        # ---- 处理本批次 ----
         model_outputs, answers = [], []
         for i in range(current_query_num):
             row = query_subset[i]
-            idx = subset_idx[start_idx + i]
             Q, A = row["Q"], row["A"]
-
-            if eval_mode != "kb":
-                raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
 
             # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
             # sub_kb_embedding = move_true_kb_to_front_inference(
             #     sub_kb_embedding,
             #     i,
             # )
+            # if kb_adjs is None:
+            #     kb_adj_i = None
+            # elif isinstance(kb_adjs, list):
+            #     kb_adj_i = kb_adjs[start_idx + i]
+            # elif hasattr(kb_adjs, "dim") and kb_adjs.dim() == 3:
+            #     kb_adj_i = kb_adjs[start_idx + i]
+            # else:
+            #     kb_adj_i = kb_adjs
+                
             output_text = answer_question_deterministic(
                 tokenizer,
                 model,
                 Q,
-                kb=sub_kb_embedding,
+                kb=(key_embeddings, value_embeddings),
                 kb_config=kb_config,
-                kb_adj=sub_kb_adj,
-                save_attention_weights=debug_flag,
-                attention_save_loc="./attn_weights_kblam/",
-                attention_file_base_name=f"kb-{idx}",
-            ).split(Q)[1]
+                kb_adj=kb_adj,
+                # save_attention_weights=debug_flag,
+                # attention_save_loc="./attn_weights_kblam/",
+                # attention_file_base_name=f"kb-{idx}",
+            )
+            # print(f"[DEBUG] output_text={output_text}")
 
+            output_text=output_text.split(Q)[1]
             prof = kblam_profile_get()
             prefill_s = prof["prefill_s"]                # 模型 prefill
             decode_s = prof["decode_s"]
@@ -638,10 +641,6 @@ def perform_eval_v2(
     # print(f"[DONE] Evaluated {len(all_model_outputs)} queries with KB size={kb_size}")
     # print(results)
     # return results, results_dict
-
-
-    
-
 
 
 def perform_eval_refusal(
@@ -836,6 +835,12 @@ parent_parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=False,
     help="Whether to use short format",
+)
+parent_parser.add_argument(
+    "--path_attn",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to use path attention",
 )
 
 
@@ -1140,6 +1145,7 @@ def eval_generate():
         kb_scale_factor,
     )
     kb_config.format_short = args.format_short
+    kb_config.path_attn = args.path_attn
 
     kb_retriever = KBRetriever(
         encoder,

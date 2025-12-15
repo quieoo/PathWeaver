@@ -115,7 +115,10 @@ class KBRetriever:
         hop_num: int = 2,
     ):
         if not self._use_cached_embd():
-            raise RuntimeError("get_embeddings_with_adj_2wiki 当前仅支持 cached KB embedding")
+            raise RuntimeError("get_embeddings_with_adj_2wiki only support cached KB embedding")
+
+        if hop_num != 2:
+            raise ValueError("get_embeddings_with_adj_2wiki only support hop_num=2")
 
         B = len(batch_indices)
 
@@ -143,22 +146,25 @@ class KBRetriever:
         val_true = self.encoder.encode_val(base_emb=val_true_np)   # (B*2, d)
 
 
-        # if kb_size is None:
-        # 如果kb_size是单个int值，则认为是推理阶段
-        if kb_size is not None and isinstance(kb_size, int):
-            # 推理阶段key/value_embedding形状为(2*B, d)
-            # kb_adj的形状应该为: B/kb_size * (2*kb_size, 2*kb_size)
-            kb_adjs = []
+        if kb_size is None:
+            kb_size=len(batch_indices)
             kb_len = hop_num*kb_size
-            for b in range(B):
-                kb_adj = torch.zeros(kb_len, kb_len, dtype=torch.float32, device=device)
-                # 每两个KB之间，第一个KB到第二个KB之间有路径
-                for i in range(0, kb_len, hop_num):
-                    kb_adj[i, i+1] = 1.0  # 只在第 0 → 1 有路径
-                kb_adj = kb_adj.view(1, kb_len, kb_len)
-                kb_adjs.append(kb_adj)
-
-            return key_true, val_true, kb_adjs
+            # ------------------------------------------
+            # given: kb_size=100, hop_num=2, kb_len=200
+            # row_idx = [0, 2, 4, ..., 198]
+            # col_idx = [1, 3, 5, ..., 199]
+            # indices = [[0, 2, 4, ..., 198], [1, 3, 5, ..., 199]], (2*100)
+            # values = [1.0, 1.0, 1.0, ..., 1.0], (100)
+            # sparse_adj = (200,200)的稀疏矩阵，100条边[(0,1), (2,3), ..., (198,199)], 非零元素为1.0
+            # ------------------------------------------
+            adj_device = device if device is not None else key_true.device
+            row_idx = torch.arange(0, kb_len, hop_num, device=adj_device)
+            col_idx = row_idx + 1
+            indices = torch.stack([row_idx, col_idx])
+            values = torch.ones(row_idx.size(0), dtype=key_true.dtype, device=adj_device)
+            sparse_adj = torch.sparse_coo_tensor(indices, values, (kb_len, kb_len), device=adj_device).coalesce()
+            # kb_adjs.append(sparse_adj)
+            return key_true, val_true, sparse_adj
 
         # 形状变为(B, 2, d)
         key_true = key_true.view(B, hop_num, -1)
@@ -173,6 +179,7 @@ class KBRetriever:
         # 这里用 context_set_size_scheduler 让 context_set_size 随 step 变化
         context_set_size = context_set_size_scheduler(step, kb_size)
         context_set_size = min(context_set_size, total_samples)
+        #print("[kb_size]:", context_set_size * 2 + 2)
 
         # 从全局 KB 中随机采样 context_set_size 个 triple（所有样本共享）
         random_sample_ids = np.random.choice(total_samples, context_set_size, replace=False)
@@ -204,11 +211,27 @@ class KBRetriever:
         # 6) 构造路径邻接矩阵 kb_adj
         #    - 只保留 0->1 的边，其余 context 均视作“孤立节点”
         # ------------------------------------------------
-        kb_adj = torch.zeros(B, kb_len, kb_len, dtype=torch.float32, device=device)
-        # 每两个KB之间，第一个KB到第二个KB之间有路径
+        # kb_adj = torch.zeros(B, kb_len, kb_len, dtype=torch.float32, device=device)
+        # for b in range(B):
+        #     for i in range(0, kb_len, hop_num):
+        #         kb_adj[b, i, i+1] = 1.0
+        adj_device = device if device is not None else key_emb.device
+        batch_entries = []
+        value_entries = []
         for b in range(B):
-            for i in range(0, kb_len, hop_num):
-                kb_adj[b, i, i+1] = 1.0  # 只在第 0 → 1 有路径
+            rows = torch.arange(0, kb_len, hop_num, device=adj_device)
+            cols = rows + 1
+            batch_entries.append(torch.stack([torch.full_like(rows, b), rows, cols]))
+            value_entries.append(torch.ones(rows.size(0), dtype=key_emb.dtype, device=adj_device))
+        if batch_entries:
+            indices = torch.cat(batch_entries, dim=1)
+            values = torch.cat(value_entries, dim=0)
+        else:
+            indices = torch.empty((3, 0), dtype=torch.long, device=adj_device)
+            values = torch.empty((0,), dtype=key_emb.dtype, device=adj_device)
+        kb_adj = torch.sparse_coo_tensor(
+            indices, values, (B, kb_len, kb_len), device=adj_device, dtype=key_emb.dtype
+        ).coalesce()
 
         return key_emb, val_emb, kb_adj
 

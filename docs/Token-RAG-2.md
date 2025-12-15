@@ -452,7 +452,7 @@ nohup python eval.py generation \
     --query_size 100 --seed 1 >> eval_squad.log 2>&1 &
 
 # rag
- python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/squad/plain_text/validation_merged.json     --dataset-type squad     --model-path /mnt/n0/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 10     --similarity-top-k 5 --oracle-retrieval
+ python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/squad/plain_text/validation_merged.json     --dataset-type squad     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10 --oracle-retrieval
 
 ````
 
@@ -1516,6 +1516,112 @@ nohup python train.py \
   --eval_step 100 \
   --total_steps 18000 --path_attn  --N 9999999   --model_dir_to_resume ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999 \
   --model_save_dir ./train/hotpot_2hop_v1.1 >> train_hotpot_2hop_v1.1.log 2>&1 &
+
+
+# 临时跑：把kb size缩小
+nohup python train.py \
+  --seed 1 --B 10  --lr 5e-4 \
+  --sep_query_head --use_cached_embd --use_lr_decay  --save_period 100 --duplicate_true_kb \
+  --dynamic_kb_size 10 20 --outlier_num -999999 \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets.jsonl --dataset_type 2wiki \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --gradient_accm_step 20  --kb_token_layer_frequency 3 \
+  --verbose \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets.jsonl \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 13000   --N 9999999   --model_dir_to_resume ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999 \
+  --model_save_dir ./train/hotpot_2hop_v1.1 >> train_hotpot_2hop_v1.1.log 2>&1 &
+
+````
+
+### 内存泄露debug
+
+#### RAG
+
+````bash
+ python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop_test.json     --dataset-type hotpot     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10
+
+````
+
+````bash
+
+# 训练hotpot
+
+# 修改梯度检查点
+# 禁用torch.compile
+export TORCHDYNAMO_DISABLE=1
+
+
+nohup python train.py \
+  --seed 1 --B 10  --lr 5e-4 \
+  --sep_query_head --use_cached_embd --use_lr_decay  --save_period 500 --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets.jsonl --dataset_type 2wiki \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/train_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --gradient_accm_step 20  --kb_token_layer_frequency 3 \
+  --verbose \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets.jsonl \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 5000 --path_attn  --N 9999999 \
+  --model_save_dir ./train/hotpot_2hop_v2.1 >> train_hotpot_2hop_v2.1.log 2>&1 &
+
+
+# 训练2wiki
+nohup python train.py \
+  --seed 1 --B 10  --lr 5e-4 \
+  --sep_query_head --use_cached_embd --use_lr_decay  --save_period 100 --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_train_datasets.json --dataset_type 2wiki \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_train_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_train_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --gradient_accm_step 20  --kb_token_layer_frequency 3 \
+  --verbose \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --path_attn  --N 9999999 \
+  --model_save_dir ./train/2wiki_1.1.0 \
+  >> train_2wiki_1.1.0.log 2>&1 &
+````
+
+#### 推理
+
+````bash
+
+nohup python eval.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/hotpot_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_12999_encoder/encoder.pt  \
+    --model_dir ./train/hotpot_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_12999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop \
+    --test_dataset test_datasets.jsonl \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+    --dataset_type 2wiki --query_size 100 --seed 1 --path_attn --save_dir ./gen_tmp >> eval_hotpot_2hop_1.1.log 2>&1 &
 
 ````
 

@@ -381,26 +381,90 @@ class KblamLlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
         # ================== 链式注意力 =============
-        # before_memory=torch.cuda.mem_get_info(0)[0] / 1024**3
         if (
             kb_config.path_attn 
             and kb_kvs is not None
             and kb_adj is not None
             and self.layer_idx % kb_layer_frequency == 0
         ):
-            kb_k, kb_v = kb_kvs
-            B, H, Q, total_k = attn_weights.shape
-            kb_len = kb_adj.shape[-1]
-            hop_num = 2          # 与构造脚本保持一致，如会变动请改成参数
+            #if attn_weights.device.type == "cuda":
+                #torch.cuda.synchronize(attn_weights.device)
+                #before_memory = torch.cuda.memory_allocated(attn_weights.device) / 1024**3
+            #else:
+                #before_memory = 0.0
+            #print(f"[L{self.layer_idx}] 链式注意力前内存占用：{before_memory:.2f} GB")
+
+            # kb_k, kb_v = kb_kvs
+            # B, H, Q, total_k = attn_weights.shape
+            # kb_len = kb_adj.shape[-1]
+            if isinstance(kb_adj, list):
+                kb_len = kb_adj[0].size(-1)
+            else:
+                kb_len = kb_adj.size(-1)
+            B_sparse = attn_weights.size(0)
+            # hop_num = 2          # 与构造脚本保持一致，如会变动请改成参数
 
             # ---------- 1. 原始 KB 注意力 ----------
             alpha_kb = attn_weights[:, :, :, :kb_len]          # (B, H, Q, kb_len)
 
             # ---------- 2. 图路径转发 ----------
-            A = kb_adj.to(attn_weights.device).unsqueeze(1).unsqueeze(2)
-            # print(f"attn_weights.shape={attn_weights.shape}, kb_adj.shape={kb_adj.shape}, A.shape={A.shape}, alpha_kb.shape={alpha_kb.shape}")
+            if isinstance(kb_adj, list):
+                alpha_flat = alpha_kb.reshape(B_sparse, -1, kb_len)
+                beta_chunks = []
+                for b in range(B_sparse):
+                    adj_b = kb_adj[b]
+                    adj_sparse = adj_b.coalesce() if adj_b.is_sparse else adj_b.to(attn_weights.device).to_sparse().coalesce()
+                    beta_flat = torch.sparse.mm(
+                        adj_sparse.transpose(0, 1),
+                        alpha_flat[b].transpose(0, 1)
+                    ).transpose(0, 1)
+                    beta_chunks.append(beta_flat.view(alpha_kb.size(1), alpha_kb.size(2), kb_len))
+                beta_kb = torch.stack(beta_chunks, dim=0)
+            elif kb_adj.is_sparse:
+                alpha_flat = alpha_kb.reshape(B_sparse, -1, kb_len)
+                idx = kb_adj.indices()
+                vals = kb_adj.values()
+                if idx.size(0) == 2:
+                    # inference mode
+                    adj_single = kb_adj.coalesce().to(device=alpha_kb.device, dtype=alpha_kb.dtype)
+                    beta_chunks = []
+                    for b in range(B_sparse):
+                        beta_flat = torch.sparse.mm(
+                            adj_single.transpose(0, 1),
+                            alpha_flat[b].transpose(0, 1)
+                        ).transpose(0, 1)
+                        beta_chunks.append(beta_flat.view(alpha_kb.size(1), alpha_kb.size(2), kb_len))
+                    beta_kb = torch.stack(beta_chunks, dim=0)
+                else:
+                    beta_chunks = []
+                    for b in range(B_sparse):
+                        mask = idx[0] == b
+                        if mask.any():
+                            rows = idx[1, mask]
+                            cols = idx[2, mask]
+                            adj_b = torch.sparse_coo_tensor(
+                                torch.stack([rows, cols]),
+                                vals[mask],
+                                (kb_len, kb_len),
+                                device=vals.device,
+                                dtype=alpha_kb.dtype,
+                            ).coalesce()
+                        else:
+                            adj_b = torch.sparse_coo_tensor(
+                                torch.empty((2, 0), dtype=torch.long, device=alpha_kb.device),
+                                torch.empty((0,), dtype=alpha_kb.dtype, device=alpha_kb.device),
+                                (kb_len, kb_len),
+                            )
+                        beta_flat = torch.sparse.mm(
+                            adj_b.transpose(0, 1),
+                            alpha_flat[b].transpose(0, 1)
+                        ).transpose(0, 1)
+                        beta_chunks.append(beta_flat.view(alpha_kb.size(1), alpha_kb.size(2), kb_len))
+                    beta_kb = torch.stack(beta_chunks, dim=0)
+            else:
+                A = kb_adj.to(attn_weights.device).unsqueeze(1).unsqueeze(2)
+                beta_kb = torch.matmul(alpha_kb.unsqueeze(-2), A).squeeze(-2)
 
-            beta_kb = torch.matmul(alpha_kb.unsqueeze(-2), A).squeeze(-2)
             mix_ratio = getattr(kb_config, 'path_attn_mix_ratio', 1.0)
             beta_kb = mix_ratio * beta_kb + (1.0 - mix_ratio) * alpha_kb
             kb_sum = beta_kb.sum(dim=-1, keepdim=True).clamp_min(1e-9)
@@ -408,6 +472,7 @@ class KblamLlamaAttention(nn.Module):
 
             # ---------- 3. 日志：Top-3 before vs after ----------
             # 只盯 batch-0, head-0, query-0，避免刷屏
+            '''
             if False:
                 # 3.1 原始 top-3
                 scores_raw, idx_raw = alpha_kb[0, 0, 0].topk(3, dim=-1)   # (3,)
@@ -418,7 +483,8 @@ class KblamLlamaAttention(nn.Module):
                     return ' | '.join([f'ID={i.item():<3} score={s.item():.4f}'
                                     for i, s in zip(ids, scores)])
                 print(f'Layer-{self.layer_idx}  KB-Top3  raw={fmt(idx_raw, scores_raw)}  -->  graph={fmt(idx_new, scores_new)}')
-
+            '''
+                
             # ---------- 4. 写回注意力 ----------
             new_attn = attn_weights.clone()
             new_attn[:, :, :, :kb_len] = beta_kb
@@ -426,11 +492,7 @@ class KblamLlamaAttention(nn.Module):
             new_attn = new_attn / total_sum
             attn_weights = new_attn
 
-        # after_memory=torch.cuda.mem_get_info(0)[0] / 1024**3
-        # if after_memory < before_memory:
-        #     print(f"[L{self.layer_idx}] 链式注意力内存占用增加，可能存在内存泄漏问题. 占用增加量: {after_memory - before_memory:.2f} GB")
-        #     print(f"当前可用：{after_memory:.2f} GB")
-
+            
         # save attention weights
         if not attn_weights.requires_grad:
             # TODO: Make this function injectable
@@ -637,7 +699,7 @@ class LlamaModel(LlamaPreTrainedModel):
             ]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing = True
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -751,6 +813,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # print(f"gradient_checkpointing: {self.gradient_checkpointing}, training: {self.training}")
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -763,9 +826,11 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position,
                     kb_kvs,
                     kb_config,
+                    kb_adj,
                     save_attention_weights,
                     attention_save_loc,
                     attention_file_base_name,
+                    save_attn_weights_policy,
                 )
             else:
                 layer_outputs = decoder_layer(
