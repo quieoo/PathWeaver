@@ -387,40 +387,13 @@ class KblamLlamaAttention(nn.Module):
             and kb_adj is not None
             and self.layer_idx % kb_layer_frequency == 0
         ):
-            #if attn_weights.device.type == "cuda":
-                #torch.cuda.synchronize(attn_weights.device)
-                #before_memory = torch.cuda.memory_allocated(attn_weights.device) / 1024**3
-            #else:
-                #before_memory = 0.0
-            #print(f"[L{self.layer_idx}] 链式注意力前内存占用：{before_memory:.2f} GB")
 
-            # kb_k, kb_v = kb_kvs
-            # B, H, Q, total_k = attn_weights.shape
-            # kb_len = kb_adj.shape[-1]
-            if isinstance(kb_adj, list):
-                kb_len = kb_adj[0].size(-1)
-            else:
-                kb_len = kb_adj.size(-1)
+            kb_len = kb_adj.size(-1)
             B_sparse = attn_weights.size(0)
-            # hop_num = 2          # 与构造脚本保持一致，如会变动请改成参数
-
-            # ---------- 1. 原始 KB 注意力 ----------
             alpha_kb = attn_weights[:, :, :, :kb_len]          # (B, H, Q, kb_len)
 
             # ---------- 2. 图路径转发 ----------
-            if isinstance(kb_adj, list):
-                alpha_flat = alpha_kb.reshape(B_sparse, -1, kb_len)
-                beta_chunks = []
-                for b in range(B_sparse):
-                    adj_b = kb_adj[b]
-                    adj_sparse = adj_b.coalesce() if adj_b.is_sparse else adj_b.to(attn_weights.device).to_sparse().coalesce()
-                    beta_flat = torch.sparse.mm(
-                        adj_sparse.transpose(0, 1),
-                        alpha_flat[b].transpose(0, 1)
-                    ).transpose(0, 1)
-                    beta_chunks.append(beta_flat.view(alpha_kb.size(1), alpha_kb.size(2), kb_len))
-                beta_kb = torch.stack(beta_chunks, dim=0)
-            elif kb_adj.is_sparse:
+            if kb_adj.is_sparse:
                 alpha_flat = alpha_kb.reshape(B_sparse, -1, kb_len)
                 idx = kb_adj.indices()
                 vals = kb_adj.values()

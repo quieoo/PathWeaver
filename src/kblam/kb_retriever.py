@@ -147,6 +147,8 @@ class KBRetriever:
 
 
         if kb_size is None:
+            # 推理模式
+            # 一次性传入指定的样本ID，构建成一张KB图
             kb_size=len(batch_indices)
             kb_len = hop_num*kb_size
             # ------------------------------------------

@@ -426,9 +426,24 @@ def perform_eval_2wiki(
     #     raise ValueError(f"query_size={query_size} must be greater than kb_size={kb_size}")
     dataset = kb_retriever.dataset
     total_N = len(dataset)
-
     query_idx=np.random.randint(0, total_N, query_size)
     subset=[dataset[idx] for idx in query_idx]
+
+    # 过滤掉三元组提取质量不够的样本
+    new_subset = []
+    new_query_idx=[]
+    for row, idx in zip(subset, query_idx):
+        ans=format_output_for_synthetic(row["A"])
+        des_2=row["triple_lists"][1]["description"]
+        if ans == des_2:
+            new_subset.append(row)
+            new_query_idx.append(idx)
+    subset=new_subset
+    query_idx=new_query_idx
+    query_size=len(subset)    
+    print(f"After filtering, query_size={query_size}")
+
+
 
     # 统一的结果容器
     all_model_outputs, all_answers = [], []
@@ -490,6 +505,7 @@ def perform_eval_2wiki(
 
             output_text=output_text.split(Q)[1]
             prof = kblam_profile_get()
+            kblam_profile_reset()
             prefill_s = prof["prefill_s"]                # 模型 prefill
             decode_s = prof["decode_s"]
             decode_tokens = max(1, prof["decode_tokens"])
@@ -555,7 +571,7 @@ def perform_eval_v2(
     subset_idx=np.random.randint(0, total_N, query_size)
     subset=[dataset[idx] for idx in subset_idx]
     kb_embeddings=kb_retriever.get_key_embeddings(subset_idx)
-
+    key_embeddings, value_embeddings=kb_embeddings
 
     # 统一的结果容器
     all_model_outputs, all_answers = [], []
@@ -564,6 +580,11 @@ def perform_eval_v2(
     num_batches = (query_size + kb_size - 1) // kb_size
 
     print(f"[INFO] Eval mode={eval_mode}, KB size={kb_size}, Query size={query_size}, total_batches={num_batches}")
+
+    start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
+    retrieval_time=0.003
 
     for batch_id in tqdm(range(num_batches)):
         # ---- 当前批的 query 索引范围 ----
@@ -595,22 +616,35 @@ def perform_eval_v2(
                 raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
 
             # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
-            sub_kb_embedding = move_true_kb_to_front_inference(
-                sub_kb_embedding,
-                i,
-            )
+            # sub_kb_embedding = move_true_kb_to_front_inference(
+            #     sub_kb_embedding,
+            #     i,
+            # )
             output_text = answer_question_deterministic(
                 tokenizer,
                 model,
                 Q,
                 kb=sub_kb_embedding,
                 kb_config=kb_config,
-                kb_adj=kb_adjs[start_idx:end_idx],
-                save_attention_weights=debug_flag,
-                attention_save_loc="./attn_weights_kblam/",
-                attention_file_base_name=f"kb-{idx}",
+                # save_attention_weights=debug_flag,
+                # attention_save_loc="./attn_weights_kblam/",
+                # attention_file_base_name=f"kb-{idx}",
             ).split(Q)[1]
             model_output=output_text[2:]
+
+            prof = kblam_profile_get()
+            kblam_profile_reset()
+            prefill_s = prof["prefill_s"]                # 模型 prefill
+            decode_s = prof["decode_s"]
+            decode_tokens = max(1, prof["decode_tokens"])
+            # print(f"prefill_s: {prefill_s}, decode_s: {decode_s}, decode_tokens: {decode_tokens}")
+            tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+            ttft = retrieval_time + prefill_s
+
+            TTFTs.append(ttft)
+            TPOTs.append(tpot)
+
+
             if remove_sorry and "sorry" in model_output.lower():
                 continue
 
@@ -632,8 +666,16 @@ def perform_eval_v2(
         all_model_outputs.extend(model_outputs)
         all_answers.extend(answers)
 
+
         # print(f"[INFO] Batch {batch_id+1}/{num_batches} done. Queries={current_query_num}")
 
+
+    end_time=time.time()
+    print(f"============== 2wiki Performance ==================")
+    print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
     return all_model_outputs, all_answers
 
     # # ---- 统一计算评估指标 ----

@@ -182,10 +182,11 @@ def load_2wiki_dataset(dataset_path: str,
             continue
         new_dataset.append(item)
     dataset=new_dataset[:max_samples]
-    print(f"从本地加载了 {len(dataset)} 个 {source_type} 样本")
+    print(f"原始数据集大小: {len(new_dataset)}")
+    print(f"过滤后的数据集大小: {len(dataset)}")
 
     # 1. 把所有“其它”段落展平成候选池
-    candidate_paras = [p for item in dataset for p in item['paragraphs']]
+    candidate_paras = [p for item in new_dataset for p in item['paragraphs']]
 
     ret = []
     for item in dataset:
@@ -240,7 +241,8 @@ def load_2wiki_dataset(dataset_path: str,
 
 def load_data(args):
     if args.dataset_type == 'musique':
-        return load_musique_dataset(args.dataset_path, args.n_samples)
+        # return load_musique_dataset(args.dataset_path, args.n_samples)
+        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
     elif args.dataset_type == 'squad':
         return load_squad_dataset(args.dataset_path, args.kb_size, args.n_samples)
     elif args.dataset_type == '2wiki':
@@ -399,7 +401,7 @@ def run_rag_inference(
     stat_e2e: List[float] = []
 
     for i, (question, paras) in enumerate(zip(questions, paragraphs_list)):
-        print(f"\n[{i + 1}/{len(questions)}] Question: {question}")
+        
 
         # ---- 检索阶段 ----
         if args.oracle_retrieval:
@@ -528,20 +530,21 @@ def run_rag_inference(
         stat_tokens.append(num_out)
         stat_e2e.append(retrieval_time + gen_elapsed)
 
-        if i % 10 == 0:
+        if i % 100 == 0:
+            print(f"\n[{i + 1}/{len(questions)}] Question: {question}")
             print("\n--- 模型输出 ---")
-        print(pred)
-        print(f" → Prediction: {pred}")
-        print(f" → Ground Truth: {answers[i]}")
-        print(
-            f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
-            f"prefill(model)={prefill_model*1000:.1f} ms, "
-            f"TTFT={ttft*1000:.1f} ms, "
-            f"decode={decode_time*1000:.1f} ms, "
-            f"TPOT={tpot*1000:.1f} ms/token, "
-            f"out_tokens={num_out}, "
-            f"E2E={(retrieval_time+gen_elapsed):.3f} s"
-        )
+            print(pred)
+            print(f" → Prediction: {pred}")
+            print(f" → Ground Truth: {answers[i]}")
+            print(
+                f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
+                f"prefill(model)={prefill_model*1000:.1f} ms, "
+                f"TTFT={ttft*1000:.1f} ms, "
+                f"decode={decode_time*1000:.1f} ms, "
+                f"TPOT={tpot*1000:.1f} ms/token, "
+                f"out_tokens={num_out}, "
+                f"E2E={(retrieval_time+gen_elapsed):.3f} s"
+            )
 
         predictions.append(pred)
 
