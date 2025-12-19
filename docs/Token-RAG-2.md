@@ -1561,7 +1561,10 @@ nohup python train.py \
 #### RAG
 
 ````bash
- python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/hotpot_2hop_test.json     --dataset-type hotpot     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10
+nohup python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/hotpot_2hop_test.json     --dataset-type hotpot     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10 >> eval_hotpot_2hop_1.1.log 2>&1 &
+
+# key不重合数据集
+nohup python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_bridge.json     --dataset-type hotpot     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10 >> eval_hotpot_2hop_1.1.log 2>&1 &
 
 ````
 
@@ -1641,6 +1644,7 @@ nohup python eval.py generation \
 #### 验证调整过后的路径注意力的正确性
 
 ````bash
+## XXXXXX
 nohup python train.py \
   --seed 1 --B 10  --lr 5e-4 \
   --sep_query_head --use_cached_embd --use_lr_decay  --save_period 500 --duplicate_true_kb \
@@ -1792,7 +1796,7 @@ nohup python eval.py generation \
     --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/musique_2hop/test_datasets_triples_qwen-embedding-0.6B_embd_value.npy \
     --dataset_type 2wiki --query_size 100 --seed 1 --save_dir ./gen_tmp >> eval_musique_2hop_1.1.log 2>&1 &
 
- python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/musique_2hop/test_datasets_prepare.json     --dataset-type musique     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10
+nohup python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/musique_2hop/test_datasets_prepare.json     --dataset-type musique     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10 >> eval_musique_2hop_1.1.log 2>&1 &
 ````
 
 
