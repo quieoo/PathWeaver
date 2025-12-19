@@ -3,9 +3,14 @@ import gc
 import json
 import torch
 from safetensors.torch import load_file
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LogitsProcessorList
 
-from olmo3_standalone import Olmo3Config, Olmo3StandaloneModel, HFWrapperForGeneration
+from olmo3_standalone import (
+    DeviceAwareSuppressTokensLogitsProcessor,
+    HFWrapperForGeneration,
+    Olmo3Config,
+    Olmo3StandaloneModel,
+)
 
 
 # --------------------------------------------------
@@ -97,6 +102,33 @@ if os.path.exists(chat_template_path):
 else:
     print("Warning: chat_template.jinja not found!")
 
+
+def _build_banned_tokens(tokenizer: AutoTokenizer) -> list[int]:
+    """Collect problematic special tokens to prevent corrupted generations."""
+
+    banned_tokens: list[int] = []
+    special_tokens = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|function|>",
+        "<|function_calls|>",
+    ]
+
+    for tok in special_tokens:
+        if tok in tokenizer.get_vocab():
+            banned_tokens.append(tokenizer.convert_tokens_to_ids(tok))
+
+    problematic_patterns = ["system", "user", "assistant", "function", "tool"]
+    for pattern in problematic_patterns:
+        for token_str, token_id in tokenizer.get_vocab().items():
+            if pattern in token_str.lower() and len(token_str.strip()) < 10:
+                banned_tokens.append(token_id)
+
+    return sorted(set(banned_tokens))
+
 # --------------------------------------------------
 # minimal greedy generation (修复版本)
 # --------------------------------------------------
@@ -107,22 +139,7 @@ def greedy_generate(
     tokenizer,
     max_new_tokens=256,
 ):
-    # ---- 禁止 system / user / assistant token ----
-    banned_tokens = []
-    # 检查实际的chat template token格式
-    for tok in ["<|im_start|>", "<|im_end|>", "<|system|>", "<|user|>", "<|assistant|>", "<|function|>", "<|function_calls|>"]:
-        if tok in tokenizer.get_vocab():
-            banned_tokens.append(tokenizer.convert_tokens_to_ids(tok))
-    
-    # 额外禁止一些可能导致重复的token
-    problematic_patterns = ["system", "user", "assistant", "function", "tool"]
-    for pattern in problematic_patterns:
-        for token_str, token_id in tokenizer.get_vocab().items():
-            if pattern in token_str.lower() and len(token_str.strip()) < 10:
-                banned_tokens.append(token_id)
-    
-    # 去重
-    banned_tokens = list(set(banned_tokens))
+    banned_tokens = _build_banned_tokens(tokenizer)
 
     for step in range(max_new_tokens):
         outputs = model(input_ids)
@@ -155,22 +172,7 @@ def sample_generate(
 ):
     eos_token_id = tokenizer.eos_token_id
 
-    # ---- 禁止 system / user / assistant token (修复版本) ----
-    banned_tokens = []
-    # 检查实际的chat template token格式
-    for tok in ["<|im_start|>", "<|im_end|>", "<|system|>", "<|user|>", "<|assistant|>", "<|function|>", "<|function_calls|>"]:
-        if tok in tokenizer.get_vocab():
-            banned_tokens.append(tokenizer.convert_tokens_to_ids(tok))
-    
-    # 额外禁止一些可能导致重复的token
-    problematic_patterns = ["system", "user", "assistant", "function", "tool"]
-    for pattern in problematic_patterns:
-        for token_str, token_id in tokenizer.get_vocab().items():
-            if pattern in token_str.lower() and len(token_str.strip()) < 10:
-                banned_tokens.append(token_id)
-    
-    # 去重
-    banned_tokens = list(set(banned_tokens))
+    banned_tokens = _build_banned_tokens(tokenizer)
 
     print(f"禁止的token数量: {len(banned_tokens)}")
 
@@ -240,12 +242,20 @@ inputs = tokenizer(
     return_attention_mask=True
 ).to(device)
 
+banned_tokens = _build_banned_tokens(tokenizer)
+
 print("Generating response...")
 hf_model = HFWrapperForGeneration(model, tokenizer)
 # hf_model.to(device)
 hf_model.eval()
 
 
+
+logits_processor = LogitsProcessorList()
+if banned_tokens:
+    logits_processor.append(
+        DeviceAwareSuppressTokensLogitsProcessor(banned_tokens)
+    )
 
 with torch.no_grad():
     output_ids = hf_model.generate(
@@ -256,6 +266,7 @@ with torch.no_grad():
         top_p=0.9,
         repetition_penalty=1.1,
         pad_token_id=tokenizer.eos_token_id,
+        logits_processor=logits_processor,
     )
     
 result = tokenizer.decode(
