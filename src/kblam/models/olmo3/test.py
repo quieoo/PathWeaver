@@ -93,7 +93,7 @@ model.eval()
 # tokenizer (with chat_template)
 # --------------------------------------------------
 print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
 chat_template_path = os.path.join(MODEL_DIR, "chat_template.jinja")
 if os.path.exists(chat_template_path):
     with open(chat_template_path, "r") as f:
