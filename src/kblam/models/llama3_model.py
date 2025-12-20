@@ -41,18 +41,59 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
-    _CONFIG_FOR_DOC,
-    LLAMA_INPUTS_DOCSTRING,
-    LLAMA_START_DOCSTRING,
-    LlamaDynamicNTKScalingRotaryEmbedding,
-    LlamaLinearScalingRotaryEmbedding,
+    # _CONFIG_FOR_DOC,
+    # LLAMA_INPUTS_DOCSTRING,
+    # LLAMA_START_DOCSTRING,
+    # LlamaDynamicNTKScalingRotaryEmbedding,
+    # LlamaLinearScalingRotaryEmbedding,
     LlamaMLP,
     LlamaPreTrainedModel,
     LlamaRMSNorm,
-    LlamaRotaryEmbedding,
+    # LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     repeat_kv,
 )
+
+#-----------------------------------------------------
+#  ->tf457 FIX
+
+try:
+    from transformers.models.llama.modeling_llama import _CONFIG_FOR_DOC  # older transformers
+except ImportError:
+    # 在 HF 官方代码里，这通常只是 docstring 装饰器用的：
+    # _CONFIG_FOR_DOC = "LlamaConfig"
+    _CONFIG_FOR_DOC = "LlamaConfig"
+
+try:
+    from transformers.models.llama.modeling_llama import LLAMA_INPUTS_DOCSTRING
+except ImportError:
+    LLAMA_INPUTS_DOCSTRING = ""
+
+try:
+    from transformers.models.llama.modeling_llama import LLAMA_START_DOCSTRING
+except ImportError:
+    LLAMA_START_DOCSTRING = ""
+
+from transformers.models.llama.modeling_llama import (
+    LlamaRotaryEmbedding,
+)
+
+try:
+    from transformers.models.llama.modeling_llama import LlamaLinearScalingRotaryEmbedding
+except ImportError:
+    LlamaLinearScalingRotaryEmbedding = LlamaRotaryEmbedding
+
+try:
+    from transformers.models.llama.modeling_llama import LlamaDynamicNTKScalingRotaryEmbedding
+except ImportError:
+    LlamaDynamicNTKScalingRotaryEmbedding = LlamaRotaryEmbedding
+
+
+from transformers.generation import GenerationMixin
+
+
+#-----------------------------------------------------
+
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -153,31 +194,43 @@ class KblamLlamaAttention(nn.Module):
 
         return self._cached_path_adj[key]
     def _init_rope(self):
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=self.rope_theta,
-            )
-        else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+        """
+        transformers >= 4.52:
+        LlamaRotaryEmbedding is fully config-driven.
+        Older constructor signatures are NOT supported anymore.
+        """
+        try:
+            # transformers >= 4.52 (including 4.57)
+            self.rotary_emb = LlamaRotaryEmbedding(self.config)
+        except TypeError:
+            # transformers <= 4.46 fallback (legacy)
+            if self.config.rope_scaling is None:
+                self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
                     base=self.rope_theta,
                 )
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                scaling_type = self.config.rope_scaling["type"]
+                scaling_factor = self.config.rope_scaling["factor"]
+                if scaling_type == "linear":
+                    self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                        self.head_dim,
+                        max_position_embeddings=self.max_position_embeddings,
+                        scaling_factor=scaling_factor,
+                        base=self.rope_theta,
+                    )
+                elif scaling_type == "dynamic":
+                    self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                        self.head_dim,
+                        max_position_embeddings=self.max_position_embeddings,
+                        scaling_factor=scaling_factor,
+                        base=self.rope_theta,
+                    )
+                else:
+                    raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+
 
     def prune_key_value(self, query, kb_keys, kb_values, topk_size=20):
         assert (
@@ -621,6 +674,7 @@ class LlamaDecoderLayer(nn.Module):
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
         save_attn_weights_policy: str = "prefill-all-layer",
+        **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -736,6 +790,7 @@ class LlamaModel(LlamaPreTrainedModel):
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
         save_attn_weights_policy: str = "prefill-all-layer",
+        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1006,7 +1061,9 @@ class LlamaModel(LlamaPreTrainedModel):
         return causal_mask
 
 
-class KblamLlamaForCausalLM(LlamaPreTrainedModel):
+# class KblamLlamaForCausalLM(LlamaPreTrainedModel):
+# ->tf457
+class KblamLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config: LlamaConfig):
@@ -1093,6 +1150,7 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
         attention_save_loc: Optional[str] = None,
         attention_file_base_name: Optional[str] = None,
         save_attn_weights_policy: str = "prefill-all-layer",
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1208,27 +1266,34 @@ class KblamLlamaForCausalLM(LlamaPreTrainedModel):
         **kwargs,
     ):
         past_length = 0
+        cache_length = None
+        max_cache_length = None
+
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
+                # HF >=4.50 unified cache API
                 past_length = (
                     cache_position[0]
                     if cache_position is not None
                     else past_key_values.get_seq_length()
                 )
-                max_cache_length = (
-                    torch.tensor(
-                        past_key_values.get_max_length(), device=input_ids.device
-                    )
-                    if past_key_values.get_max_length() is not None
-                    else None
-                )
-                cache_length = (
-                    past_length
-                    if max_cache_length is None
-                    else torch.min(max_cache_length, past_length)
-                )
-            # TODO joao: remove this `else` after `generate` prioritizes `Cache` objects
+
+                # StaticCache only
+                if hasattr(past_key_values, "get_max_length"):
+                    max_len = past_key_values.get_max_length()
+                    if max_len is not None:
+                        max_cache_length = torch.tensor(
+                            max_len, device=input_ids.device
+                        )
+                        cache_length = torch.min(max_cache_length, past_length)
+                    else:
+                        cache_length = past_length
+                else:
+                    # DynamicCache: unbounded
+                    cache_length = past_length
+
             else:
+                # legacy tuple cache
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
 

@@ -231,10 +231,11 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
             model_outputs,
             references,
             lang=lang,
-            model_type="microsoft/deberta-xlarge-mnli",
+            model_type="roberta-large",
             verbose=True,
             device=device,
             batch_size=4,
+            use_fast_tokenizer=True,
         )
     except RuntimeError as e:
         if "CUDA out of memory" in str(e):
@@ -244,10 +245,11 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
                 model_outputs,
                 references,
                 lang=lang,
-                model_type="microsoft/deberta-xlarge-mnli",
+                model_type="roberta-large",
                 verbose=True,
                 device="cpu",
                 batch_size=1,
+                use_fast_tokenizer=True,
             )
         else:
             raise e
