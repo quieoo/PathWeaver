@@ -54,6 +54,13 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
+from kblam.kblam_attention import (
+    apply_kblam_attention,
+    apply_kblam_path_attention,
+    apply_kblam_sep_query_head,
+)
+
+
 #-----------------------------------------------------
 #  ->tf457 FIX
 
@@ -257,6 +264,386 @@ class KblamLlamaAttention(nn.Module):
         "all-step-last-layer",
     ]
 
+    # def forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     attention_mask: Optional[torch.Tensor] = None,
+    #     position_ids: Optional[torch.LongTensor] = None,
+    #     past_key_value: Optional[Cache] = None,
+    #     output_attentions: bool = False,
+    #     use_cache: bool = False,
+    #     cache_position: Optional[torch.LongTensor] = None,
+    #     kb_kvs: Optional[tuple] = None,
+    #     kb_config: Optional[KBLaMConfig] = None,
+    #     kb_adj: Optional[torch.Tensor] = None,
+    #     save_attention_weights: bool = True,
+    #     attention_save_loc: Optional[str] = None,
+    #     attention_file_base_name: Optional[str] = None,
+    #     save_attn_weights_policy: str = "prefill-all-layer",
+    #     **kwargs,
+    # ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    #     if save_attention_weights:
+    #         assert (
+    #             attention_save_loc is not None
+    #         ), "Please provide a location to save the attention weights"
+    #         assert (
+    #             attention_file_base_name is not None
+    #         ), "Please provide a base name for the attention weights"
+    #     bsz, q_len, _ = hidden_states.size()
+    #     if self.config.pretraining_tp > 1:
+    #         key_value_slicing = (
+    #             self.num_key_value_heads * self.head_dim
+    #         ) // self.config.pretraining_tp
+    #         query_slices = self.q_proj.weight.split(
+    #             (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+    #         )
+    #         key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+    #         value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+    #         query_states = [
+    #             F.linear(hidden_states, query_slices[i])
+    #             for i in range(self.config.pretraining_tp)
+    #         ]
+    #         query_states = torch.cat(query_states, dim=-1)
+
+    #         key_states = [
+    #             F.linear(hidden_states, key_slices[i])
+    #             for i in range(self.config.pretraining_tp)
+    #         ]
+    #         key_states = torch.cat(key_states, dim=-1)
+
+    #         value_states = [
+    #             F.linear(hidden_states, value_slices[i])
+    #             for i in range(self.config.pretraining_tp)
+    #         ]
+    #         value_states = torch.cat(value_states, dim=-1)
+
+    #     else:
+    #         query_states = self.q_proj(hidden_states)
+    #         query_states_2 = self.q_proj_new(hidden_states)
+    #         key_states = self.k_proj(hidden_states)
+    #         value_states = self.v_proj(hidden_states)
+
+    #     query_states = query_states.view(
+    #         bsz, q_len, self.num_heads, self.head_dim
+    #     ).transpose(1, 2)
+    #     query_states_2 = query_states_2.view(
+    #         bsz, q_len, self.num_heads, self.head_dim
+    #     ).transpose(1, 2)
+    #     key_states = key_states.view(
+    #         bsz, q_len, self.num_key_value_heads, self.head_dim
+    #     ).transpose(1, 2)
+    #     value_states = value_states.view(
+    #         bsz, q_len, self.num_key_value_heads, self.head_dim
+    #     ).transpose(1, 2)
+
+    #     cos, sin = self.rotary_emb(value_states, position_ids)
+    #     query_states, key_states = apply_rotary_pos_emb(
+    #         query_states, key_states, cos, sin
+    #     )
+
+    #     if past_key_value is not None:
+    #         # sin and cos are specific to RoPE models; cache_position needed for the static cache
+    #         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+    #         key_states, value_states = past_key_value.update(
+    #             key_states, value_states, self.layer_idx, cache_kwargs
+    #         )
+
+    #     # eager_attention_forward
+    #     key_states = repeat_kv(key_states, self.num_key_value_groups)
+    #     value_states = repeat_kv(value_states, self.num_key_value_groups)
+    #     kb_layer_frequency = kb_config.kb_layer_frequency
+    #     dynamic_sparsify = kb_config.dynamic_sparsify
+    #     topk_size = kb_config.top_k_kb
+    #     attn_weights_2 = None
+    #     if kb_kvs is not None:
+    #         if self.layer_idx % kb_layer_frequency == 0:
+    #             kb_keys, kb_values = (
+    #                 kb_kvs  # (kb_len, head_dim * num_heads * num_adapters)
+    #             )
+    #             kb_idx = (
+    #                 self.layer_idx // kb_layer_frequency
+    #             )  # Should be something inside the kb config
+    #             if len(kb_keys.shape) == 2:  # Not batch dim
+    #                 kb_len = kb_keys.shape[0]
+    #                 kb_keys = kb_keys.reshape(
+    #                     kb_len,
+    #                     1 + self.config.num_hidden_layers // kb_layer_frequency,
+    #                     -1,
+    #                 )[:, kb_idx]
+    #                 kb_values = kb_values.reshape(
+    #                     kb_len,
+    #                     1 + self.config.num_hidden_layers // kb_layer_frequency,
+    #                     -1,
+    #                 )[:, kb_idx]
+    #                 kb_keys = kb_keys.view(
+    #                     kb_len, self.num_heads, self.head_dim
+    #                 ).transpose(0, 1)
+    #                 kb_values = kb_values.view(
+    #                     kb_len, self.num_heads, self.head_dim
+    #                 ).transpose(0, 1)
+    #                 kb_keys = kb_keys.unsqueeze(0).expand(
+    #                     bsz, self.num_heads, kb_len, self.head_dim
+    #                 )
+    #                 kb_values = kb_values.unsqueeze(0).expand(
+    #                     bsz, self.num_heads, kb_len, self.head_dim
+    #                 )
+    #                 if dynamic_sparsify:
+    #                     kb_keys, kb_values, attn_weights_2 = self.prune_key_value(
+    #                         query_states_2, kb_keys, kb_values, topk_size
+    #                     )
+    #                 # Append the KB keys and values in the front, in front of padding
+    #                 key_states = torch.concat([kb_keys, key_states], dim=2)
+    #                 value_states = torch.concat([kb_values, value_states], dim=2)
+    #             elif len(kb_keys.shape) == 3:  # Has a batch dim
+    #                 kb_len = kb_keys.shape[1]
+    #                 kb_keys = kb_keys.view(
+    #                     bsz,
+    #                     kb_len,
+    #                     1 + self.config.num_hidden_layers // kb_layer_frequency,
+    #                     -1,
+    #                 )[:, :, kb_idx]
+    #                 kb_values = kb_values.view(
+    #                     bsz,
+    #                     kb_len,
+    #                     1 + self.config.num_hidden_layers // kb_layer_frequency,
+    #                     -1,
+    #                 )[:, :, kb_idx]
+    #                 kb_keys = kb_keys.view(
+    #                     bsz, kb_len, self.num_heads, self.head_dim
+    #                 ).transpose(1, 2)
+    #                 kb_values = kb_values.view(
+    #                     bsz, kb_len, self.num_heads, self.head_dim
+    #                 ).transpose(1, 2)
+    #                 if dynamic_sparsify:
+    #                     kb_keys, kb_values, attn_weights_2 = self.prune_key_value(
+    #                         query_states_2, kb_keys, kb_values, topk_size
+    #                     )
+    #                 # Append the KB keys and values in the front, in front of padding
+    #                 key_states = torch.concat([kb_keys, key_states], dim=2)
+    #                 value_states = torch.concat([kb_values, value_states], dim=2)
+    #             # Modify the attention matrix: Appendx a (seq_len, kb_len) block to the left
+    #             kb_len = kb_keys.shape[2]
+    #             kb_atten_mask = attention_mask.new_zeros(bsz, 1, q_len, kb_len)
+    #             padding_mask = torch.all(
+    #                 attention_mask < 0, -1, keepdim=True
+    #             )  # (bsz, num_heads, q_len, 1)
+    #             kb_atten_mask = (
+    #                 padding_mask * PADDING_VALUE + (~padding_mask) * kb_atten_mask
+    #             )
+    #             attention_mask = torch.concat([kb_atten_mask, attention_mask], dim=-1)
+
+    #     attn_weights = torch.matmul(
+    #         query_states, key_states.transpose(2, 3)
+    #     ) / math.sqrt(self.head_dim)
+    #     sep_query_head = kb_config.sep_query_head
+    #     kb_scale_factor = kb_config.kb_scale_factor
+    #     if sep_query_head:
+    #         if kb_kvs is not None:
+    #             if self.layer_idx % kb_layer_frequency == 0:
+    #                 # If we have pruned the KB tokens, then this quantity should have been computed,
+    #                 # if not, then we compute it here
+    #                 if attn_weights_2 is None:
+    #                     attn_weights_2 = torch.matmul(
+    #                         query_states_2, kb_keys.transpose(2, 3)
+    #                     ) / math.sqrt(self.head_dim)
+    #                 attn_weights = attn_weights[:, :, :, kb_len:]
+    #                 if kb_scale_factor is not None:
+    #                     # attn_weights_2 = (
+    #                     #     attn_weights_2 + math.log(kb_scale_factor)
+    #                     # )
+    #                     attn_weights_2 *= kb_scale_factor
+    #                 attn_weights = torch.concat([attn_weights_2, attn_weights], -1)
+
+    #     if attention_mask is not None:  # no matter the length, we just slice it
+    #         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+    #         attn_weights = attn_weights + causal_mask
+    #     # upcast attention to fp32
+    #     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+    #     # ================== 链式注意力（推理优化版） ==================
+    #     if (
+    #         kb_config.path_attn
+    #         and kb_kvs is not None
+    #         and kb_adj is not None
+    #         and self.layer_idx % kb_layer_frequency == 0
+    #     ):
+
+    #         kb_len = kb_adj.size(-1)
+    #         alpha_kb = attn_weights[..., :kb_len]          # (B, H, Q, K)
+    #         B, H, Q, K = alpha_kb.shape
+    #         K = alpha_kb.size(-1)
+
+    #         # ---------- 2. 图路径转发（推理：idx.size(0) == 2） ----------
+    #         if kb_adj.is_sparse:
+    #             idx = kb_adj.indices()
+    #             if idx.size(0) == 2:
+    #                 # ===== 方案 A：一次 sparse.mm（零循环） =====
+    #                 M = B * H * Q
+    #                 alpha2 = alpha_kb.reshape(M, K)        # (M, K)
+
+    #                 # ------------------直接提取------------------
+    #                 # adj = kb_adj.coalesce().to(
+    #                 #     device=alpha_kb.device,
+    #                 #     dtype=alpha_kb.dtype,
+    #                 # )
+    #                 # adj_t = adj.transpose(0, 1)
+                    
+    #                 # ------------------缓存实现-------------------
+    #                 adj_t = self._get_cached_adj_t(
+    #                     kb_adj,
+    #                     K=K,
+    #                     device=alpha_kb.device,
+    #                     dtype=alpha_kb.dtype,
+    #                 )
+
+    #                 beta2 = torch.sparse.mm(
+    #                     adj_t,
+    #                     alpha2.transpose(0, 1)              # (K, M)
+    #                 )                                        # (K, M)
+
+    #                 beta_kb = beta2.transpose(0, 1).reshape(B, H, Q, K)
+
+    #             else:
+    #                 # ===== 训练 / 非共享图：保留你原来的实现 =====
+    #                 alpha_flat = alpha_kb.reshape(B, -1, kb_len)
+    #                 vals = kb_adj.values()
+    #                 beta_chunks = []
+    #                 for b in range(B):
+    #                     mask = idx[0] == b
+    #                     if mask.any():
+    #                         rows = idx[1, mask]
+    #                         cols = idx[2, mask]
+    #                         adj_b = torch.sparse_coo_tensor(
+    #                             torch.stack([rows, cols]),
+    #                             vals[mask],
+    #                             (kb_len, kb_len),
+    #                             device=vals.device,
+    #                             dtype=alpha_kb.dtype,
+    #                         ).coalesce()
+    #                     else:
+    #                         adj_b = torch.sparse_coo_tensor(
+    #                             torch.empty((2, 0), dtype=torch.long, device=alpha_kb.device),
+    #                             torch.empty((0,), dtype=alpha_kb.dtype, device=alpha_kb.device),
+    #                             (kb_len, kb_len),
+    #                         )
+    #                     beta_flat = torch.sparse.mm(
+    #                         adj_b.transpose(0, 1),
+    #                         alpha_flat[b].transpose(0, 1)
+    #                     ).transpose(0, 1)
+    #                     beta_chunks.append(
+    #                         beta_flat.view(H, Q, kb_len)
+    #                     )
+    #                 beta_kb = torch.stack(beta_chunks, dim=0)
+
+    #         else:
+    #             # ---------- dense 邻接 ----------
+    #             A = kb_adj.to(device=alpha_kb.device, dtype=alpha_kb.dtype)
+    #             beta_kb = alpha_kb @ A                      # (B, H, Q, K)
+
+    #         # ---------- 3. KB 内混合 + 归一化（只归一 KB 段） ----------
+    #         mix_ratio = getattr(kb_config, 'path_attn_mix_ratio', 1.0)
+    #         beta_kb = mix_ratio * beta_kb + (1.0 - mix_ratio) * alpha_kb
+
+    #         beta_kb = beta_kb / beta_kb.sum(
+    #             dim=-1, keepdim=True
+    #         ).clamp_min(1e-9)                               # KB 段 sum=1
+
+    #         # ---------- 4. 写回注意力（无 clone / 无全量归一化） ----------
+    #         other = attn_weights[..., kb_len:]              # (B,H,Q,rest)
+    #         other_sum = other.sum(dim=-1, keepdim=True)
+    #         denom = (1.0 + other_sum).clamp_min(1e-9)
+
+    #         attn_weights = torch.cat(
+    #             [beta_kb / denom, other / denom],
+    #             dim=-1
+    #         )
+
+            
+    #     # save attention weights
+    #     if not attn_weights.requires_grad:
+    #         # TODO: Make this function injectable
+    #         # chosen_layers=[13, 14, 15]
+    #         # if q_len > 1 and kb_kvs is not None and self.layer_idx % kb_layer_frequency == 0 and self.layer_idx in chosen_layers:
+    #         #     # 统计正确Token（KB-0）的注意力得分
+    #         #     kb_len_local = kb_len if "kb_len" in locals() else 0
+    #         #     if kb_len_local > 0:
+    #         #         # 所有 Query Token 对 KB Token 的注意力取最大值，再在 head 上平均
+    #         #         kb_attn = attn_weights[:, :, :, :kb_len_local].max(dim=2).values  # (bsz, num_heads, kb_len)
+    #         #         kb_mean = kb_attn.mean(dim=1)                # (bsz, kb_len)
+    #         #         correct = kb_mean[:, 0:1]                    # (bsz,1)
+    #         #         rank = (kb_mean > correct).sum(dim=1).float() + 1.0
+    #         #         # 归一化成百分位（1最好 → 0.0）
+    #         #         percentile = 1.0 - (rank - 1) / (kb_mean.size(1) - 1)
+    #         #         mass_share = (kb_mean[:, 0] / (kb_mean.sum(dim=1) + 1e-9)).mean().item()
+    #         #         print(f"[L{self.layer_idx}] KB正确token百分位(均值)= {percentile.mean().item():.3f} ,注意力份额= {mass_share:.3f}")
+    #         if save_attention_weights:
+    #             os.makedirs(attention_save_loc, exist_ok=True)
+    #             if save_attn_weights_policy == "prefill-all-layer":
+    #                 if q_len > 1:
+    #                     if self.layer_idx % kb_layer_frequency == 0:
+    #                         # only prefill stage
+    #                         save_path = os.path.join(
+    #                             attention_save_loc,
+    #                             f"{attention_file_base_name}_{self.layer_idx}.npy",
+    #                         )
+    #                         np.save(
+    #                             save_path,
+    #                             attn_weights.to(torch.float32).cpu().detach().numpy(),
+    #                         )
+    #             elif save_attn_weights_policy == "all-step-last-layer":
+    #                 # 判断是否是能够整除kb_layer_frequency的最大层
+    #                 if self.layer_idx == (self.config.num_hidden_layers - 1) // kb_layer_frequency * kb_layer_frequency:
+    #                     step_id = int(cache_position.max().item()) if cache_position is not None else 0
+    #                     save_path = os.path.join(
+    #                         attention_save_loc,
+    #                         f"{attention_file_base_name}_step{step_id}_layer{self.layer_idx}.npy",
+    #                     )
+    #                     np.save(
+    #                         save_path,
+    #                         attn_weights.to(torch.float32).cpu().detach().numpy(),
+    #                     )
+    #             else:
+    #                 raise ValueError(f"Unknown save_attn_weights_policy: {save_attn_weights_policy}")
+
+    #     attn_weights = attn_weights.to(query_states.dtype)
+    #     attn_weights = nn.functional.dropout(
+    #         attn_weights, p=self.attention_dropout, training=self.training
+    #     )
+    #     attn_output = torch.matmul(attn_weights, value_states)
+
+    #     if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+    #         raise ValueError(
+    #             f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+    #             f" {attn_output.size()}"
+    #         )
+
+    #     attn_output = attn_output.transpose(1, 2).contiguous()
+
+    #     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+    #     if self.config.pretraining_tp > 1:
+    #         attn_output = attn_output.split(
+    #             self.hidden_size // self.config.pretraining_tp, dim=2
+    #         )
+    #         o_proj_slices = self.o_proj.weight.split(
+    #             self.hidden_size // self.config.pretraining_tp, dim=1
+    #         )
+    #         attn_output = sum(
+    #             [
+    #                 F.linear(attn_output[i], o_proj_slices[i])
+    #                 for i in range(self.config.pretraining_tp)
+    #             ]
+    #         )
+    #     else:
+    #         attn_output = self.o_proj(attn_output)
+
+    #     if not output_attentions:
+    #         attn_weights = None
+
+    #     return attn_output, attn_weights, past_key_value
+
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -274,15 +661,19 @@ class KblamLlamaAttention(nn.Module):
         attention_file_base_name: Optional[str] = None,
         save_attn_weights_policy: str = "prefill-all-layer",
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ):
+        # ------------------------------------------------------------
+        # 0. 一些检查（保持原语义）
+        # ------------------------------------------------------------
         if save_attention_weights:
-            assert (
-                attention_save_loc is not None
-            ), "Please provide a location to save the attention weights"
-            assert (
-                attention_file_base_name is not None
-            ), "Please provide a base name for the attention weights"
+            assert attention_save_loc is not None
+            assert attention_file_base_name is not None
+
         bsz, q_len, _ = hidden_states.size()
+
+        # ------------------------------------------------------------
+        # 1. Q / K / V 投影
+        # ------------------------------------------------------------
         if self.config.pretraining_tp > 1:
             key_value_slicing = (
                 self.num_key_value_heads * self.head_dim
@@ -293,36 +684,38 @@ class KblamLlamaAttention(nn.Module):
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
-            query_states = [
-                F.linear(hidden_states, query_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [
-                F.linear(hidden_states, key_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [
-                F.linear(hidden_states, value_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            value_states = torch.cat(value_states, dim=-1)
-
+            query_states = torch.cat(
+                [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)],
+                dim=-1,
+            )
+            query_states_2 = torch.cat(
+                [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)],
+                dim=-1,
+            )
+            key_states = torch.cat(
+                [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)],
+                dim=-1,
+            )
+            value_states = torch.cat(
+                [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)],
+                dim=-1,
+            )
         else:
             query_states = self.q_proj(hidden_states)
             query_states_2 = self.q_proj_new(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        # ------------------------------------------------------------
+        # 2. reshape → (B, H, Q, D)
+        # ------------------------------------------------------------
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
         query_states_2 = query_states_2.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)
+
         key_states = key_states.view(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
@@ -330,289 +723,105 @@ class KblamLlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
+        # ------------------------------------------------------------
+        # 3. RoPE
+        # ------------------------------------------------------------
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
 
+        # ------------------------------------------------------------
+        # 4. KV cache
+        # ------------------------------------------------------------
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
+        # ------------------------------------------------------------
+        # 5. repeat KV
+        # ------------------------------------------------------------
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        kb_layer_frequency = kb_config.kb_layer_frequency
-        dynamic_sparsify = kb_config.dynamic_sparsify
-        topk_size = kb_config.top_k_kb
-        attn_weights_2 = None
-        if kb_kvs is not None:
-            if self.layer_idx % kb_layer_frequency == 0:
-                kb_keys, kb_values = (
-                    kb_kvs  # (kb_len, head_dim * num_heads * num_adapters)
-                )
-                kb_idx = (
-                    self.layer_idx // kb_layer_frequency
-                )  # Should be something inside the kb config
-                if len(kb_keys.shape) == 2:  # Not batch dim
-                    kb_len = kb_keys.shape[0]
-                    kb_keys = kb_keys.reshape(
-                        kb_len,
-                        1 + self.config.num_hidden_layers // kb_layer_frequency,
-                        -1,
-                    )[:, kb_idx]
-                    kb_values = kb_values.reshape(
-                        kb_len,
-                        1 + self.config.num_hidden_layers // kb_layer_frequency,
-                        -1,
-                    )[:, kb_idx]
-                    kb_keys = kb_keys.view(
-                        kb_len, self.num_heads, self.head_dim
-                    ).transpose(0, 1)
-                    kb_values = kb_values.view(
-                        kb_len, self.num_heads, self.head_dim
-                    ).transpose(0, 1)
-                    kb_keys = kb_keys.unsqueeze(0).expand(
-                        bsz, self.num_heads, kb_len, self.head_dim
-                    )
-                    kb_values = kb_values.unsqueeze(0).expand(
-                        bsz, self.num_heads, kb_len, self.head_dim
-                    )
-                    if dynamic_sparsify:
-                        kb_keys, kb_values, attn_weights_2 = self.prune_key_value(
-                            query_states_2, kb_keys, kb_values, topk_size
-                        )
-                    # Append the KB keys and values in the front, in front of padding
-                    key_states = torch.concat([kb_keys, key_states], dim=2)
-                    value_states = torch.concat([kb_values, value_states], dim=2)
-                elif len(kb_keys.shape) == 3:  # Has a batch dim
-                    kb_len = kb_keys.shape[1]
-                    kb_keys = kb_keys.view(
-                        bsz,
-                        kb_len,
-                        1 + self.config.num_hidden_layers // kb_layer_frequency,
-                        -1,
-                    )[:, :, kb_idx]
-                    kb_values = kb_values.view(
-                        bsz,
-                        kb_len,
-                        1 + self.config.num_hidden_layers // kb_layer_frequency,
-                        -1,
-                    )[:, :, kb_idx]
-                    kb_keys = kb_keys.view(
-                        bsz, kb_len, self.num_heads, self.head_dim
-                    ).transpose(1, 2)
-                    kb_values = kb_values.view(
-                        bsz, kb_len, self.num_heads, self.head_dim
-                    ).transpose(1, 2)
-                    if dynamic_sparsify:
-                        kb_keys, kb_values, attn_weights_2 = self.prune_key_value(
-                            query_states_2, kb_keys, kb_values, topk_size
-                        )
-                    # Append the KB keys and values in the front, in front of padding
-                    key_states = torch.concat([kb_keys, key_states], dim=2)
-                    value_states = torch.concat([kb_values, value_states], dim=2)
-                # Modify the attention matrix: Appendx a (seq_len, kb_len) block to the left
-                kb_len = kb_keys.shape[2]
-                kb_atten_mask = attention_mask.new_zeros(bsz, 1, q_len, kb_len)
-                padding_mask = torch.all(
-                    attention_mask < 0, -1, keepdim=True
-                )  # (bsz, num_heads, q_len, 1)
-                kb_atten_mask = (
-                    padding_mask * PADDING_VALUE + (~padding_mask) * kb_atten_mask
-                )
-                attention_mask = torch.concat([kb_atten_mask, attention_mask], dim=-1)
 
+        # ------------------------------------------------------------
+        # 6. ⭐ KB 注入（keys / values / mask）
+        # ------------------------------------------------------------
+        key_states, value_states, attention_mask, kb_len = apply_kblam_attention(
+            query_states=query_states,
+            query_states_2=query_states_2,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+            kb_kvs=kb_kvs,
+            kb_config=kb_config,
+            kb_adj=kb_adj,
+            layer_idx=self.layer_idx,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            num_hidden_layers=self.config.num_hidden_layers,
+        )
+
+        # ------------------------------------------------------------
+        # 7. attention logits
+        # ------------------------------------------------------------
         attn_weights = torch.matmul(
             query_states, key_states.transpose(2, 3)
         ) / math.sqrt(self.head_dim)
-        sep_query_head = kb_config.sep_query_head
-        kb_scale_factor = kb_config.kb_scale_factor
-        if sep_query_head:
-            if kb_kvs is not None:
-                if self.layer_idx % kb_layer_frequency == 0:
-                    # If we have pruned the KB tokens, then this quantity should have been computed,
-                    # if not, then we compute it here
-                    if attn_weights_2 is None:
-                        attn_weights_2 = torch.matmul(
-                            query_states_2, kb_keys.transpose(2, 3)
-                        ) / math.sqrt(self.head_dim)
-                    attn_weights = attn_weights[:, :, :, kb_len:]
-                    if kb_scale_factor is not None:
-                        # attn_weights_2 = (
-                        #     attn_weights_2 + math.log(kb_scale_factor)
-                        # )
-                        attn_weights_2 *= kb_scale_factor
-                    attn_weights = torch.concat([attn_weights_2, attn_weights], -1)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
 
-        # ================== 链式注意力（推理优化版） ==================
-        if (
-            kb_config.path_attn
-            and kb_kvs is not None
-            and kb_adj is not None
-            and self.layer_idx % kb_layer_frequency == 0
-        ):
-
-            kb_len = kb_adj.size(-1)
-            alpha_kb = attn_weights[..., :kb_len]          # (B, H, Q, K)
-            B, H, Q, K = alpha_kb.shape
-            K = alpha_kb.size(-1)
-
-            # ---------- 2. 图路径转发（推理：idx.size(0) == 2） ----------
-            if kb_adj.is_sparse:
-                idx = kb_adj.indices()
-                if idx.size(0) == 2:
-                    # ===== 方案 A：一次 sparse.mm（零循环） =====
-                    M = B * H * Q
-                    alpha2 = alpha_kb.reshape(M, K)        # (M, K)
-
-                    # ------------------直接提取------------------
-                    # adj = kb_adj.coalesce().to(
-                    #     device=alpha_kb.device,
-                    #     dtype=alpha_kb.dtype,
-                    # )
-                    # adj_t = adj.transpose(0, 1)
-                    
-                    # ------------------缓存实现-------------------
-                    adj_t = self._get_cached_adj_t(
-                        kb_adj,
-                        K=K,
-                        device=alpha_kb.device,
-                        dtype=alpha_kb.dtype,
-                    )
-
-                    beta2 = torch.sparse.mm(
-                        adj_t,
-                        alpha2.transpose(0, 1)              # (K, M)
-                    )                                        # (K, M)
-
-                    beta_kb = beta2.transpose(0, 1).reshape(B, H, Q, K)
-
-                else:
-                    # ===== 训练 / 非共享图：保留你原来的实现 =====
-                    alpha_flat = alpha_kb.reshape(B, -1, kb_len)
-                    vals = kb_adj.values()
-                    beta_chunks = []
-                    for b in range(B):
-                        mask = idx[0] == b
-                        if mask.any():
-                            rows = idx[1, mask]
-                            cols = idx[2, mask]
-                            adj_b = torch.sparse_coo_tensor(
-                                torch.stack([rows, cols]),
-                                vals[mask],
-                                (kb_len, kb_len),
-                                device=vals.device,
-                                dtype=alpha_kb.dtype,
-                            ).coalesce()
-                        else:
-                            adj_b = torch.sparse_coo_tensor(
-                                torch.empty((2, 0), dtype=torch.long, device=alpha_kb.device),
-                                torch.empty((0,), dtype=alpha_kb.dtype, device=alpha_kb.device),
-                                (kb_len, kb_len),
-                            )
-                        beta_flat = torch.sparse.mm(
-                            adj_b.transpose(0, 1),
-                            alpha_flat[b].transpose(0, 1)
-                        ).transpose(0, 1)
-                        beta_chunks.append(
-                            beta_flat.view(H, Q, kb_len)
-                        )
-                    beta_kb = torch.stack(beta_chunks, dim=0)
-
-            else:
-                # ---------- dense 邻接 ----------
-                A = kb_adj.to(device=alpha_kb.device, dtype=alpha_kb.dtype)
-                beta_kb = alpha_kb @ A                      # (B, H, Q, K)
-
-            # ---------- 3. KB 内混合 + 归一化（只归一 KB 段） ----------
-            mix_ratio = getattr(kb_config, 'path_attn_mix_ratio', 1.0)
-            beta_kb = mix_ratio * beta_kb + (1.0 - mix_ratio) * alpha_kb
-
-            beta_kb = beta_kb / beta_kb.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-9)                               # KB 段 sum=1
-
-            # ---------- 4. 写回注意力（无 clone / 无全量归一化） ----------
-            other = attn_weights[..., kb_len:]              # (B,H,Q,rest)
-            other_sum = other.sum(dim=-1, keepdim=True)
-            denom = (1.0 + other_sum).clamp_min(1e-9)
-
-            attn_weights = torch.cat(
-                [beta_kb / denom, other / denom],
-                dim=-1
+        if kb_len > 0:
+            kb_keys = key_states[..., :kb_len, :]
+            attn_weights = apply_kblam_sep_query_head(
+                attn_weights=attn_weights,
+                query_states_2=query_states_2,
+                kb_keys=kb_keys,
+                kb_len=kb_len,
+                kb_config=kb_config,
+                layer_idx=self.layer_idx,
+                head_dim=self.head_dim,
             )
 
-            
-        # save attention weights
-        if not attn_weights.requires_grad:
-            # TODO: Make this function injectable
-            # chosen_layers=[13, 14, 15]
-            # if q_len > 1 and kb_kvs is not None and self.layer_idx % kb_layer_frequency == 0 and self.layer_idx in chosen_layers:
-            #     # 统计正确Token（KB-0）的注意力得分
-            #     kb_len_local = kb_len if "kb_len" in locals() else 0
-            #     if kb_len_local > 0:
-            #         # 所有 Query Token 对 KB Token 的注意力取最大值，再在 head 上平均
-            #         kb_attn = attn_weights[:, :, :, :kb_len_local].max(dim=2).values  # (bsz, num_heads, kb_len)
-            #         kb_mean = kb_attn.mean(dim=1)                # (bsz, kb_len)
-            #         correct = kb_mean[:, 0:1]                    # (bsz,1)
-            #         rank = (kb_mean > correct).sum(dim=1).float() + 1.0
-            #         # 归一化成百分位（1最好 → 0.0）
-            #         percentile = 1.0 - (rank - 1) / (kb_mean.size(1) - 1)
-            #         mass_share = (kb_mean[:, 0] / (kb_mean.sum(dim=1) + 1e-9)).mean().item()
-            #         print(f"[L{self.layer_idx}] KB正确token百分位(均值)= {percentile.mean().item():.3f} ,注意力份额= {mass_share:.3f}")
-            if save_attention_weights:
-                os.makedirs(attention_save_loc, exist_ok=True)
-                if save_attn_weights_policy == "prefill-all-layer":
-                    if q_len > 1:
-                        if self.layer_idx % kb_layer_frequency == 0:
-                            # only prefill stage
-                            save_path = os.path.join(
-                                attention_save_loc,
-                                f"{attention_file_base_name}_{self.layer_idx}.npy",
-                            )
-                            np.save(
-                                save_path,
-                                attn_weights.to(torch.float32).cpu().detach().numpy(),
-                            )
-                elif save_attn_weights_policy == "all-step-last-layer":
-                    # 判断是否是能够整除kb_layer_frequency的最大层
-                    if self.layer_idx == (self.config.num_hidden_layers - 1) // kb_layer_frequency * kb_layer_frequency:
-                        step_id = int(cache_position.max().item()) if cache_position is not None else 0
-                        save_path = os.path.join(
-                            attention_save_loc,
-                            f"{attention_file_base_name}_step{step_id}_layer{self.layer_idx}.npy",
-                        )
-                        np.save(
-                            save_path,
-                            attn_weights.to(torch.float32).cpu().detach().numpy(),
-                        )
-                else:
-                    raise ValueError(f"Unknown save_attn_weights_policy: {save_attn_weights_policy}")
+        # ------------------------------------------------------------
+        # 8. mask
+        # ------------------------------------------------------------
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : attn_weights.size(-1)]
 
+        # ------------------------------------------------------------
+        # 9. softmax（fp32）
+        # ------------------------------------------------------------
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+        # ------------------------------------------------------------
+        # 10. ⭐ KB path attention（softmax 后）
+        # ------------------------------------------------------------
+        if kb_len > 0:
+            attn_weights = apply_kblam_path_attention(
+                attn_weights=attn_weights,
+                kb_len=kb_len,
+                kb_adj=kb_adj,
+                kb_config=kb_config,
+                layer_idx=self.layer_idx,
+            )
+
+        # ------------------------------------------------------------
+        # 11. dropout + matmul V
+        # ------------------------------------------------------------
         attn_weights = attn_weights.to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
+        attn_weights = F.dropout(
             attn_weights, p=self.attention_dropout, training=self.training
         )
+
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
+        # ------------------------------------------------------------
+        # 12. reshape → output projection
+        # ------------------------------------------------------------
         attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(
@@ -622,14 +831,15 @@ class KblamLlamaAttention(nn.Module):
                 self.hidden_size // self.config.pretraining_tp, dim=1
             )
             attn_output = sum(
-                [
-                    F.linear(attn_output[i], o_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ]
+                F.linear(attn_output[i], o_proj_slices[i])
+                for i in range(self.config.pretraining_tp)
             )
         else:
             attn_output = self.o_proj(attn_output)
 
+        # ------------------------------------------------------------
+        # 13. 返回
+        # ------------------------------------------------------------
         if not output_attentions:
             attn_weights = None
 

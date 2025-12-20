@@ -25,4 +25,6 @@ class KBLaMConfig(PretrainedConfig):
         self.format_short = format_short
         self.path_attn = path_attn
 
+        self.debug_bias = 0.0
+
         super().__init__(**kwargs)
