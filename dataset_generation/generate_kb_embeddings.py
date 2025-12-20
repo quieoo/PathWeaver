@@ -6,7 +6,8 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from kblam.gpt_session import GPT
+from kblam.gpt_session import GPT, ALI_Embedding
+from openai import OpenAI
 from kblam.utils.data_utils import DataPoint
 
 
@@ -16,10 +17,11 @@ def parser_args():
         "--model_name",
         type=str,
         default="text-embedding-3-large",
-        choices=["all-MiniLM-L6-v2", "text-embedding-3-large", "ada-embeddings"],
+        choices=["all-MiniLM-L6-v2", "text-embedding-3-large", "ada-embeddings", "text-embedding-v4"],
     )
     parser.add_argument("--dataset_name", type=str, default="synthetic_data")
     parser.add_argument("--endpoint_url", type=str)
+    parser.add_argument("--api_key", type=str)
     parser.add_argument(
         "--dataset_path",
         type=str,
@@ -49,6 +51,7 @@ def compute_embeddings(
         all_elements[i : i + batch_size]
         for i in range(0, len(all_elements), batch_size)
     ]
+    print(f" {part}: {chunks[0]}")
 
     model = SentenceTransformer(encoder_model_spec, device="cuda")
     for chunk in tqdm(chunks):
@@ -64,20 +67,25 @@ if __name__ == "__main__":
     args = parser_args()
     with open(args.dataset_path, "r") as file:
         loaded_dataset = json.loads(file.read())
-
         dataset = [DataPoint(**line) for line in loaded_dataset]
+    print(f"Computing embeddings for {len(dataset)} entities using {args.model_name}")
     if args.model_name == "all-MiniLM-L6-v2":
         key_embeds = compute_embeddings(args.model_name, dataset, "key_string")
         value_embeds = compute_embeddings(args.model_name, dataset, "description")
     elif args.model_name in ["ada-embeddings", "text-embedding-3-large"]:
         gpt = GPT(args.model_name, args.endpoint_url)
-
         key_embeds = []
         value_embeds = []
 
         for entity in tqdm(dataset):
             key_embeds.append(gpt.generate_embedding(entity.key_string))
             value_embeds.append(gpt.generate_embedding(entity.description))
+    elif args.model_name == "text-embedding-v4":
+        ali=ALI_Embedding(args.model_name, args.api_key)
+        key_strs=[entity.key_string for entity in dataset]
+        value_strs=[entity.description for entity in dataset]
+        key_embeds=ali.create_embedding_batch(key_strs)
+        value_embeds=ali.create_embedding_batch(value_strs)
     else:
         raise ValueError(f"Model {args.model_name} not supported.")
 
@@ -87,6 +95,8 @@ if __name__ == "__main__":
         save_name = "all-MiniLM-L6-v2"
     elif args.model_name == "ada-embeddings":
         save_name = "OAI"
+    elif args.model_name == "text-embedding-v4":
+        save_name = "text-embedding-v4"
     else:
         save_name = "BigOAI"
 

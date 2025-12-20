@@ -10,8 +10,45 @@ from azure.identity import (
     get_bearer_token_provider,
 )
 from openai import AzureOpenAI
+from openai import OpenAI
+from tqdm import tqdm
 
 valid_models = ["gpt-4o", "ada-embeddings", "text-embedding-3-large"]
+
+class ALI_Embedding:
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str,
+        batch_size: int = 10,
+        dimensions: int = 1024,
+    ):
+        self.model_name = model_name
+        self.api_key = api_key
+        self.batch_size = batch_size
+        self.dimensions = dimensions
+
+        self.client=OpenAI(
+            api_key=self.api_key,
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        print(f"Create Ali Embedding with: {self.model_name}, {self.dimensions} dimensions, batch size: {self.batch_size}")
+    
+    def create_embedding_batch(self, texts: list[str]):
+        # create embedding in batches
+        embeddings=[]
+        for i in tqdm(range(0, len(texts), self.batch_size)):
+            batch = texts[i : i + self.batch_size]
+            embedding = self.client.embeddings.create(
+                input=batch,
+                model=self.model_name,
+                dimensions=self.dimensions,
+            )
+            embeddings.append(embedding.data)
+        
+        return embeddings
+
+
 
 
 class GPT:

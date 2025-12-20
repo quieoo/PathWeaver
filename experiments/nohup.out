@@ -1,0 +1,179 @@
+/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+wandb: Currently logged in as: quieoob (quieoob-shandong-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run jd4m2iil
+wandb: Tracking run with wandb version 0.22.2
+wandb: Run data is saved locally in /mnt/n0/KBLAM/KBLaM/experiments/wandb/run-20251106_191608-jd4m2iil
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run vocal-resonance-120
+wandb: ⭐️ View project at https://wandb.ai/quieoob-shandong-university/kb-llm
+wandb: 🚀 View run at https://wandb.ai/quieoob-shandong-university/kb-llm/runs/jd4m2iil
+wandb: Detected [huggingface_hub.inference, openai] in use.
+wandb: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
+wandb: For more information, check out the docs at: https://weave-docs.wandb.ai/
+{'seed': 1, 'dataset_type': 'synthetic', 'N': 120000, 'B': 10, 'lr': 0.0005, 'sep_query_head': True, 'use_oai_embd': False, 'use_cached_embd': True, 'total_steps': 4800, 'encoder_spec': 'all-MiniLM-L6-v2', 'key_embd_src': 'key', 'use_data_aug': False, 'use_lr_decay': True, 'dataset_dir': '../datasets/synthetic_embd', 'model_dir_to_resume': None, 'hf_model_spec': '/mnt/n0/models/llama3_8B_instruct/', 'hf_token': None, 'model_save_dir': './train/synthetic3', 'kb_size': None, 'dynamic_kb_size': [10, 100], 'duplicate_true_kb': True, 'length_invariance': False, 'outlier_num': -999999, 'multi_entities': None, 'use_extended_qa': False, 'kb_token_layer_frequency': 1, 'gradient_accm_step': 10, 'verbose': True, 'log_to_file': False, 'llm_type': 'llama3', 'max_seq_len': None, 'save_period': 100, 'debug_level': 0, 'test_data_path': '../datasets/synthetic_embd/test_synthetic.json', 'test_precomputed_embed_keys_path': '../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_key.npy', 'test_precomputed_embed_values_path': '../datasets/synthetic_embd/test_synthetic_all-MiniLM-L6-v2_embd_value.npy', 'test_kb_size': 10, 'test_query_size': 100, 'test_kb_scale_factor': 1.0, 'test_kb_scale_factor_range': None}
+[DEBUG]: hf_token: None
+[19:16:09] INFO     Running on cuda                                train.py:1306
+           INFO     Started training                               train.py:1308
+           INFO     Saving to  ./train/synthetic3                  train.py:1309
+           INFO     Having seperate query head for KB!             train.py:1312
+           INFO     Using pre-computed all-MiniLM-L6-v2 embedding  train.py:1323
+           INFO     Experiment prefix                              train.py:1328
+                    stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-99              
+                    9999KBSizedynamicSepQueryHead                               
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+KblamLlamaForCausalLM has generative capabilities, as `prepare_inputs_for_generation` is explicitly overwritten. However, it doesn't directly inherit from `GenerationMixin`. From 👉v4.50👈 onwards, `PreTrainedModel` will NOT inherit from `GenerationMixin`, and this model will lose the ability to call `generate` and other related functions.
+  - If you're using `trust_remote_code=True`, you can get rid of this warning by loading the model with an auto class. See https://huggingface.co/docs/transformers/en/model_doc/auto#auto-classes
+  - If you are the owner of the model architecture code, please modify your model class such that it inherits from `GenerationMixin` (after `PreTrainedModel`, otherwise you'll get an exception).
+  - If you are not the owner of the model architecture class, please contact the model code owner to update it.
+`LlamaRotaryEmbedding` can now be fully parameterized by passing the model config through the `config` argument. All other arguments will be removed in v4.46
+[INFO]: Loaded 120000 samples for training
+[INFO]: Loaded 12072 samples for validation
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:00<00:00,  5.71it/s]Loading checkpoint shards:  50%|█████     | 2/4 [00:00<00:00,  7.33it/s]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:00<00:00,  8.08it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00,  8.64it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:00<00:00,  8.04it/s]
+Some weights of LlamaModel were not initialized from the model checkpoint at /mnt/n0/models/llama3_8B_instruct/ and are newly initialized: ['model.layers.0.self_attn.score_shift', 'model.layers.1.self_attn.score_shift', 'model.layers.10.self_attn.score_shift', 'model.layers.11.self_attn.score_shift', 'model.layers.12.self_attn.score_shift', 'model.layers.13.self_attn.score_shift', 'model.layers.14.self_attn.score_shift', 'model.layers.15.self_attn.score_shift', 'model.layers.16.self_attn.score_shift', 'model.layers.17.self_attn.score_shift', 'model.layers.18.self_attn.score_shift', 'model.layers.19.self_attn.score_shift', 'model.layers.2.self_attn.score_shift', 'model.layers.20.self_attn.score_shift', 'model.layers.21.self_attn.score_shift', 'model.layers.22.self_attn.score_shift', 'model.layers.23.self_attn.score_shift', 'model.layers.24.self_attn.score_shift', 'model.layers.25.self_attn.score_shift', 'model.layers.26.self_attn.score_shift', 'model.layers.27.self_attn.score_shift', 'model.layers.28.self_attn.score_shift', 'model.layers.29.self_attn.score_shift', 'model.layers.3.self_attn.score_shift', 'model.layers.30.self_attn.score_shift', 'model.layers.31.self_attn.score_shift', 'model.layers.4.self_attn.score_shift', 'model.layers.5.self_attn.score_shift', 'model.layers.6.self_attn.score_shift', 'model.layers.7.self_attn.score_shift', 'model.layers.8.self_attn.score_shift', 'model.layers.9.self_attn.score_shift']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:01<00:04,  1.38s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:02<00:02,  1.30s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:03<00:01,  1.25s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:04<00:00,  1.13it/s]Loading checkpoint shards: 100%|██████████| 4/4 [00:04<00:00,  1.04s/it]
+Some weights of KblamLlamaForCausalLM were not initialized from the model checkpoint at /mnt/n0/models/llama3_8B_instruct/ and are newly initialized: ['model.layers.0.self_attn.q_proj_new.weight', 'model.layers.0.self_attn.score_shift', 'model.layers.1.self_attn.q_proj_new.weight', 'model.layers.1.self_attn.score_shift', 'model.layers.10.self_attn.q_proj_new.weight', 'model.layers.10.self_attn.score_shift', 'model.layers.11.self_attn.q_proj_new.weight', 'model.layers.11.self_attn.score_shift', 'model.layers.12.self_attn.q_proj_new.weight', 'model.layers.12.self_attn.score_shift', 'model.layers.13.self_attn.q_proj_new.weight', 'model.layers.13.self_attn.score_shift', 'model.layers.14.self_attn.q_proj_new.weight', 'model.layers.14.self_attn.score_shift', 'model.layers.15.self_attn.q_proj_new.weight', 'model.layers.15.self_attn.score_shift', 'model.layers.16.self_attn.q_proj_new.weight', 'model.layers.16.self_attn.score_shift', 'model.layers.17.self_attn.q_proj_new.weight', 'model.layers.17.self_attn.score_shift', 'model.layers.18.self_attn.q_proj_new.weight', 'model.layers.18.self_attn.score_shift', 'model.layers.19.self_attn.q_proj_new.weight', 'model.layers.19.self_attn.score_shift', 'model.layers.2.self_attn.q_proj_new.weight', 'model.layers.2.self_attn.score_shift', 'model.layers.20.self_attn.q_proj_new.weight', 'model.layers.20.self_attn.score_shift', 'model.layers.21.self_attn.q_proj_new.weight', 'model.layers.21.self_attn.score_shift', 'model.layers.22.self_attn.q_proj_new.weight', 'model.layers.22.self_attn.score_shift', 'model.layers.23.self_attn.q_proj_new.weight', 'model.layers.23.self_attn.score_shift', 'model.layers.24.self_attn.q_proj_new.weight', 'model.layers.24.self_attn.score_shift', 'model.layers.25.self_attn.q_proj_new.weight', 'model.layers.25.self_attn.score_shift', 'model.layers.26.self_attn.q_proj_new.weight', 'model.layers.26.self_attn.score_shift', 'model.layers.27.self_attn.q_proj_new.weight', 'model.layers.27.self_attn.score_shift', 'model.layers.28.self_attn.q_proj_new.weight', 'model.layers.28.self_attn.score_shift', 'model.layers.29.self_attn.q_proj_new.weight', 'model.layers.29.self_attn.score_shift', 'model.layers.3.self_attn.q_proj_new.weight', 'model.layers.3.self_attn.score_shift', 'model.layers.30.self_attn.q_proj_new.weight', 'model.layers.30.self_attn.score_shift', 'model.layers.31.self_attn.q_proj_new.weight', 'model.layers.31.self_attn.score_shift', 'model.layers.4.self_attn.q_proj_new.weight', 'model.layers.4.self_attn.score_shift', 'model.layers.5.self_attn.q_proj_new.weight', 'model.layers.5.self_attn.score_shift', 'model.layers.6.self_attn.q_proj_new.weight', 'model.layers.6.self_attn.score_shift', 'model.layers.7.self_attn.q_proj_new.weight', 'model.layers.7.self_attn.score_shift', 'model.layers.8.self_attn.q_proj_new.weight', 'model.layers.8.self_attn.score_shift', 'model.layers.9.self_attn.q_proj_new.weight', 'model.layers.9.self_attn.score_shift']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+[INFO]: Initialised model /mnt/n0/models/llama3_8B_instruct/
+[19:16:15] INFO     LlamaConfig {                                  train.py:1397
+                      "_attn_implementation_autoset": true,                     
+                      "_name_or_path":                                          
+                    "/mnt/n0/models/llama3_8B_instruct/",                       
+                      "architectures": [                                        
+                        "LlamaForCausalLM"                                      
+                      ],                                                        
+                      "attention_bias": false,                                  
+                      "attention_dropout": 0.0,                                 
+                      "bos_token_id": 128000,                                   
+                      "eos_token_id": 128009,                                   
+                      "head_dim": 128,                                          
+                      "hidden_act": "silu",                                     
+                      "hidden_size": 4096,                                      
+                      "initializer_range": 0.02,                                
+                      "intermediate_size": 14336,                               
+                      "max_position_embeddings": 8192,                          
+                      "mlp_bias": false,                                        
+                      "model_type": "llama",                                    
+                      "num_attention_heads": 32,                                
+                      "num_hidden_layers": 32,                                  
+                      "num_key_value_heads": 8,                                 
+                      "pretraining_tp": 1,                                      
+                      "rms_norm_eps": 1e-05,                                    
+                      "rope_scaling": null,                                     
+                      "rope_theta": 500000.0,                                   
+                      "tie_word_embeddings": false,                             
+                      "torch_dtype": "bfloat16",                                
+                      "transformers_version": "4.46.0",                         
+                      "use_cache": true,                                        
+                      "vocab_size": 128256                                      
+                    }                                                           
+                                                                                
+Traceback (most recent call last):
+  File "/mnt/n0/KBLAM/KBLaM/experiments/train.py", line 1500, in <module>
+    main()
+  File "/mnt/n0/KBLAM/KBLaM/experiments/train.py", line 1405, in main
+    encoder = KBEncoder(
+              ^^^^^^^^^^
+  File "/mnt/n0/KBLAM/KBLaM/src/kblam/kb_encoder.py", line 84, in __init__
+    self.base_model = SentenceTransformer(encoder_name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/sentence_transformers/SentenceTransformer.py", line 327, in __init__
+    modules, self.module_kwargs = self._load_sbert_model(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/sentence_transformers/SentenceTransformer.py", line 2183, in _load_sbert_model
+    config_sentence_transformers_json_path = load_file_path(
+                                             ^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/sentence_transformers/util/file_io.py", line 96, in load_file_path
+    return hf_hub_download(
+           ^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 961, in hf_hub_download
+    return _hf_hub_download_to_cache_dir(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 1024, in _hf_hub_download_to_cache_dir
+    (url_to_download, etag, commit_hash, expected_size, xet_file_data, head_call_error) = _get_metadata_or_catch_error(
+                                                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 1484, in _get_metadata_or_catch_error
+    metadata = get_hf_file_metadata(
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 1401, in get_hf_file_metadata
+    r = _request_wrapper(
+        ^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 285, in _request_wrapper
+    response = _request_wrapper(
+               ^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/file_download.py", line 308, in _request_wrapper
+    response = get_session().request(method=method, url=url, **params)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/huggingface_hub/utils/_http.py", line 96, in send
+    return super().send(request, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sdu/.local/lib/python3.12/site-packages/requests/adapters.py", line 667, in send
+    resp = conn.urlopen(
+           ^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/urllib3/connectionpool.py", line 787, in urlopen
+    response = self._make_request(
+               ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/urllib3/connectionpool.py", line 534, in _make_request
+    response = conn.getresponse()
+               ^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/urllib3/connection.py", line 565, in getresponse
+    httplib_response = super().getresponse()
+                       ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/http/client.py", line 1430, in getresponse
+    response.begin()
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/http/client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/http/client.py", line 292, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/socket.py", line 720, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/ssl.py", line 1251, in recv_into
+    return self.read(nbytes, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/ssl.py", line 1103, in read
+    return self._sslobj.read(len, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mvocal-resonance-120[0m at: [34m[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20251106_191608-jd4m2iil/logs[0m
+Exception ignored in atexit callback: <function _start_and_connect_service.<locals>.teardown_atexit at 0x7f3798526200><object repr() failed>
+Traceback (most recent call last):
+[19:16:24] WARNING  socket.send() raised exception.      selector_events.py:1068
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/wandb/sdk/lib/service/service_connection.py", line 61, in teardown_atexit
+[19:16:25] WARNING  socket.send() raised exception.      selector_events.py:1068
+    conn.teardown(hooks.exit_code)
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/wandb/sdk/lib/service/service_connection.py", line 238, in teardown
+    return self._proc.join()
+           ^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/site-packages/wandb/sdk/lib/service/service_process.py", line 57, in join
+    return self._process.wait()
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/subprocess.py", line 2053, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ^^^^^^^^^^^^^^^^^
+  File "/mnt/n0/.conda/envs/kblam/lib/python3.12/subprocess.py", line 2011, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt: 

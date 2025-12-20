@@ -20,81 +20,232 @@ from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
-from kblam.utils.data_utils import aug_row, generate_multi_entity_qa
+# from kblam.utils.data_utils import aug_row, generate_multi_entity_qa
+from kblam.utils.data_utils import generate_multi_entity_qa
+
 from kblam.utils.eval_utils import (
     instruction_prompts,
     instruction_prompts_multi_entities,
     zero_shot_prompt,
     zero_shot_prompt_multi_entities,
-    _format_Q_llama,
-    _format_Q_phi3,
+    format_Q_llama,
+    format_Q_phi3,
     model_prune_format_mapping,
     answer_question,
+    answer_question_deterministic,
     softmax,
+    format_output_for_synthetic,
 )
 from kblam.utils.train_utils import get_kb_embd
+from kblam.kb_retriever import KBRetriever
+from kblam.metrics_evaluator import full_evaluation
+import time
+from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
 
-nltk.download("wordnet")
+
+debug_flag = True
 logging.set_verbosity_warning()
 
-rouge = evaluate.load("rouge")
-bert_score = evaluate.load("bertscore")
 
 
-class KBRetriever:
-    def __init__(
-        self,
-        encoder: KBEncoder,
-        dataset: List[Dict],
-        precomputed_embed_keys_path: Optional[str] = None,
-        precomputed_embed_values_path: Optional[np.ndarray] = None,
-    ):
-        self.encoder = encoder
-        self.dataset = dataset
-        if precomputed_embed_keys_path is not None:
-            self.key_embds = np.load(precomputed_embed_keys_path).astype("float32")
-        else:
-            self.key_embds = None
-        if precomputed_embed_values_path is not None:
-            self.value_embds = np.load(precomputed_embed_values_path).astype("float32")
-        else:
-            self.value_embds = None
+def perform_eval_musique(
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    kb_retriever: KBRetriever,
+    kb_config: KBLaMConfig,
+    eval_mode: str = "kb",
+    kb_size: int = 1,
+    seed: int = 1,
+    query_size: int = 100,
+):
+    def _normalize_blocks(paragraphs, sample_id: int):
+        """将( start_id, num_triples, para )按start_id排序并做重叠/越界校验"""
+        blocks = []
+        for p in paragraphs:
+            s, n = int(p["start_id"]), int(p["num_triples"])
+            if n <= 0:
+                continue
+            # 越界预检
+            if s + n > len(kb_retriever.key_embds):
+                raise IndexError(
+                    f"[sample {sample_id}] start_id overflow: start={s}, num={n}, "
+                    f"total={len(kb_retriever.key_embds)}"
+                )
+            blocks.append((s, n, p))
 
-        if precomputed_embed_keys_path is not None:
-            assert len(dataset) == len(self.key_embds)
+        if not blocks:
+            return []
 
-    def _use_cached_embd(self):
-        if self.key_embds is not None and self.value_embds is not None:
-            return True
-        else:
-            return False
+        # 排序
+        blocks.sort(key=lambda x: x[0])
 
-    def get_key_embeddings(self, batch_indices):
-        if self._use_cached_embd():
-            return get_kb_embd(
-                self.encoder,
-                batch_indices,
-                precomputed_embd=(self.key_embds, self.value_embds),
+        # 重叠/单调性校验
+        for j in range(1, len(blocks)):
+            prev_s, prev_n, _ = blocks[j - 1]
+            cur_s,  cur_n,  _ = blocks[j]
+            prev_end = prev_s + prev_n
+            assert prev_end <= cur_s, (
+                f"[sample {sample_id}] KB blocks overlap or out-of-order: "
+                f"({prev_s},{prev_n}) -> ({cur_s},{cur_n})"
             )
+        return blocks
+    # get samples to query
+    query_size = min(query_size, len(kb_retriever.dataset))
+    if seed < 0:
+        sample_idx=np.arange(query_size)
+    else:
+        np.random.seed(seed)
+        sample_idx=np.random.randint(0, len(kb_retriever.dataset), query_size)
+    if debug_flag:
+        query_size=1
+        # sample_idx=[22]
+        sample_idx=[24]
+        
+        
+    
+    test_samples=[kb_retriever.dataset[idx] for idx in sample_idx]
+    
+    # get kb embeddings
+    start_ids = [[] for _ in range(query_size)]
+    num_triples = [[] for _ in range(query_size)]
+    paras=[[] for _ in range(query_size)]
+
+    for i in range(query_size):
+        sample = test_samples[i]
+        paragraphs = sample["paragraphs"]
+
+        if kb_size == -1:
+            start_ids[i] = [paragraphs[0]["start_id"]]
+            total_triples = sum(p["num_triples"] for p in paragraphs)
+            num_triples[i] = [total_triples]
+            
+        elif kb_size == 1:
+            # Use only ground-truth supporting paragraphs
+            support_paras = []
+            for qd in sample["question_decomposition"]:
+                true_idx = int(qd["paragraph_support_idx"])
+                support_paras.append(paragraphs[true_idx])
+
+            blocks = _normalize_blocks(support_paras, sample_id=i)
+
+            start_ids[i]   = [s for (s, n, p) in blocks]
+            num_triples[i] = [n for (s, n, p) in blocks]
+            paras[i]       = [p for (s, n, p) in blocks]
+
+            assert all(start_ids[i][k] <= start_ids[i][k+1] for k in range(len(start_ids[i]) - 1)), \
+                f"[sample {i}] start_ids not non-decreasing after normalization."
         else:
-            return get_kb_embd(self.encoder, batch_indices, kb_dict=self.dataset)
+            raise ValueError(f"Unsupported kb_size: {kb_size}")   
+    if debug_flag:
+        print(f"sample {sample['id']} chosen triples {start_ids[i]} {num_triples[i]}")
+        # 逐条打印三元组id加内容
+        for para_in_sample in paras:
+            t_id=0
+            for para in para_in_sample:
+                print(f"True para: {para['paragraph_text']}")
+                triples=para["triples"]
+                for triple in triples:
+                    print(f"Triple {t_id} : {triple}")
+                    t_id+=1
+            
+    kb_embeddings = kb_retriever.get_embeddings(start_ids, num_triples, query_size, is_inference=True)
+
+    retrieval_time=0.0003
+
+    kb_keys, kb_values = kb_embeddings
+    
+    full_outputs = []
+    model_outputs = []
+    answers = []
+    start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
+    for i in range(query_size):
+        sample = test_samples[i]
+        Q=sample["question"]
+        answer=sample["answer"]
+        kb_i=(kb_keys[i], kb_values[i])
+        # zoro Value 测试
+        # kb_i=(kb_keys[i], torch.zeros_like(kb_values[i]))
+        
+        kblam_profile_reset()
+        if debug_flag:
+            model_output=answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=kb_i,
+                kb_config=kb_config,
+                save_attention_weights=True,
+                attention_save_loc="./attn_weights/",
+                attention_file_base_name=f"debug_kbscale{kb_config.kb_scale_factor}_sample-{sample['id']}",
+                # save_attn_weights_policy="all-step-last-layer",
+            )
+            print(f"model_output: {model_output}")
+            model_output=model_output.split(Q)[1]
+        else:
+            model_output=answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=kb_i,
+                kb_config=kb_config,
+            ).split(Q)[1]
+
+        prof = kblam_profile_get()
+        prefill_s = prof["prefill_s"]                # 模型 prefill
+        decode_s = prof["decode_s"]
+        decode_tokens = max(1, prof["decode_tokens"])
+        tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+        ttft = retrieval_time + prefill_s
+
+        TTFTs.append(ttft)
+        TPOTs.append(tpot)
+
+        model_output = model_output[2:]
+        full_outputs.append((model_output,answer))
+        answers.append(answer)
+        print(f"------------------sample {i}----------")
+        print(f"Q: {Q}")
+        print(f"PRED: {model_output}")
+        print(f"GT: {answer}")
+        print("---------------------------------------")
+
+        # process the model_output
+        model_outputs.append(model_output)
+    
+    end_time=time.time()
+    print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
+
+    if debug_flag:
+        exit(0)
+
+    return model_outputs, answers
+    
 
 
 def perform_eval(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
     tokenizer: transformers.PreTrainedTokenizer,
     kb_retriever: KBRetriever,
-    encoder_model_spec: str,
     kb_config: KBLaMConfig,
     eval_mode: str = "kb",
     kb_size: int = 250,
     seed: int = 1,
-    topk_size: int = -1,
     multi_entites: int = -1,
     remove_sorry: bool = False,
+    query_size: int = 250,
 ):
-    np.random.seed(seed)
+    # np.random.seed(seed)
     kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
+
+    # if debug_flag:
+    #     query_size=1
+
+    print(f"kb_idx: {kb_idx}")
     test_kb = [kb_retriever.dataset[idx] for idx in kb_idx]
     kb_embedding = ()
     key_str = [row["key_string"] for row in test_kb]
@@ -110,13 +261,14 @@ def perform_eval(
     full_outputs = []
     # answer_question
     subset_size = min(
-        400, len(test_kb)
-    )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    subset_size = min(
-        400, len(test_kb)
+        query_size, len(test_kb)
     )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
     # subset_size = 50
-    for row in tqdm(test_kb[:subset_size]):
+    # for row in tqdm(test_kb[:subset_size]):
+    # for i in range(subset_size):
+    for i in tqdm(range(subset_size)):
+        row=test_kb[i]
+        idx=kb_idx[i]
         if multi_entites == -1:
             Q = row["Q"]
             answer = row["A"]
@@ -129,15 +281,36 @@ def perform_eval(
             )
             answer = A
 
+        # k_emb, v_emb=(kb_embedding)
+        # # 切割kb embed，只要其中第一个Token
+        # # row_i = k_emb[i:i+1, :]
+        # # v_i = v_emb[i:i+1, :]
+        # row_i = k_emb[0:1, :]
+        # v_i = v_emb[0:1, :]
+        # kb_i=(row_i, v_i)
+        kb_i=kb_embedding
+
+        # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+        kb_i = move_true_kb_to_front_inference(
+            kb_i,
+            i,
+        )
+
         if eval_mode == "kb":
-            model_output = answer_question(
+            model_output = answer_question_deterministic(
                 tokenizer,
                 model,
                 Q,
-                kb=kb_embedding,
-                topk_size=topk_size,
+                kb=kb_i,
                 kb_config=kb_config,
+                save_attention_weights=True,
+                attention_save_loc="./attn_weights_kblam/",
+                attention_file_base_name=f"kb-{idx}",
+                # save_attn_weights_policy="all-step-last-layer",
             ).split(Q)[1]
+            # 去除输出中的前两个换行符
+            model_output = model_output[2:]
+            # print(f"raw model output: {model_output}")
         elif eval_mode == "icl":
             if multi_entites != -1:
                 ins_prompt = instruction_prompts_multi_entities
@@ -163,50 +336,353 @@ def perform_eval(
             if "sorry" in model_output:
                 continue
         full_outputs.append((model_output, answer))
-        if multi_entites == -1:
-            pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
-            match = re.search(pattern, model_output)
-            answers.append(row["description"])
-            if match:
-                model_output = match.group(1)
-        else:
-            pattern = r"(?:is|are) (.*?)(?:\.|;)"
-            matches = re.findall(pattern, model_output)
-            model_output = "; ".join(matches)
-            answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
-        model_outputs.append(model_output)
+        
+        answers.append(row["description"])
+        model_outputs.append(format_output_for_synthetic(model_output))
+        # if multi_entites == -1:
+        #     pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
+        #     match = re.search(pattern, model_output)
+        #     answers.append(row["description"])
+        #     if match:
+        #         model_output = match.group(1)
+        # else:
+        #     pattern = r"(?:is|are) (.*?)(?:\.|;)"
+        #     matches = re.findall(pattern, model_output)
+        #     model_output = "; ".join(matches)
+        #     answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
+        # model_outputs.append(model_output)
 
-    print(f"KB size: {kb_size}, mode: {eval_mode}")
-    rouge = evaluate.load("rouge")
 
     for pred, gt in zip(model_outputs, answers):
         print(f"PREDICTION: {pred}")
         print(f"GT: {gt}")
-    rouge_scores = rouge.compute(predictions=model_outputs, references=answers)
-    print(rouge_scores)
+    print(f"KB size: {kb_size}, mode: {eval_mode}")
 
-    results_dict = {k: float(v) for k, v in rouge_scores.items()}
+    return model_outputs, answers
+    # results, results_dict=full_evaluation(model_outputs, answers)
+    # return results, results_dict
 
-    bertscore = bert_score.compute(
-        predictions=model_outputs,
-        references=answers,
-        lang="en",
-        model_type="microsoft/deberta-xlarge-mnli",
-    )
-    # bert_scores = []
-    # bert_scores = {}
-    for k, v in bertscore.items():
-        if isinstance(v, list):
-            # bert_scores.append(np.mean(v))
-            results_dict[f"bert_score_{k}"] = float(np.mean(v))
-            print(k, np.mean(v))
-    results = ""
-    for a, A in full_outputs:
-        results += f"Model output: {a}\nTrue answer: {A}\n-------\n"
-    if eval_mode == "kb":
-        eval_mode = encoder_model_spec + eval_mode
 
-    return results, results_dict
+def move_true_kb_to_front_inference(kb_embedding, true_index: int):
+    """
+    适用于推理阶段的版本：
+    kb_embedding: (N, D)
+    true_index: 正确 key 的索引
+    """
+    if true_index == 0:
+        return kb_embedding  # 已在开头
+
+    kb_keys, kb_vals = kb_embedding
+
+    # 可选，全部置零
+    # kb_keys = torch.zeros_like(kb_keys)
+    # kb_vals = torch.zeros_like(kb_vals)
+    # return (kb_keys, kb_vals)
+
+    # 复制以避免原地修改
+    new_keys = kb_keys.clone()
+    new_vals = kb_vals.clone()
+
+    true_key = new_keys[true_index].clone()
+    true_val = new_vals[true_index].clone()
+
+    # 把第0位和true_index交换
+    new_keys[true_index], new_keys[0] = new_keys[0], true_key
+    new_vals[true_index], new_vals[0] = new_vals[0], true_val
+
+    # 可选：将true_key和true_val设为空，观察模型结果，可以看到模型精度大幅下降，说明正确答案的位置是对的，并且被掩盖
+    # new_keys[0] = torch.zeros_like(true_key)
+    # new_vals[0] = torch.zeros_like(true_val)
+
+    # 可选：将除了true_index之外的其他key设为空，观察模型结果
+    # new_keys[1:] = torch.zeros_like(new_keys[1:])
+    # new_vals[1:] = torch.zeros_like(new_vals[1:])
+
+
+    return (new_keys, new_vals)
+
+def perform_eval_2wiki(
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    kb_retriever: KBRetriever,
+    kb_config: KBLaMConfig,
+    eval_mode: str = "kb",
+    kb_size: int = 250,
+    seed: int = 1,
+    multi_entites: int = -1,
+    remove_sorry: bool = False,
+    query_size: int = 250,
+):
+
+    if eval_mode != "kb":
+        raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+
+    if seed < 0:
+        np.random.seed(None)
+    else:
+        np.random.seed(seed)
+
+    # if query_size <= kb_size:
+    #     raise ValueError(f"query_size={query_size} must be greater than kb_size={kb_size}")
+    dataset = kb_retriever.dataset
+    total_N = len(dataset)
+    query_idx=np.random.randint(0, total_N, query_size)
+    subset=[dataset[idx] for idx in query_idx]
+
+    # 过滤掉三元组提取质量不够的样本
+    new_subset = []
+    new_query_idx=[]
+    for row, idx in zip(subset, query_idx):
+        ans=format_output_for_synthetic(row["A"])
+        des_2=row["triple_lists"][1]["description"]
+        if ans == des_2:
+            new_subset.append(row)
+            new_query_idx.append(idx)
+    subset=new_subset
+    query_idx=new_query_idx
+    query_size=len(subset)    
+    print(f"After filtering, query_size={query_size}")
+
+
+
+    # 统一的结果容器
+    all_model_outputs, all_answers = [], []
+
+    # 计算批次数
+    num_batches = (query_size + kb_size - 1) // kb_size
+
+    print(f"[INFO] Eval mode={eval_mode}, KB size={kb_size}, Query size={query_size}, total_batches={num_batches}")
+    
+    start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
+    retrieval_time=0.003
+    
+    for batch_id in tqdm(range(num_batches)):
+        # ---- 当前批的 query 索引范围 ----
+        start_idx = batch_id * kb_size
+        end_idx = min((batch_id + 1) * kb_size, query_size)
+        current_query_num = end_idx - start_idx
+        
+        key_embeddings, value_embeddings, kb_adj=kb_retriever.get_embeddings_with_adj_2wiki(
+            batch_indices=query_idx[start_idx:end_idx],
+            hop_num=2,
+        )
+        
+        query_subset=subset[start_idx:end_idx]
+
+        model_outputs, answers = [], []
+        for i in range(current_query_num):
+            row = query_subset[i]
+            Q, A = row["Q"], row["A"]
+
+            # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+            # sub_kb_embedding = move_true_kb_to_front_inference(
+            #     sub_kb_embedding,
+            #     i,
+            # )
+            # if kb_adjs is None:
+            #     kb_adj_i = None
+            # elif isinstance(kb_adjs, list):
+            #     kb_adj_i = kb_adjs[start_idx + i]
+            # elif hasattr(kb_adjs, "dim") and kb_adjs.dim() == 3:
+            #     kb_adj_i = kb_adjs[start_idx + i]
+            # else:
+            #     kb_adj_i = kb_adjs
+                
+            output_text = answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=(key_embeddings, value_embeddings),
+                kb_config=kb_config,
+                kb_adj=kb_adj,
+                # save_attention_weights=debug_flag,
+                # attention_save_loc="./attn_weights_kblam/",
+                # attention_file_base_name=f"kb-{idx}",
+            )
+            # print(f"[DEBUG] output_text={output_text}")
+
+            output_text=output_text.split(Q)[1]
+            prof = kblam_profile_get()
+            kblam_profile_reset()
+            prefill_s = prof["prefill_s"]                # 模型 prefill
+            decode_s = prof["decode_s"]
+            decode_tokens = max(1, prof["decode_tokens"])
+            tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+            ttft = retrieval_time + prefill_s
+
+            TTFTs.append(ttft)
+            TPOTs.append(tpot)
+
+            model_output=output_text[2:]
+            if remove_sorry and "sorry" in model_output.lower():
+                continue
+            answers.append(format_output_for_synthetic(A))
+            model_outputs.append(format_output_for_synthetic(model_output))
+
+        all_model_outputs.extend(model_outputs)
+        all_answers.extend(answers)
+
+    end_time=time.time()
+    print(f"============== 2wiki Performance ==================")
+    print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
+
+    return all_model_outputs, all_answers
+
+
+def perform_eval_v2(
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    tokenizer: transformers.PreTrainedTokenizer,
+    kb_retriever: KBRetriever,
+    kb_config: KBLaMConfig,
+    eval_mode: str = "kb",
+    kb_size: int = 250,
+    seed: int = 1,
+    multi_entites: int = -1,
+    remove_sorry: bool = False,
+    query_size: int = 250,
+):
+    if seed < 0:
+        np.random.seed(None)
+    else:
+        np.random.seed(seed)
+
+    if query_size <= kb_size:
+        return perform_eval(
+            model,
+            tokenizer,
+            kb_retriever,
+            encoder_model_spec,
+            kb_config,
+            eval_mode,
+            kb_size,
+            seed,
+            multi_entites,
+            remove_sorry,
+            query_size,
+        )    
+    dataset = kb_retriever.dataset
+    total_N = len(dataset)
+
+    subset_idx=np.random.randint(0, total_N, query_size)
+    subset=[dataset[idx] for idx in subset_idx]
+    kb_embeddings=kb_retriever.get_key_embeddings(subset_idx)
+    key_embeddings, value_embeddings=kb_embeddings
+
+    # 统一的结果容器
+    all_model_outputs, all_answers = [], []
+
+    # 计算批次数
+    num_batches = (query_size + kb_size - 1) // kb_size
+
+    print(f"[INFO] Eval mode={eval_mode}, KB size={kb_size}, Query size={query_size}, total_batches={num_batches}")
+
+    start_time=time.time()
+    TTFTs=[]
+    TPOTs=[]
+    retrieval_time=0.003
+
+    for batch_id in tqdm(range(num_batches)):
+        # ---- 当前批的 query 索引范围 ----
+        start_idx = batch_id * kb_size
+        end_idx = min((batch_id + 1) * kb_size, query_size)
+        current_query_num = end_idx - start_idx
+
+        # ---- KB 子集：固定大小 ----
+        sub_kb_embedding=(key_embeddings[start_idx:end_idx], value_embeddings[start_idx:end_idx])
+
+        # ---- Query 子集 ----
+        query_subset=subset[start_idx:end_idx]
+
+        # ---- 处理本批次 ----
+        model_outputs, answers = [], []
+        for i in range(current_query_num):
+            row = query_subset[i]
+            idx = subset_idx[start_idx + i]
+            if multi_entites == -1:
+                Q, A = row["Q"], row["A"]
+            else:
+                kb_subset_idx = np.random.randint(0, total_N, multi_entites)
+                Q, A = generate_multi_entity_qa(
+                    [dataset[j]["name"] for j in kb_subset_idx],
+                    [dataset[j]["description_type"] for j in kb_subset_idx],
+                    [dataset[j]["description"] for j in kb_subset_idx],
+                )
+            if eval_mode != "kb":
+                raise ValueError(f"eval_mode={eval_mode} is not supported for batched evaluation")
+
+            # 可选，移动正确 key 到开头，用于验证模型是否能正确定位答案
+            # sub_kb_embedding = move_true_kb_to_front_inference(
+            #     sub_kb_embedding,
+            #     i,
+            # )
+            output_text = answer_question_deterministic(
+                tokenizer,
+                model,
+                Q,
+                kb=sub_kb_embedding,
+                kb_config=kb_config,
+                # save_attention_weights=debug_flag,
+                # attention_save_loc="./attn_weights_kblam/",
+                # attention_file_base_name=f"kb-{idx}",
+            ).split(Q)[1]
+            model_output=output_text[2:]
+
+            prof = kblam_profile_get()
+            kblam_profile_reset()
+            prefill_s = prof["prefill_s"]                # 模型 prefill
+            decode_s = prof["decode_s"]
+            decode_tokens = max(1, prof["decode_tokens"])
+            # print(f"prefill_s: {prefill_s}, decode_s: {decode_s}, decode_tokens: {decode_tokens}")
+            tpot = decode_s / decode_tokens             # ms/token 可乘 1000
+            ttft = retrieval_time + prefill_s
+
+            TTFTs.append(ttft)
+            TPOTs.append(tpot)
+
+
+            if remove_sorry and "sorry" in model_output.lower():
+                continue
+
+            # if multi_entites == -1:
+            #     pattern = r'The\s+\w+\s+of\s+[^"]+\s+is\s+(.+)'
+            #     match = re.search(pattern, model_output)
+            #     answers.append(row["description"])
+            #     if match:
+            #         model_output = match.group(1)
+            # else:
+            #     pattern = r"(?:is|are) (.*?)(?:\.|;)"
+            #     matches = re.findall(pattern, model_output)
+            #     model_output = "; ".join(matches)
+            #     answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
+            answers.append(format_output_for_synthetic(A))
+            model_outputs.append(format_output_for_synthetic(model_output))
+
+        # ---- 聚合 ----
+        all_model_outputs.extend(model_outputs)
+        all_answers.extend(answers)
+
+
+        # print(f"[INFO] Batch {batch_id+1}/{num_batches} done. Queries={current_query_num}")
+
+
+    end_time=time.time()
+    print(f"============== 2wiki Performance ==================")
+    print(f"query per second: {query_size/(end_time-start_time)}")
+
+    print(f"Average TTFTs: {np.mean(TTFTs)}")
+    print(f"Average TPOTs: {np.mean(TPOTs)}")
+    return all_model_outputs, all_answers
+
+    # # ---- 统一计算评估指标 ----
+    # results, results_dict = full_evaluation(all_model_outputs, all_answers)
+    # print(f"[DONE] Evaluated {len(all_model_outputs)} queries with KB size={kb_size}")
+    # print(results)
+    # return results, results_dict
 
 
 def perform_eval_refusal(
@@ -326,13 +802,30 @@ parent_parser.add_argument(
 )
 parent_parser.add_argument(
     "--kb_scale_factor",
-    type=int,
+    type=float,
     default=None,
     help="Scaling factor for knowledge base",
 )
+
+parent_parser.add_argument(
+    "--kb_scale_factor_range",
+    nargs=2,
+    type=float,
+    default=None,
+    help="Range of scaling factor for knowledge base",
+)
+
 parent_parser.add_argument(
     "--kb_size", type=int, default=200, help="Size of the knowledge base"
 )
+
+parent_parser.add_argument(
+    "--query_size",
+    type=int,
+    default=100,
+    help="Number of queries to generate per KB entry",
+)
+
 parent_parser.add_argument(
     "--llm_base_dir",
     type=str,
@@ -348,7 +841,7 @@ parent_parser.add_argument(
 parent_parser.add_argument(
     "--model_dir", type=str, help="Directory containing the model"
 )
-parent_parser.add_argument("--save_dir", type=str, help="Directory to save outputs")
+parent_parser.add_argument("--save_dir", type=str, default=None, help="Directory to save outputs")
 parent_parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
 parent_parser.add_argument(
     "--test_dataset", type=str, help="Source of test KB (assumes KV pair format)"
@@ -364,6 +857,34 @@ parent_parser.add_argument(
 parent_parser.add_argument(
     "--query_head_path", type=str, default="", help="Path to load KB head from"
 )
+
+parent_parser.add_argument(
+    "--dataset_type",
+    type=str,
+    default="",
+    help="Type of dataset to use",
+)
+
+parent_parser.add_argument(
+    "--debug_flag",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable debug mode",
+)
+
+parent_parser.add_argument(
+    "--format_short",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to use short format",
+)
+parent_parser.add_argument(
+    "--path_attn",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to use path attention",
+)
+
 
 # Create subparsers
 subparsers = parser.add_subparsers(dest="command", required=True)
@@ -547,17 +1068,92 @@ basic_parser.add_argument(
 )
 
 
+def eval_main_process(
+    dataset: list[dict],
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+    encoder: KBEncoder,
+    kb_config: KBLaMConfig,
+    kb_retriever: KBRetriever,
+    kb_scale_factor_range: list[float] | None = None,
+    kb_scale_factor: float | None = None,
+    dataset_type: str = "synthetic",
+    seed: int = 42,
+    kb_size: int = -1,
+    query_size: int = -1,
+    eval_mode: str = "kb",
+):
+    if kb_scale_factor_range is not None:
+        scale_factor_list=[]
+        start=kb_scale_factor_range[0]
+        end=kb_scale_factor_range[1]
+        while start<=end:
+            scale_factor_list.append(start)
+            start*=2
+    else:
+        scale_factor_list=[kb_scale_factor]
+    print(f"---- kb_scale_factor_range: {scale_factor_list}")
+
+    results_pair_list=[]
+    for sf in scale_factor_list:
+        kb_config.kb_scale_factor = sf
+        if dataset_type == "musique":
+            model_outputs, answers = perform_eval_musique(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            )
+        elif dataset_type=="2wiki":
+           model_outputs, answers = perform_eval_2wiki(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            ) 
+        else:
+            model_outputs, answers = perform_eval_v2(
+            # gen_results, score_results = perform_eval(
+                model,
+                tokenizer,
+                kb_retriever,
+                kb_config,
+                eval_mode,
+                seed=seed,
+                kb_size=kb_size,
+                query_size=query_size,
+            )
+        
+        results_pair_list.append((model_outputs, answers))
+    return results_pair_list, scale_factor_list
+
+
+
 def eval_generate():
     """Evaluate generation using KB"""
     args = parser.parse_args()
 
     dataset_dir = args.dataset_dir
+
+    # adapter
     encoder_model_spec = args.encoder_spec
     encoder_path = args.encoder_dir
+
+
     eval_mode = args.eval_mode
     exp_config = args.exp_config_name
     kb_layer_frequency = args.kb_layer_frequency
     kb_scale_factor = args.kb_scale_factor
+    kb_scale_factor_range = args.kb_scale_factor_range
+
     kb_size = args.kb_size
     llm_base_dir = args.llm_base_dir
     llm_type = args.llm_type
@@ -565,10 +1161,20 @@ def eval_generate():
     seed = args.seed
     test_dataset = args.test_dataset
     query_head_path = args.query_head_path
+
+    # embeddings 
     precomputed_embed_keys_path = args.precomputed_embed_keys_path
     precomputed_embed_values_path = args.precomputed_embed_values_path
 
-    dataset = json.load(open(os.path.join(dataset_dir, test_dataset)))
+
+    dataset_path=os.path.join(dataset_dir, test_dataset)
+    # 判断数据集是json还是jsonl格式
+    if dataset_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(dataset_path)]
+    elif dataset_path.endswith(".json"):
+        dataset=json.load(open(dataset_path))
+    else:
+        raise ValueError(f"Unknown dataset format: {dataset_path}")
 
     tokenizer, encoder, model, kb_config = _prepare_models(
         encoder_model_spec,
@@ -580,6 +1186,8 @@ def eval_generate():
         kb_layer_frequency,
         kb_scale_factor,
     )
+    kb_config.format_short = args.format_short
+    kb_config.path_attn = args.path_attn
 
     kb_retriever = KBRetriever(
         encoder,
@@ -588,26 +1196,36 @@ def eval_generate():
         precomputed_embed_values_path=precomputed_embed_values_path,
     )
 
-    gen_results, score_results = perform_eval(
-        model,
+    results_pair_list, scale_factor_list = eval_main_process(
+        dataset,
         tokenizer,
-        kb_retriever,
-        encoder_model_spec,
+        model,
+        encoder,
         kb_config,
-        eval_mode,
-        seed=seed,
-        kb_size=kb_size,
-        topk_size=args.topk_size,
-        multi_entites=args.multi_entites,
+        kb_retriever,
+        kb_scale_factor_range,
+        kb_scale_factor,
+        args.dataset_type,
+        seed,
+        kb_size,
+        args.query_size,
     )
-    mem_cost = torch.cuda.max_memory_reserved("cuda")
-    score_results["mem_cost"] = mem_cost
 
-    (Path(args.save_dir) / exp_config).mkdir(exist_ok=True, parents=True)
-    write_to_json(score_results, Path(args.save_dir) / f"{exp_config}.json")
-    print(score_results)
-    text_file = open(os.path.join(args.save_dir, exp_config + ".txt"), "w")
-    text_file.write(gen_results)
+    for i in range(len(results_pair_list)):
+        model_outputs, answers = results_pair_list[i]
+        sf = scale_factor_list[i]
+        
+        gen_results, score_results = full_evaluation(model_outputs, answers)
+        # mem_cost = torch.cuda.max_memory_reserved("cuda")
+        # score_results["mem_cost"] = mem_cost
+        # print(score_results)
+        # print(gen_results)
+        print(f"---- kb_scale_factor: {sf}, {score_results}")
+        if args.save_dir is not None:
+            (Path(args.save_dir) / exp_config).mkdir(exist_ok=True, parents=True)
+            write_to_json(score_results, Path(args.save_dir) / f"{exp_config}-{sf}.json")
+            text_file = open(os.path.join(args.save_dir, f"{exp_config}-{sf}.txt"), "w")
+            text_file.write(gen_results)
 
 
 def _prepare_models(
@@ -672,6 +1290,8 @@ def _prepare_models(
         projector_kwargs={"mlp_depth": 1, "mlp_hidden_dim": 512},
         device=torch.device("cuda"),
     )
+    # print(f"encoder out_dim: {model.config.hidden_size
+        # * (model.config.num_hidden_layers // kb_layer_frequency + 1)}")
 
     encoder.load_state_dict(torch.load(encoder_path))
     return tokenizer, encoder, model, kb_config
@@ -706,12 +1326,13 @@ def eval_accuracy(
 
     kb_embedding_real = kb_retriever.get_key_embeddings(dataset_subset_idx)
 
-    format_func_map = {"llama3": _format_Q_llama, "phi3": _format_Q_phi3}
+    format_func_map = {"llama3": format_Q_llama, "phi3": format_Q_phi3}
 
     if not fancy_question:
         input_strs_gen = (dataset_subset[i]["Q"] for i in range(test_batch_size))
     else:
-        input_strs_gen = (aug_row(dataset_subset[i]) for i in range(test_batch_size))
+        # input_strs_gen = (aug_row(dataset_subset[i]) for i in range(test_batch_size))
+        print("ERROR: aug_row not implemented")
     input_strs = [format_func_map[llm_type](ex) for ex in input_strs_gen]
 
     tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(
@@ -1073,7 +1694,7 @@ def eval():
             kb_embedding_key, kb_embedding_val = kb_embedding_real
             kb_embedding_real = (kb_embedding_key, kb_embedding_val)
 
-        format_func_map = {"llama3": _format_Q_llama, "phi3": _format_Q_phi3}
+        format_func_map = {"llama3": format_Q_llama, "phi3": format_Q_phi3}
 
         input_strs = [
             format_func_map[llm_type](dataset_subset[i]["Q"])
@@ -1192,6 +1813,13 @@ def eval():
 
 def main():
     args = parser.parse_args()
+    global debug_flag
+    if args.debug_flag:
+        print("Debug mode enabled")
+        debug_flag = True
+    else:
+        debug_flag = False
+
     print(args)
     if args.command == "generation":
         eval_generate()

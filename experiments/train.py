@@ -6,7 +6,10 @@ import pathlib
 import re
 from functools import partial
 from itertools import chain
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union, Tuple
+import glob
+import traceback
+
 
 import numpy as np
 import torch
@@ -20,6 +23,8 @@ from rich.theme import Theme
 from torch.nn import CrossEntropyLoss
 from torch.nn.parallel import DistributedDataParallel
 from transformers import AutoTokenizer
+from torch.nn.utils.rnn import pad_sequence
+
 
 from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
@@ -27,9 +32,19 @@ from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
-
+from kblam.kb_retriever import KBRetriever
+from eval import eval_main_process
+from kblam.metrics_evaluator import simple_evaluation
+from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short
+import re
+import shutil
+import random
+import gc
 LOGFORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOGFORMAT_RICH = "%(message)s"
+
+debug_level=1
+
 
 # setup logging
 # Create a custom theme for Rich
@@ -56,7 +71,7 @@ logging.basicConfig(
 # fmt: off
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=1)
-parser.add_argument("--train_dataset",type=str,default="synthetic")
+parser.add_argument("--dataset_type",type=str,default="synthetic")
 parser.add_argument("--N", type=int, default=120000, help="Size of training set, select the first N samples for training")
 parser.add_argument("--B", type=int, default=10, help="Batch size")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -68,9 +83,14 @@ parser.add_argument("--encoder_spec", type=str, default="OAI")
 parser.add_argument("--key_embd_src", type=str, default="key", choices=["key", "answer", "questions", None], help="Source of key embedding")
 parser.add_argument("--use_data_aug", action="store_true", help="Randomly pick templates for the question")
 parser.add_argument("--use_lr_decay", action="store_true")
-parser.add_argument("--dataset_dir", type=str, default="synthetic_data")
+parser.add_argument("--train_data_path", type=str, default="synthetic_data")
+parser.add_argument("--train_precomputed_embed_keys_path", type=str, default=None, help="The path of the precomputed embed keys for training")
+parser.add_argument("--train_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for training")
+
 parser.add_argument("--model_dir_to_resume", type=str, default=None, help="Checkpoint directory to resume training")
-parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
+# parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
+parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
+
 parser.add_argument("--hf_token", type=str,default=None,help="Huggingface token")
 parser.add_argument("--model_save_dir", type=str, default="output", help="Place to save the checkpoints")
 parser.add_argument("--kb_size", type=int, default=None, help="The size of the KB set size")
@@ -86,7 +106,24 @@ parser.add_argument("--verbose", action="store_true", help="Set logging to debug
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
 parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
+parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
+parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
+parser.add_argument("--path_attn", action="store_true", default=False, help="Use path attention")
+
+
 # fmt: on
+
+# Test arguments
+parser.add_argument("--test_data_path", type=str, default=None, help="The path of the test data")
+parser.add_argument("--test_precomputed_embed_keys_path", type=str, default=None, help="The path of the precomputed embed keys for testing")
+parser.add_argument("--test_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for testing")
+parser.add_argument("--test_kb_size", type=int, default=None, help="The size of the KB set size for testing")
+parser.add_argument("--test_query_size", type=int, default=None, help="The size of the query set size for testing")
+parser.add_argument("--test_kb_scale_factor", type=float, default=None, help="The scale factor of the KB set size for testing")
+parser.add_argument("--test_kb_scale_factor_range", nargs=2, type=float, default=None, help="The range of the scale factor of the KB set size for testing")
+parser.add_argument("--eval_step", type=int, default=50, help="Evaluate every n steps")
+parser.add_argument("--format_short", type=bool, default=False, help="Use short answer in prompt")
+
 
 
 def create_custom_progress_bar(
@@ -133,22 +170,9 @@ def create_custom_progress_bar(
     return progress
 
 
-def _format_QA_llama(Q: str, A: str):
-    return (
-        "<|start_header_id|>user<|end_header_id|> "
-        + Q
-        + "<|eot_id|>"
-        + "<|start_header_id|>assistant<|end_header_id|>"
-        + A
-        + "<|eot_id|>"
-    )
 
-
-def _format_QA_phi3(Q: str, A: str):
-    return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n" + A + "<|end|>\n"
-
-
-def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
+# 构建训练标签：只计算模型对assistant回答部分的预测损失，而忽略对用户提问等其他内容的预测
+def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tokenizer, attention_masks: torch.Tensor):
     # Not sure this is correct. This method simply masks the <|start_header_id|>user<|end_header_id|> then leaves the rest in the labels
     # Possibly what they want is to mask out the query. To do that swap the index from the tokenizer below from 1 to 2
     answer_indices = torch.argmax(
@@ -161,6 +185,41 @@ def _create_labels_for_llama(input_ids: torch.Tensor, input_strs: List[str], tok
     labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
     return labels
 
+def _create_labels_for_llama_enhanced(input_ids: torch.Tensor,
+                                      input_strs: List[str],
+                                      tokenizer,
+                                      attention_masks: torch.Tensor) -> torch.Tensor:
+    labels = input_ids.clone()
+    labels[:] = -100
+
+    assistant_header = tokenizer("<|start_header_id|>assistant<|end_header_id|>",
+                                 add_special_tokens=False).input_ids
+
+    for b in range(input_ids.size(0)):
+        seq = input_ids[b].tolist()
+        # 1. 找到 assistant header 起始位置
+        start_idx = None
+        for i in range(len(seq) - len(assistant_header) + 1):
+            if seq[i:i + len(assistant_header)] == assistant_header:
+                start_idx = i
+                break
+        if start_idx is None:
+            continue   # 没找到 header，整行保持 -100
+
+        # 2. 解除 header + 答案的掩码（到末尾非 pad 为止）
+        pad_id = tokenizer("<|eot_id|>", add_special_tokens=False).input_ids[0]
+        # 最后一个非 pad token 位置
+        last_real = (attention_masks[b] == 1).nonzero()[-1].item()
+
+        # header → 答案
+        labels[b, start_idx: last_real + 1] = input_ids[b, start_idx: last_real + 1]
+
+        # 3. 紧跟其后的**第一个** pad 位置强制设为 eot_id
+        if last_real + 1 < labels.size(1):
+            labels[b, last_real + 1] = pad_id   # 仅此 1 个 token 非 -100
+
+        # 4. 再往后所有 padding 仍保持 -100（模型无需关心）
+    return labels
 
 def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], tokenizer):
     # We just want to mask out the starting token.
@@ -176,10 +235,10 @@ def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], toke
     labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
     return labels
 
-
+# 从数据集中构建训练批次：对应输入字符串的Token id，注意力掩码以及标签
 def get_batch(
     qa_format_func: Callable[[str, str], str],
-    label_func: Callable[[torch.Tensor, List, Callable], torch.Tensor],
+    label_func: Callable[[torch.Tensor, List, Callable, torch.Tensor], torch.Tensor],
     dataset: List[Dict],
     tokenizer,
     device: torch.device,
@@ -189,19 +248,13 @@ def get_batch(
     include_outlier=False,
     multi_entities=None,
     use_extended_qa=False,
+    global_step: int = 0,
 ):
-    """
-    dataset: List of dictionary, denoting the KB, used to extract QA pairs
-    model: The LLM, used to provide the embedding
-    kb_embedding: KB embedding (differentiable)
-    B: Batchsize
-    include_outlier : Create a batch of question without answer in the KB.
-    multi_entities : Create a batch of question that involves more than one entities.
-    """
     labels = []
     if multi_entities is not None:
         assert not include_outlier
 
+    # 数据采样
     if random_sample:
         if multi_entities is not None:
             batch_indices = np.random.choice(len(dataset), (B, multi_entities), replace=False)
@@ -209,7 +262,7 @@ def get_batch(
             batch_indices = np.random.choice(len(dataset), B, replace=False)
     else:
         batch_indices = np.arange(B)
-
+    # 构建问答对
     def get_question_and_answer(idx: int) -> tuple[str, str]:
         if use_extended_qa:
             Q, A = dataset[idx]["extended_Q"], dataset[idx]["extended_A"]
@@ -225,6 +278,161 @@ def get_batch(
             A = get_i_dont_know_ans() if include_outlier else dataset[idx]["A"]
         return Q, A
 
+    # 遍历采样索引，获取有效的问答对并应用格式化函数生成input string
+    with torch.autograd.no_grad():
+        input_strs = []
+        real_batch_indices = []
+        for idx in batch_indices:
+            Q, A = get_question_and_answer(idx)
+            
+            # 消除A中的连续padding
+            import re
+            A = re.sub(r'(<\|eot_id\|>)+', '<|eot_id|>', A.strip())
+            if A == '<|eot_id|>': A = 'N/A'   # 防止整段变空
+
+
+            if Q is not None and A is not None:
+                input_strs.append(qa_format_func(Q, A))
+                real_batch_indices.append(idx)
+            else:
+                print("Q or Answer is none")
+        batch_indices = real_batch_indices
+        
+        # 将input string转换为token IDs和注意力掩码 
+        tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(device)
+        input_ids, attention_masks = (
+            tokenizer_output["input_ids"],
+            tokenizer_output["attention_mask"],
+        )
+        # 生成训练标签
+        labels = label_func(input_ids, input_strs, tokenizer, attention_masks)
+    if include_outlier:
+        # Generate a new set of indices, such that the KB does not contain the entity where the question comes from
+        batch_indices = np.random.choice(len(dataset), B, replace=False)
+    return input_ids, attention_masks, labels, batch_indices
+
+
+# DATASET_SUPPORT
+# 随机选择B篇文档，每篇文档随机抽取一个问答对，组成字符串输入，转换成TokenIDs和注意力掩码并返回
+def get_batch_from_document(
+    qa_format_func: Callable[[str, str], str],
+    label_func: Callable[[torch.Tensor, List, Callable], torch.Tensor],
+    dataset: List[Dict],
+    tokenizer,
+    device: torch.device,
+    B: int = 20,
+    random_sample=True,
+    use_data_aug=False,
+    include_outlier=False,
+    multi_entities=None,
+    use_extended_qa=False,
+):
+    labels = []
+    if multi_entities is not None:
+        assert not include_outlier
+
+    # 数据采样
+    if random_sample:
+        if multi_entities is not None:
+            batch_indices = np.random.choice(len(dataset), (B, multi_entities), replace=False)
+        else:
+            batch_indices = np.random.choice(len(dataset), B, replace=False)
+    else:
+        batch_indices = np.arange(B)
+    
+    # 构建问答对
+    def get_question_and_answer(idx: Union[int, List[int]]) -> tuple[str | None, str | None]:
+        if use_extended_qa:
+            # # 扩展QA：基于triples生成更复杂的问答
+            # if isinstance(idx, list):
+            #     # 多个样本的情况
+            #     samples = [dataset[i] for i in idx]
+            #     all_triples = [triple for sample in samples for triple in sample["triples"]]
+            #     if all_triples:
+            #         triple = random.choice(all_triples)
+            #         Q = f"Can you explain how {triple['name']} relates to {triple['description']}?"
+            #         A = f"{triple['name']} {triple['description_type']} {triple['description']}."
+            #         return Q, A
+            #     return None, None
+            # else:
+            #     # 单个样本的情况
+            #     sample = dataset[idx]
+            #     if sample["triples"]:
+            #         triple = random.choice(sample["triples"])
+            #         Q = f"Can you explain the relationship between {triple['name']} and {triple['description']}?"
+            #         A = f"{triple['name']} {triple['description_type']} {triple['description']}."
+            #         return Q, A
+            #     return None, None
+            print("Extended QA is not supported yet.")
+            return None, None
+        elif multi_entities is not None:
+            # # 优化多实体问题生成逻辑
+            # samples = [dataset[i] for i in idx]
+            # all_triples = []
+            # for sample in samples:
+            #     all_triples.extend(sample["triples"])
+            
+            # if not all_triples:
+            #     return None, None
+            
+            # # 确保选择的三元组覆盖足够多的实体
+            # selected_triples = []
+            # selected_entities = set()
+            
+            # # 优先选择能形成关系链的三元组
+            # for triple in all_triples:
+            #     if len(selected_entities) >= multi_entities:
+            #         break
+            #     if triple["name"] not in selected_entities or triple["description"] not in selected_entities:
+            #         selected_triples.append(triple)
+            #         selected_entities.add(triple["name"])
+            #         selected_entities.add(triple["description"])
+            
+            # # 如果实体不足，补充随机三元组
+            # if len(selected_entities) < multi_entities and len(all_triples) > len(selected_triples):
+            #     remaining = multi_entities - len(selected_entities)
+            #     additional = random.sample([t for t in all_triples if t not in selected_triples], min(remaining, len(all_triples) - len(selected_triples)))
+            #     selected_triples.extend(additional)
+            
+            # entities = [t["name"] for t in selected_triples]
+            # desc_types = [t["description_type"] for t in selected_triples]
+            # descriptions = [t["description"] for t in selected_triples]
+            
+            # return generate_multi_entity_qa(entities, desc_types, descriptions)
+            print("Multi-entity QA is not supported yet.")
+            return None, None
+        else:
+            if isinstance(idx, list):
+                # 不应该发生，因为标准QA情况下idx是单个整数
+                idx = idx[0]
+                
+            sample = dataset[idx]
+            if not sample["QAs"]:
+                return None, None
+                
+            # 随机选择一个问题-答案对
+            qa = random.choice(sample["QAs"])
+            Q = qa["question"]
+            A = get_i_dont_know_ans() if include_outlier else qa["answer"]
+            
+            if use_data_aug:
+                # 数据增强：基于triples生成不同的问题表述
+                # if sample["triples"]:
+                #     triple = random.choice(sample["triples"])
+                #     if "what" in Q.lower():
+                #         Q = f"Could you tell me about {triple['name']} and its relationship to {triple['description']}?"
+                #     elif "when" in Q.lower():
+                #         Q = f"At what point in time did {triple['name']} {triple['description_type']} {triple['description']}?"
+                #     elif "where" in Q.lower():
+                #         Q = f"In which location can we find {triple['name']} {triple['description_type']} {triple['description']}?"
+                #     elif "who" in Q.lower():
+                #         Q = f"Which person is associated with {triple['name']} {triple['description_type']} {triple['description']}?"
+                
+                # 暂时不开启数据增强功能
+                pass
+            return Q, A
+
+    # 遍历采样索引，获取有效的问答对并应用格式化函数生成input string
     with torch.autograd.no_grad():
         input_strs = []
         real_batch_indices = []
@@ -236,18 +444,80 @@ def get_batch(
             else:
                 print("Q or Answer is none")
         batch_indices = real_batch_indices
+        # print(f"---- batch_indices: {batch_indices}, input_strs: {input_strs}")
+        # 将input string转换为token IDs和注意力掩码 
         tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(device)
         input_ids, attention_masks = (
             tokenizer_output["input_ids"],
             tokenizer_output["attention_mask"],
         )
-
+        # 生成训练标签
         labels = label_func(input_ids, input_strs, tokenizer)
     if include_outlier:
         # Generate a new set of indices, such that the KB does not contain the entity where the question comes from
         batch_indices = np.random.choice(len(dataset), B, replace=False)
     return input_ids, attention_masks, labels, batch_indices
 
+def get_batch_musique(
+    qa_format_func: Callable[[str, str], str],
+    label_func: Callable[[torch.Tensor, List, Callable], torch.Tensor],
+    dataset: List[Dict],
+    tokenizer,
+    device: torch.device,
+    B: int = 20,
+    random_sample=True,
+    use_data_aug=False,
+    include_outlier=False,
+    multi_entities=None,
+    use_extended_qa=False,
+    global_step: int = 0,
+):
+    # 暂不开启随机采样
+    # random_sample = False
+
+    labels = []
+    if random_sample:
+        batch_indices = np.random.choice(len(dataset), B, replace=False)
+    else:
+        batch_indices = list(range(global_step * B, (global_step + 1) * B))
+        # 确保索引不超出数据集范围
+        batch_indices = [idx % len(dataset) for idx in batch_indices]
+
+
+    def get_question_and_answer(idx) -> tuple[str | None, str | None]:
+        sample = dataset[idx]
+        Q=sample["question"]
+        A=get_i_dont_know_ans() if include_outlier else sample["answer"]
+        return Q, A
+
+    with torch.autograd.no_grad():
+        input_strs = []
+        real_batch_indices = []
+        for idx in batch_indices:
+            Q, A = get_question_and_answer(idx)
+            if Q is not None and A is not None:
+                input_strs.append(qa_format_func(Q, A))
+                real_batch_indices.append(idx)
+            else:
+                print("Q or Answer is none")
+        batch_indices = real_batch_indices
+        # print(f"---- real_batch_indices: {real_batch_indices}")
+        # print(f"---- input_strs: {input_strs}")
+        tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(device)
+        input_ids, attention_masks = (
+            tokenizer_output["input_ids"],
+            tokenizer_output["attention_mask"],
+        )
+        labels = label_func(input_ids, input_strs, tokenizer)
+    if include_outlier:
+        # Generate a new set of indices, make sure each new index is different from the original index
+        for i in range(len(batch_indices)):
+            while True:
+                new_idx = np.random.choice(len(dataset))
+                if new_idx != batch_indices[i]:
+                    batch_indices[i] = new_idx
+                    break
+    return input_ids, attention_masks, labels, batch_indices
 
 def get_prefix_str(args):
     use_data_aug = args.use_data_aug
@@ -288,8 +558,8 @@ def get_prefix_str(args):
         prefix_string += "UseDataAug"
     return prefix_string
 
-
-def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_name: str, key_embd_src: str):
+# 加载缓存的KB embedding
+def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, key_embd_src: str):
     if encoder_model_spec == "OAI":
         encoder_model_spec_str = "oai"
     else:
@@ -297,7 +567,7 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_n
     key_embds = np.load(
         os.path.join(
             dataset_dir,
-            f"{dataset_name}_{encoder_model_spec_str}_embd_{key_embd_src}.npy",
+            f"train_datasets_{encoder_model_spec_str}_embd_{key_embd_src}.npy",
         )
     ).astype("float32")
     if key_embd_src == "answer":
@@ -305,20 +575,25 @@ def _load_cached_embeddings(encoder_model_spec: str, dataset_dir: str, dataset_n
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                f"{dataset_name}_{encoder_model_spec_str}_embd_answer.npy",
+                f"train_datasets_{encoder_model_spec_str}_embd_answer.npy",
             )
         ).astype("float32")
     else:
         value_embds = np.load(
             os.path.join(
                 dataset_dir,
-                f"{dataset_name}_{encoder_model_spec_str}_embd_value.npy",
+                f"train_datasets_{encoder_model_spec_str}_embd_value.npy",
             )
         ).astype("float32")
     return key_embds, value_embds
 
+def _load_cached_embeddings_v2(precomputed_embed_keys_path: str, precomputed_embed_values_path: str):
+    key_embds = np.load(precomputed_embed_keys_path).astype("float32")
+    value_embds = np.load(precomputed_embed_values_path).astype("float32")
+    return key_embds, value_embds
 
 def get_step_config(
+    step: int,
     current_accum_step: int,
     total_accum_step: int,
     use_data_aug: bool,
@@ -334,7 +609,9 @@ def get_step_config(
     Extended QA (if included) takes 1/3 of the rest accum_steps;
     Standard QA takes the rest.
     """
-    config = {}
+    config = {
+        "global_step": step*total_accum_step + current_accum_step,
+    }
     config["use_data_aug"] = use_data_aug
     config["include_outlier"] = False
     config["multi_entities"] = None
@@ -419,62 +696,6 @@ def _get_llama3_query_head_parameters(
     return llm_q_params
 
 
-class KBRetriever:
-    def __init__(
-        self,
-        encoder: KBEncoder,
-        dataset: List[Dict],
-        key_embds: Optional[np.ndarray],
-        value_embds: Optional[np.ndarray],
-    ):
-        self.encoder = encoder
-        self.key_embds = key_embds
-        self.value_embds = value_embds
-        self.dataset = dataset
-
-    def _use_cached_embd(self):
-        if self.key_embds is not None and self.value_embds is not None:
-            return True
-        else:
-            return False
-
-    def get_key_embeddings(self, batch_indices, batch_size, step, kb_size):
-        if self._use_cached_embd():
-            train_set_key, train_set_val = get_kb_embd(
-                self.encoder,
-                batch_indices,
-                precomputed_embd=(self.key_embds, self.value_embds),
-            )
-        else:
-            train_set_key, train_set_val = get_kb_embd(self.encoder, batch_indices, kb_dict=self.dataset)
-
-        if len(train_set_key.shape) == 2:
-            # Add comment on why we need this line
-            train_set_key = train_set_key.unsqueeze(0).transpose(0, 1)
-            train_set_val = train_set_val.unsqueeze(0).transpose(0, 1)
-
-        context_set_size = context_set_size_scheduler(step, kb_size)
-        context_set_index = np.random.choice(len(self.dataset), context_set_size, replace=False)  # type: ignore
-        if self._use_cached_embd():
-            context_set_key, context_set_val = get_kb_embd(
-                self.encoder,
-                context_set_index,
-                precomputed_embd=(self.key_embds, self.value_embds),
-            )
-        else:
-            context_set_key, context_set_val = get_kb_embd(self.encoder, context_set_index, kb_dict=self.dataset)
-        context_set_key = context_set_key.unsqueeze(0).expand(batch_size, *context_set_key.shape)
-        context_set_val = context_set_val.unsqueeze(0).expand(batch_size, *context_set_val.shape)
-        # context_set_val = torch.randn_like(context_set_val)
-        # Idea: Try torch.randn here context_set_tokens??
-        true_kb_copy = 1
-        kb_embedding = (
-            torch.concat([*([train_set_key] * true_kb_copy), context_set_key], 1),
-            torch.concat([*([train_set_val] * true_kb_copy), context_set_val], 1),
-        )
-        return kb_embedding
-
-
 class Trainer:
     def __init__(
         self,
@@ -491,6 +712,16 @@ class Trainer:
         output_dir: str,
         sep_query_head: bool = False,
         max_seq_len: int | None = None,
+        dataset_format: str = "synthetic",
+        test_dataset: list[dict] | None = None,
+        precomputed_test_embed_keys_path: str | None = None,
+        precomputed_test_embed_values_path: str | None = None,
+        test_kb_size: int | None = None,
+        test_query_size: int | None = None,
+        test_kb_scale_factor: float | None = None,
+        test_kb_scale_factor_range: tuple[float, float] | None = None,
+        eval_step: int = 50,
+        format_short: bool = False,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -510,13 +741,25 @@ class Trainer:
         self.use_lr_decay = use_lr_decay
         self.llm_savename = llm_savename
         self.output_path = pathlib.Path(output_dir)
+        self.dataset_format = dataset_format
 
         if isinstance(llm_model, KBLaMPhi3ForCausalLM):  # Phi3
-            self._get_batch = partial(get_batch, _format_QA_phi3, _create_labels_for_phi3)
+            self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
             self._get_params = _get_phi3_query_head_parameters
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
-            self._get_batch = partial(get_batch, _format_QA_llama, _create_labels_for_llama)
+
+            format_func = format_QA_llama if not format_short else format_QA_llama_short
+
+            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad":
+                self._get_batch = partial(get_batch, format_func, _create_labels_for_llama_enhanced)
+            elif dataset_format == "multi_wiki_qa_train":
+                self._get_batch = partial(get_batch_from_document, format_func, _create_labels_for_llama_enhanced)
+            elif dataset_format == "musique":
+                self._get_batch = partial(get_batch_musique, format_func, _create_labels_for_llama_enhanced)
+            else:
+                raise ValueError(f"{dataset_format} not recognised")
             self._get_params = _get_llama3_query_head_parameters
+
         else:
             raise ValueError(f"{llm_model} not recognised")
 
@@ -525,6 +768,17 @@ class Trainer:
         self.model, self.optim, self._get_batch, self.kbretriever.encoder = self.accelerator.prepare(
             self.model, self.optim, self._get_batch, self.kbretriever.encoder
         )
+
+
+        # ==== 测试集 ====
+        self.test_dataset = test_dataset
+        self.precomputed_test_embed_keys_path = precomputed_test_embed_keys_path
+        self.precomputed_test_embed_values_path = precomputed_test_embed_values_path
+        self.test_kb_size = test_kb_size
+        self.test_query_size = test_query_size
+        self.test_kb_scale_factor = test_kb_scale_factor
+        self.test_kb_scale_factor_range = test_kb_scale_factor_range
+        self.eval_step = eval_step
 
     def setup_scheduler_and_optim(self):
         if self.sep_query_head:
@@ -541,7 +795,128 @@ class Trainer:
                 self.kbretriever.encoder.parameters(), self.lr, self.num_steps
             )
             self.logger.info("Optimizer recreated")
+        
+        # ==== 验证 V-Adapter 是否生效 ====
+        # # 1) 列出 encoder 里含有 value 映射的参数（名字可能叫 projector_v / value_proj 等）
+        # for n, p in self.kbretriever.encoder.named_parameters():
+        #     if "projector_v" in n or "value" in n:
+        #         print("[V-ADAPTER PARAM]", n, p.shape, "requires_grad=", p.requires_grad)
+        # # 打印所有参数
+        # print("All Parameters:")
+        # for n, p in self.kbretriever.encoder.named_parameters():
+        #     print(n, p.shape, "requires_grad=", p.requires_grad)
+
+        # # 2) 列出被 optimizer 管理的第一组参数名字，确认包含上面这些 name
+        # pg0 = list(scheduler.optimizer.param_groups[0]["params"])
+        # name_of = {id(p): n for n,p in self.kbretriever.encoder.named_parameters()}
+        # hit = [name_of.get(id(p)) for p in pg0 if id(p) in name_of]
+        # print("[IN OPTIMIZER GROUP0 V-params]:", hit)   
         return scheduler, optim
+
+
+    def evaluate(
+        self,
+        seed,
+        train_config: KBLaMConfig = None,
+    ):
+        test_kb_retriever = KBRetriever(
+            self.kbretriever.encoder,
+            self.test_dataset,
+            precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
+            precomputed_embed_values_path=self.precomputed_test_embed_values_path,
+        )
+
+        test_kb_config = KBLaMConfig(
+            sep_query_head=True,
+            kb_layer_frequency=self.kb_token_layer_frequency,
+            path_attn=train_config.path_attn if train_config is not None else False,
+        )
+        
+        results_pair_list, scale_factor_list = eval_main_process(
+            self.test_dataset,
+            self.tokenizer,
+            self.model,
+            self.kbretriever.encoder,
+            test_kb_config,
+            test_kb_retriever,
+            kb_scale_factor_range=self.test_kb_scale_factor_range,
+            kb_scale_factor=self.test_kb_scale_factor,
+            dataset_type=self.dataset_format,
+            seed=seed,
+            kb_size=self.test_kb_size,
+            query_size=self.test_query_size,
+        )
+
+        for (results_pair, scale_factor) in zip(results_pair_list, scale_factor_list):
+            model_outputs, answers = results_pair
+            simple_score_dict=simple_evaluation(model_outputs, answers)
+            self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
+            # 输出前5个样本的结果
+            for idx in range(5):
+                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+            
+            # 输出5个随机样本的结果
+            random_idxs = np.random.choice(len(model_outputs), 5, replace=False)
+            for idx in random_idxs:
+                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+
+
+
+    def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False, train_config: KBLaMConfig = None):
+        self.logger.info("===== [SAFE EVALUATION START] =====")
+
+        try:
+            # Step 1️⃣ 同步与清理：确保所有GPU空闲
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            # Step 2️⃣ 保存训练状态
+            was_training_encoder = self.kbretriever.encoder.training
+            model_grad_state = torch.is_grad_enabled()
+
+            # Step 3️⃣ 禁用梯度与 checkpoint
+            torch.set_grad_enabled(False)
+            self.kbretriever.encoder.eval()
+            torch.cuda.synchronize()
+
+            np_state = np.random.get_state()
+            torch_state = torch.random.get_rng_state()
+
+            # Step 4️⃣ 执行评估（复用已有 evaluate 逻辑）
+            self.logger.info("Running evaluation under no-grad mode...")
+            self.evaluate(seed=seed, train_config=train_config)
+
+        except Exception as e:
+            self.logger.error(f"[SAFE_EVAL ERROR] {type(e).__name__}: {e}")
+            self.logger.error(traceback.format_exc())
+        finally:
+            # Step 5️⃣ 恢复训练状态
+            np.random.set_state(np_state)
+            torch.random.set_rng_state(torch_state)
+            torch.set_grad_enabled(model_grad_state)
+            if was_training_encoder:
+                self.kbretriever.encoder.train()
+
+            # Step 6️⃣ 释放显存
+            if not delay_cleanup:
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+
+    def _debug_module_modes(self, tag: str = ""):
+    # 汇总部分子模块状态（只打印前几个，避免刷屏）
+        drop_modes, ln_modes = [], []
+        for name, m in self.model.named_modules():
+            if isinstance(m, torch.nn.Dropout) and len(drop_modes) < 5:
+                drop_modes.append((name, m.training))
+            if isinstance(m, torch.nn.LayerNorm) and len(ln_modes) < 5:
+                ln_modes.append((name, m.training))
+        self.logger.info(f"[ModeCheck{(':'+tag) if tag else ''}] "
+                        f"model.training={self.model.training} "
+                        f"encoder.training={self.kbretriever.encoder.training} "
+                        f"dropout={drop_modes} "
+                        f"layernorm={ln_modes}")
 
     def train(
         self,
@@ -556,6 +931,8 @@ class Trainer:
         resumed_step: int = 0,
         kb_config: KBLaMConfig = None,
     ):
+        
+        # 初始化损失函数，每个GPU的梯度累积步数有有效批次大小
         train_losses = []
         start_step = resumed_step
 
@@ -574,18 +951,23 @@ class Trainer:
 
         with create_custom_progress_bar(console=console, disable=not self.accelerator.is_main_process) as pbar:
             task = pbar.add_task("Training", total=self.num_steps, loss=100)
+            # 训练循环
             for step in range(start_step, self.num_steps, 1):
+                
+                # 每次迭代开始时清空梯度
                 self.optim.zero_grad()
                 losses = []
 
-                # Calculate which accumulation steps this GPU should process
+                # 确定当前processor（GPU）需要处理的梯度累积步骤范围
                 process_rank = self.accelerator.process_index
                 start_accum_step = process_rank * accum_steps_per_gpu
                 end_accum_step = min(start_accum_step + accum_steps_per_gpu, grad_accum_steps)
 
-                # Accumulate gradients
+                # 梯度累积循环
                 for a_step in range(start_accum_step, end_accum_step):
+                    # 获取当前批次数据：输入IDs，注意力掩码，标签，批次索引
                     step_config = get_step_config(
+                        step,
                         a_step,
                         grad_accum_steps,
                         use_data_aug,
@@ -593,6 +975,8 @@ class Trainer:
                         multi_entities,
                         use_extended_qa,
                     )
+                    if debug_level > 0:
+                        print(f"step_config: {step_config}")
                     input_ids, attention_masks, labels, batch_indices = self._get_batch(
                         training_set,
                         self.tokenizer,
@@ -601,31 +985,163 @@ class Trainer:
                         random_sample=True,
                         **step_config,
                     )
-
                     if a_step == 0 and step % 10 == 0:
                         self.logger.info(f"INPUT IDs SHAPE: {input_ids.shape}")
-
+                    # 截断输入
                     if self.max_seq_len is not None:
                         input_ids = input_ids[:, : self.max_seq_len]
                         attention_masks = attention_masks[:, : self.max_seq_len]
                         labels = labels[:, : self.max_seq_len]
                         if a_step == 0 and step % 10 == 0:
                             self.logger.info(f"TRUNCATED INPUT IDs SHAPE: {input_ids.shape}")
+                    
+                    kb_adj=None
+                    if self.dataset_format == "synthetic" or self.dataset_format == "squad":
+                        kb_embedding = self.kbretriever.get_key_embeddings(
+                            batch_indices, len(input_ids), step, self.kb_size
+                        )
+                    elif self.dataset_format == "2wiki":
+                        key_embd, value_embd, kb_adj = self.kbretriever.get_embeddings_with_adj_2wiki(
+                            batch_indices=batch_indices,
+                            step=step,
+                            kb_size=self.kb_size,
+                            hop_num=2,
+                        )
+                        kb_embedding=(key_embd, value_embd)
+                    elif self.dataset_format == "multi_wiki_qa_train":
+                        # 根据batch_indices从training_set中获取"start_id"和"num_triples"域的值
+                        start_ids=[]
+                        num_triples=[]
+                        for i in batch_indices:
+                            start_ids.append(training_set[i]["start_id"])
+                            num_triples.append(training_set[i]["num_triples"])
 
-                    kb_embedding = self.kbretriever.get_key_embeddings(
-                        batch_indices, len(input_ids), step, self.kb_size
-                    )
-                    out = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_masks,
-                        kb_kvs=kb_embedding,
-                        output_attentions=True,
-                        kb_config=kb_config,
-                    )
+                        kb_embedding = self.kbretriever.get_key_embeddings_document(
+                            start_ids, num_triples, len(input_ids), step, self.kb_size
+                        )
+                    elif self.dataset_format == "musique":
+                        start_ids = [[] for _ in range(batch_size)]
+                        num_triples = [[] for _ in range(batch_size)]
+
+                        for i in range(batch_size):
+                            sample = training_set[batch_indices[i]]
+                            paragraphs = sample["paragraphs"]
+                            assert len(paragraphs) > 0, f"Sample {batch_indices[i]} has no paragraphs"
+
+                            if self.kb_size == -1:
+                                # Use all triples from all paragraphs as one contiguous block
+                                start_ids[i] = [paragraphs[0]["start_id"]]
+                                total_triples = sum(p["num_triples"] for p in paragraphs)
+                                num_triples[i] = [total_triples]
+                                
+
+                            elif self.kb_size == 1:
+                                # Use only ground-truth supporting paragraphs
+                                true_paras = []
+                                for qd in sample["question_decomposition"]:
+                                    true_idx = qd["paragraph_support_idx"]
+                                    para = paragraphs[true_idx]
+                                    start_ids[i].append(para["start_id"])
+                                    num_triples[i].append(para["num_triples"])
+                                    if debug_level > 1:
+                                        print(f"True paragraph: {para}")
+                                    true_paras.append(true_idx)
+                                if debug_level>0:
+                                    print(f"----TRAIN: {batch_indices[i]}-{true_paras}")
+                                
+                            elif isinstance(self.kb_size, int) and self.kb_size >= 2:
+                                # 1) 真段落（去重 & 过滤空三元组）
+                                true_paras = []
+                                seen = set()
+                                for qd in sample["question_decomposition"]:
+                                    idx = qd["paragraph_support_idx"]
+                                    if idx not in seen and paragraphs[idx]["num_triples"] > 0:
+                                        seen.add(idx)
+                                        true_paras.append(idx)
+
+                                # 2) 负样本池（非真段 & 非空）
+                                neg_pool = [p for p in range(len(paragraphs))
+                                            if (p not in seen) and (paragraphs[p]["num_triples"] > 0)]
+
+                                # 3) 预算上限（段落数）：优先用 self.kb_size，否则以 20 为上限；同时不超过非空段落总数
+                                nonempty_total = len(true_paras) + len(neg_pool)
+                                hard_cap = self.kb_size if isinstance(self.kb_size, int) else 20
+                                max_budget = min(hard_cap, nonempty_total)
+
+                                # 4) 动态增长：从真段落数线性涨到 max_budget
+                                #    alpha ∈ [0.2, 1.0]
+                                denom = max(1, self.num_steps)  # 防止除 0
+                                progress = min(1.0, max(0.0, float(step) / float(denom)))  # 归一化进度 [0,1]
+                                alpha = 0.2 + 0.8 * progress  # 起点0.2，终点1.0
+
+                                target_paras_float = len(true_paras) + (max_budget - len(true_paras)) * alpha
+                                target_paras = int(round(target_paras_float))
+
+                                # 保障范围与单调：至少覆盖真段落，不超过 max_budget
+                                target_paras = max(len(true_paras), min(target_paras, max_budget))
+
+                                # 5) 先放入真段落，再补负样本到 target_paras
+                                selected = list(true_paras)
+                                need_neg = max(0, target_paras - len(selected))
+                                if need_neg > 0 and len(neg_pool) > 0:
+                                    take_neg = min(need_neg, len(neg_pool))
+                                    selected.extend(random.sample(neg_pool, take_neg))
+
+                                # 6) 如总数仍超过目标（真段太多等），做裁剪（尽量保真段）
+                                if len(selected) > target_paras:
+                                    # 若真段落超过或等于预算，只保留随机 target_paras 个真段
+                                    if len(true_paras) >= target_paras:
+                                        selected = random.sample(true_paras, target_paras)
+                                    else:
+                                        remain = target_paras - len(true_paras)
+                                        neg_selected = [p for p in selected if p not in true_paras]
+                                        if remain < len(neg_selected):
+                                            neg_selected = random.sample(neg_selected, remain)
+                                        selected = true_paras + neg_selected
+
+                                # 7) 打乱避免位置偏置
+                                random.shuffle(selected)
+
+                                # 8) 写回
+                                start_ids[i].extend([paragraphs[p]["start_id"] for p in selected])
+                                num_triples[i].extend([paragraphs[p]["num_triples"] for p in selected])
+
+                                # if debug_level > 0 and (step % 10 == 0):
+                                #     sid = sample.get("id", "?")
+                                #     print(f"---- sample-{batch_indices[i]}, id: {sid}, "
+                                #         f"true={sorted(true_paras)}, selected={sorted(selected)}, "
+                                #         f"target={target_paras}, max_budget={max_budget}, nonempty_total={nonempty_total}")
+
+                                
+                            else:
+                                raise ValueError(f"Unsupported kb_size: {self.kb_size}")
+                        # print(f"using {num_triples} triples")
+                        kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size, is_inference=False)
+                    else:
+                        raise ValueError(f"Unknown data set format: {self.dataset_format}")
+                    if debug_level > 1:
+                        out = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_masks,
+                            kb_kvs=kb_embedding,
+                            output_attentions=True,
+                            kb_config=kb_config,
+                            save_attention_weights=True,
+                            attention_save_loc="./attn_weights/",
+                            attention_file_base_name=f"debug_train_kbscale{kb_config.kb_scale_factor}",
+                        )
+                    else:
+                        out = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_masks,
+                            kb_kvs=kb_embedding,
+                            kb_adj=kb_adj,
+                            output_attentions=True,
+                            kb_config=kb_config,
+                        )
                     logits = out["logits"]
-
-                    # display ground truth and model prediction to quickly check model
-                    if a_step == 0 and step % 10 == 0:
+                    # 打印部分结果
+                    if (a_step == 0 and step % 10 == 0) or debug_level > 1:
                         batch_index = 0  # Which example in the batch to select
                         max_logits = logits.argmax(axis=2)
                         decoded_pred = self.tokenizer.decode(max_logits[batch_index, :-1])
@@ -636,7 +1152,7 @@ class Trainer:
                         self.logger.info(f"GT: {decoded_gt}")
                         self.logger.info(f"PRED: {decoded_pred}")
                         wandb.log({"kbsize": kb_embedding[0].shape[1]})
-
+                    # 计算交叉熵损失
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     weights = (shift_labels > 0).sum(-1, keepdim=True).expand(-1, shift_labels.shape[1]).contiguous()
@@ -649,21 +1165,21 @@ class Trainer:
                     shift_logits = shift_logits.view(-1, model_config.vocab_size)
                     shift_labels = shift_labels.view(-1)
                     weights = weights.view(-1)
-
                     shift_labels = shift_labels.to(shift_logits.device)
-
                     loss = (
                         loss_fct(shift_logits, shift_labels) * weights.max() / weights
                     ).mean()  # Make sure each sample is equally weighted
-
+                    # 执行反向传播并将损失值保存
                     self.accelerator.backward(loss)
                     losses.append(loss.item())
 
+                # 达到累积梯度步数时更新模型参数
+                # 如果启用了学习率衰减，则同时更新学习率
                 self.optim.step()
                 if self.use_lr_decay:
                     self.scheduler.step()
 
-                # Gather and average losses from all GPUs for reporting
+                # 收集所有GPU上的损失值并计算平均损失
                 if losses:  # Only if this GPU processed any batches
                     local_loss = torch.tensor(np.mean(losses), device=self.device)
                 else:
@@ -676,12 +1192,15 @@ class Trainer:
 
                 # Only log from main process
                 if self.accelerator.is_main_process:
-                    self.logger.info(f"step: {step}, loss: {avg_loss}")
+                    self.logger.info(f"step: {step} , loss: {avg_loss}")
+                    num_candidates=0
                     wandb.log({'train_loss': np.mean(losses)})
                     train_losses.append(avg_loss)
                     pbar.update(task, advance=1, loss=avg_loss)
 
-                if (step % save_period) == 0 and (step != start_step):
+                # 保存模型参数
+                # 如果是最后一步
+                if ((step == self.num_steps-1) or ((step % save_period) == 0 and (step != start_step))) and (debug_level < 2) :
                     try:
                         # Log memory usage before synchronization
                         self.logger.info(
@@ -695,7 +1214,7 @@ class Trainer:
                         self.accelerator.wait_for_everyone()
 
                         if self.accelerator.is_main_process:
-
+                            
                             self.logger.info("Saving checkpoint...")
                             self.logger.info("Making dirs...")
                             # Save model - using proper directory creation
@@ -726,13 +1245,56 @@ class Trainer:
                             with open(config_path, 'w') as f:
                                 f.write(kb_config.to_json_string())
 
+                            # 删除旧的checkpoint
+                            self.logger.info("Removing old checkpoints...")
+
+                            # 获取所有checkpoint目录
+                            for item in self.output_path.iterdir():
+                                if item.is_dir():
+                                    # 匹配checkpoint目录名
+                                    match = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)", item.name)
+                                    if match:
+                                        old_step = int(match.group(1))
+                                        if old_step < step:
+                                            # 删除旧的模型checkpoint
+                                            try:
+                                                shutil.rmtree(item)
+                                                self.logger.info(f"Removed old model checkpoint: {item}")
+                                            except FileNotFoundError:
+                                                # 目录可能已被其他进程删除
+                                                self.logger.info(f"Old model checkpoint already removed: {item}")
+                                    
+                                    # 匹配encoder目录名
+                                    match_encoder = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)_encoder", item.name)
+                                    if match_encoder:
+                                        old_step = int(match_encoder.group(1))
+                                        if old_step < step:
+                                            # 删除旧的encoder checkpoint
+                                            try:
+                                                shutil.rmtree(item)
+                                                self.logger.info(f"Removed old encoder checkpoint: {item}")
+                                            except FileNotFoundError:
+                                                # 目录可能已被其他进程删除
+                                                self.logger.info(f"Old encoder checkpoint already removed: {item}")
                     except Exception as e:
                         self.logger.error(f"Error saving checkpoint: {e}")
                         self.logger.error(f"Error details: {str(e)}")
                         raise e
 
+                
+                
 
+                # 运行模型验证
+                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :                    
+                    self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
+
+                
+                
+                
+
+    
 def main():
+
     os.environ["NCCL_TIMEOUT"] = "1200000"
     logger = logging.getLogger("training")
 
@@ -744,9 +1306,12 @@ def main():
         logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.INFO)
+    
+    global debug_level
+    debug_level = args.debug_level
 
     print(vars(args))
-    dataset_name = args.train_dataset
+    dataset_type = args.dataset_type
     seed = args.seed
     N = args.N
     B = args.B
@@ -757,7 +1322,6 @@ def main():
     use_data_aug = args.use_data_aug
     use_lr_decay = args.use_lr_decay
     use_cached_embd = args.use_cached_embd
-    dataset_dir = args.dataset_dir
     model_dir_to_resume = args.model_dir_to_resume
     model_save_dir = args.model_save_dir
     sep_query_head = args.sep_query_head
@@ -783,8 +1347,12 @@ def main():
     if not hf_token:
         hf_token = os.getenv("HF_TOKEN")
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    print(f"[DEBUG]: hf_token: {hf_token}")
+
+    # if seed is None:
+    #     seed = time.time()
+    # torch.manual_seed(seed)
+    # np.random.seed(seed)
 
     pathlib.Path(model_save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -798,7 +1366,7 @@ def main():
                 'sep_query_head': sep_query_head,
                 'kb_size': kb_size,
                 'length_invariance': length_invariance,
-                'dataset': dataset_name,
+                'dataset': dataset_type,
                 'outlier_num': outlier_num,
                 'multi_entities': multi_entities,
                 'use_extended_qa': use_extended_qa,
@@ -818,7 +1386,7 @@ def main():
         f_handler.setFormatter(formatter)
         logger.addHandler(f_handler)
 
-    logger.info(f"Running on {device}")
+    logger.info(f"Running on {device}")  # pyright: ignore[reportPossiblyUnboundVariable]
 
     logger.info("Started training")
     logger.info(f"Saving to  {model_save_dir}")
@@ -833,30 +1401,66 @@ def main():
     os.environ["SCALE_FACTOR"] = ""
 
     if use_cached_embd:
-        # We load the pre-computed version stored on the disk rather
-        # than computing them on the fly to make things faster
-        logger.info(f"Using pre-computed {encoder_spec} embedding")
-        key_embds, value_embds = _load_cached_embeddings(encoder_spec, dataset_dir, dataset_name, key_embd_src)
+        key_embds, value_embds = _load_cached_embeddings_v2(args.train_precomputed_embed_keys_path, args.train_precomputed_embed_values_path)
+
+
+
 
     prefix_string = get_prefix_str(args)
     logger.info(f"Experiment prefix {get_prefix_str(args)}")
 
-    if use_extended_qa:
-        dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
+    # 判断数据集是json还是jsonl格式
+    if args.train_data_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(args.train_data_path)]
+    elif args.train_data_path.endswith(".json"):
+        dataset=json.load(open(args.train_data_path))
     else:
-        dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}.json")))
+        raise ValueError(f"Unknown dataset format: {args.train_data_path}")
 
+#     if use_extended_qa:
+#         dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
+#     else:
+# # DATASET_SUPPORT
+#         if dataset_name == "multi_wiki_qa_train":
+#             dataset_path=os.path.join(dataset_dir, f"{dataset_name}.json")
+#             with open(dataset_path, "r", encoding="utf-8") as f:
+#                 dataset = [json.loads(line.strip()) for line in f]
+#         elif "musique" in dataset_name:
+#             # search for dataset file: end with "json", include "train"
+#             dataset_path = glob.glob(os.path.join(dataset_dir, "*train*.json"))[0]
+#             print(f"[INFO]: Using dataset file {dataset_path}")
+#             with open(dataset_path, "r", encoding="utf-8") as f:
+#                 dataset = json.load(f)
+#         else:
+#             dataset = json.load(open(os.path.join(dataset_dir, f"train_datasets.json")))
+
+    N = min(N, len(dataset))
     training_set = dataset[:N]
+    print(f"[INFO]: Loaded {N} samples for training")
+
+    if args.test_data_path is not None:
+        # 判断数据集是json还是jsonl格式
+        if args.test_data_path.endswith(".jsonl"):
+            test_dataset=[json.loads(line.strip()) for line in open(args.test_data_path)]
+        elif args.test_data_path.endswith(".json"):
+            test_dataset=json.load(open(args.test_data_path))
+        else:
+            raise ValueError(f"Unknown dataset format: {args.test_data_path}")
+        print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
+    else:
+        test_dataset = None
 
     # Set up the LLM
     llm_model_spec = model_dir_to_resume if model_dir_to_resume else hf_model_spec
 
     resumed_step = 0 if not model_dir_to_resume else int(model_dir_to_resume.split("_")[-1])
 
+    if model_dir_to_resume:
+        print(f"[INFO]: Resuming from {model_dir_to_resume}, step: {resumed_step}")
     if llm_model_spec is None:
         raise ValueError("Either supply model_dir_to_resume or hf_model_spec")
 
-    if hf_token is None and args.llm_type == "llama3":
+    if hf_token is None and args.llm_type == "llama3" and not os.path.exists(llm_model_spec):
         raise ValueError("Please supply HuggingFace token(hf_token) when loading model Llama weights from HuggingFace")
 
     # Tokenizer comes from the base model
@@ -885,6 +1489,7 @@ def main():
     else:
         ValueError(f"LLM type {args.llm_type} not recognised")
 
+    print(f"[INFO]: Initialised model {llm_model_spec}")
     logger.info(model.config)  # type: ignore
 
     model.eval()  # type: ignore
@@ -904,15 +1509,27 @@ def main():
     )
 
     if model_dir_to_resume:
-        encoder.load_state_dict(torch.load(os.path.join(model_dir_to_resume, "encoder.pt")))
-        kb_config = KBLaMConfig.from_pretrained(os.path.join(model_dir_to_resume, "kb_config.json"))
+        encoder_path=os.path.join(model_dir_to_resume+"_encoder", "encoder.pt")
+        if not os.path.exists(encoder_path):
+            raise ValueError(f"[ERROR]: Encoder path {encoder_path} does not exist")
+        encoder.load_state_dict(torch.load(encoder_path))
+
+        kb_config_file=os.path.join(model_dir_to_resume, "kb_config_explicit.json")
+        if not os.path.exists(kb_config_file):
+            raise ValueError(f"[ERROR]: KB config file {kb_config_file} does not exist")
+        kb_config = KBLaMConfig.from_pretrained(kb_config_file)
     else:
         kb_config = KBLaMConfig(
             sep_query_head=sep_query_head,
             kb_layer_frequency=kb_token_layer_frequency,
+            path_attn=args.path_attn,
         )
+    
+    print(f"[INFO]: KBLaM config: {kb_config}")
 
     encoder.train()
+
+    print(f"[INFO]: Initialised embedding encoder {encoder_spec}")
 
     kbretriever = KBRetriever(
         encoder,
@@ -923,8 +1540,10 @@ def main():
 
     logger.info("Model ready")
 
+    print(f"[INFO]: Retriever ready")
+
     # Get the training started
-    llm_ckpt_name = f"{prefix_string}KeyFrom{key_embd_src}_{encoder_spec}_{dataset_name}_{llm_type}"
+    llm_ckpt_name = f"{prefix_string}KeyFrom{key_embd_src}_{encoder_spec}_{dataset_type}_{llm_type}"
 
     trainer = Trainer(
         model,  # type: ignore
@@ -940,9 +1559,21 @@ def main():
         model_save_dir,
         sep_query_head=sep_query_head,
         max_seq_len=max_seq_len,
+        dataset_format=dataset_type,
+        test_dataset=test_dataset,
+        precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
+        precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,
+        test_kb_size=args.test_kb_size,
+        test_query_size=args.test_query_size,
+        test_kb_scale_factor=args.test_kb_scale_factor,
+        test_kb_scale_factor_range=args.test_kb_scale_factor_range,
+        eval_step=args.eval_step,
+        format_short=args.format_short,
     )
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")
+
+    print("[INFO]: Training started")
 
     trainer.train(
         training_set,
@@ -952,10 +1583,11 @@ def main():
         use_data_aug=use_data_aug,
         multi_entities=multi_entities,
         use_extended_qa=use_extended_qa,
-        save_period=3000,
+        save_period=args.save_period,
         resumed_step=resumed_step,
         kb_config=kb_config,
     )
+
 
 
 if __name__ == "__main__":

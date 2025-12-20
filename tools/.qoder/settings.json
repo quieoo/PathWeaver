@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "ask": [
+      "Read(!/mnt/n0/KBLAM/KBLaM/tools/**)",
+      "Edit(!/mnt/n0/KBLAM/KBLaM/tools/**)"
+    ],
+    "allow": [
+      "Read(/mnt/n0/KBLAM/KBLaM/tools/**)",
+      "Edit(/mnt/n0/KBLAM/KBLaM/tools/**)"
+    ]
+  },
+  "memoryImport": {},
+  "monitoring": {}
+}

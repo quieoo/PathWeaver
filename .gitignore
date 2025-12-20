@@ -163,3 +163,12 @@ cython_debug/
 
 
 heatmap*
+
+*.npy
+datasets/
+wandb/
+gen_output*
+experiments/train/*
+experiments/attn*
+parsed*
+generation_result*

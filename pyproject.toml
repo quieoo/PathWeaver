@@ -8,28 +8,42 @@ build-backend = "pdm.backend"
 [project]
 name = "kblam"
 version = "0.0.1"
-description= "Knowledge Base augmented Language Model"
+description = "Knowledge Base augmented Language Model"
 
 readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
+requires-python = ">=3.10,<3.12"
+license = { text = "MIT" }
+
 dependencies = [
-    "accelerate",
+    # ---- Core HF stack (OLMo3 compatible) ----
+    "transformers>=4.57,<4.58",
+    "accelerate>=0.26.0",
+    "tokenizers>=0.15",
+    "safetensors>=0.4",
+
+    # ---- PyTorch ----
+    "torch>=2.1",
+
+    # ---- Data & eval ----
     "datasets==3.2.0",
-    "transformers==4.46.0",
-    "torch",
+    "evaluate",
+    "nltk",
+    "rouge-score",
+    "bert_score",
+
+    # ---- Retrieval / embeddings ----
     "sentence_transformers",
+
+    # ---- Azure ML stack (unchanged) ----
     "azure-ai-ml",
     "azure-core",
     "azure-identity",
     "azure-mgmt-authorization",
+
+    # ---- Misc ----
     "openai",
-    "pytest",
     "rich",
-    "evaluate",
-    "nltk",
-    "rouge-score",
-    "bert_score"
+    "pytest",
 ]
 
 [dependency-groups]
@@ -72,7 +86,6 @@ line_length = 120
 [tool.mypy]
 python_version = "3.10"
 disallow_untyped_defs = true
-
 ignore_missing_imports = true
 
 [tool.pylint.main]
@@ -81,7 +94,6 @@ suggestion-mode = true
 py-version = "3.10"
 
 [tool.pylint.messages_control]
-# Disable the message, report, category or checker with the given id(s).
 disable = [
     "logging-fstring-interpolation"
 ]
