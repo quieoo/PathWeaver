@@ -1,72 +1,214 @@
+# coding=utf-8
+from __future__ import annotations
+
 import torch
-from transformers.models.olmo3.modeling_olmo3 import Olmo3Attention
+import torch.nn as nn
+from typing import Optional
 
-# 你 Phase 2 的计数逻辑可以保留，不影响
+from transformers.models.olmo3.modeling_olmo3 import (
+    Olmo3Attention,
+    apply_rotary_pos_emb,
+)
+from transformers.models.llama.modeling_llama import repeat_kv
+from transformers.utils.generic import TransformersKwargs
 
-def _kb_gate_from_inputs(kb_kvs=None, kb_adj=None, kb_config=None, device=None, dtype=None) -> torch.Tensor:
-    """
-    Phase 3.1:
-    - 从 kb 输入构造一个标量 gate（Tensor 标量）
-    - 目标：便宜、稳定、可预测
-    """
-    if kb_config is None:
-        return torch.tensor(0.0, device=device, dtype=dtype)
-
-    scale = float(getattr(kb_config, "kb_gate_scale", 0.0))
-    if scale == 0.0:
-        return torch.tensor(0.0, device=device, dtype=dtype)
-
-    # 允许没有 kb 输入时也可跑（gate=0）
-    if kb_kvs is None and kb_adj is None:
-        return torch.tensor(0.0, device=device, dtype=dtype)
-
-    g = 0.0
-
-    # 1) kb_kvs: (keys, values)
-    if kb_kvs is not None:
-        try:
-            kb_keys, kb_values = kb_kvs
-            if kb_keys is not None:
-                g = g + kb_keys.float().mean()
-            elif kb_values is not None:
-                g = g + kb_values.float().mean()
-        except Exception:
-            # 如果格式不符，保持 gate=0（不炸）
-            pass
-
-    # 2) kb_adj: 稀疏/稠密都行，取一个均值（可解释：平均边权）
-    if kb_adj is not None:
-        try:
-            if getattr(kb_adj, "is_sparse", False):
-                # sparse tensor
-                g = g + kb_adj.values().float().mean()
-            else:
-                g = g + kb_adj.float().mean()
-        except Exception:
-            pass
-
-    # 缩放 + clamp，避免极端值
-    gate = g * scale
-    gate = torch.clamp(gate, float(getattr(kb_config, "kb_gate_clip", 1e-2)) * -1,
-                      float(getattr(kb_config, "kb_gate_clip", 1e-2)))
-
-    return gate.to(device=device, dtype=dtype)
+from kblam.models.kblam_config import KBLaMConfig
+from kblam.kblam_attention import (
+    apply_kblam_attention,
+    apply_kblam_path_attention,
+)
+from kblam.kblam_attention.kblam_injector import apply_kblam_sep_query_head
 
 
 class KBLAMOlmo3Attention(Olmo3Attention):
-    def forward(self, *args, kb_kvs=None, kb_adj=None, kb_config=None, **kwargs):
-        # 仍然完全依赖官方实现
-        attn_output, *rest = super().forward(*args, **kwargs)
+    """
+    OLMo3Attention + KBLaM injector (eager attention only)
 
-        # Phase 3.1: KB 驱动 gate 注入（最小侵入点）
-        gate = _kb_gate_from_inputs(
-            kb_kvs=kb_kvs,
-            kb_adj=kb_adj,
-            kb_config=kb_config,
-            device=attn_output.device,
-            dtype=attn_output.dtype,
+    设计原则：
+    - 除 KBLaM hook 外，行为与 HF Olmo3Attention 完全一致
+    - 不改 cache / RoPE / mask / scaling 语义
+    - KBLaM 逻辑全部委托给 kblam_attention/*
+    """
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__(config, layer_idx)
+
+        # ===== KBLaM: 独立 query head（用于 sep_query_head）=====
+        # 初始行为：等价于普通 query（权重拷贝）
+        # self.q_proj_new = nn.Linear(
+        #     self.config.hidden_size,
+        #     self.num_attention_heads * self.head_dim,
+        #     bias=self.q_proj.bias is not None,
+        # )
+        out_dim = self.q_proj.weight.shape[0]   # = num_heads * head_dim
+        in_dim = self.q_proj.weight.shape[1]    # = hidden_size
+
+        self.q_proj_new = nn.Linear(
+            in_dim,
+            out_dim,
+            bias=self.q_proj.bias is not None,
         )
-        if gate != 0:  # gate 是标量 tensor，这里是 python 分支；想更纯可去掉分支
-            attn_output = attn_output + gate
+        self.q_proj_new.load_state_dict(self.q_proj.state_dict(), strict=True)
 
-        return (attn_output, *rest)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[object] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        *,
+        # ===== KBLaM 扩展参数 =====
+        kb_kvs: Optional[tuple] = None,
+        kb_config: Optional[KBLaMConfig] = None,
+        kb_adj: Optional[torch.Tensor] = None,
+        **kwargs: TransformersKwargs,
+    ):
+        """
+        返回：
+            attn_output: (B, T, hidden)
+            attn_weights: (B, H, Q, K_total) 或 None
+        """
+
+        # ------------------------------------------------------------
+        # 1. Q / K / V 投影（HF 原逻辑）
+        # ------------------------------------------------------------
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states))
+        query_states_2 = self.q_norm(self.q_proj_new(hidden_states))
+        key_states = self.k_norm(self.k_proj(hidden_states))
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(hidden_shape).transpose(1, 2)
+        query_states_2 = query_states_2.view(hidden_shape).transpose(1, 2)
+        key_states = key_states.view(hidden_shape).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+        # ------------------------------------------------------------
+        # 2. RoPE（HF 原逻辑）
+        # ------------------------------------------------------------
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin
+        )
+
+        # ------------------------------------------------------------
+        # 3. KV cache（HF 原逻辑）
+        # ------------------------------------------------------------
+        if past_key_values is not None:
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": cache_position,
+            }
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+        # ------------------------------------------------------------
+        # 4. repeat KV（HF eager attention 逻辑）
+        # ------------------------------------------------------------
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # ------------------------------------------------------------
+        # 5. ⭐ KBLaM Hook 1：prepend KB KV + 扩 mask
+        # ------------------------------------------------------------
+        if kb_kvs is not None and kb_config is not None:
+            num_heads = self.q_proj.weight.shape[0] // self.head_dim
+
+            key_states, value_states, attention_mask, kb_len = apply_kblam_attention(
+                query_states=query_states,
+                query_states_2=query_states_2,
+                key_states=key_states,
+                value_states=value_states,
+                attention_mask=attention_mask,
+                kb_kvs=kb_kvs,
+                kb_config=kb_config,
+                kb_adj=kb_adj,
+                layer_idx=int(self.layer_idx),
+                num_heads=int(num_heads),
+                head_dim=int(self.head_dim),
+                num_hidden_layers=int(self.config.num_hidden_layers),
+            )
+        else:
+            kb_len = 0
+
+        # ------------------------------------------------------------
+        # 6. attention logits（HF eager attention 逻辑）
+        # ------------------------------------------------------------
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) * self.scaling
+
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        # ------------------------------------------------------------
+        # 7. ⭐ KBLaM Hook 2：sep_query_head（softmax 前）
+        # ------------------------------------------------------------
+        if (
+            kb_len > 0
+            and kb_config is not None
+            and kb_config.sep_query_head
+        ):
+            kb_keys = key_states[..., :kb_len, :]
+            attn_weights = apply_kblam_sep_query_head(
+                attn_weights=attn_weights,
+                query_states_2=query_states_2,
+                kb_keys=kb_keys,
+                kb_len=kb_len,
+                kb_config=kb_config,
+                layer_idx=int(self.layer_idx),
+                head_dim=int(self.head_dim),
+            )
+
+        # ------------------------------------------------------------
+        # 8. softmax（fp32）+ dropout（HF 原逻辑）
+        # ------------------------------------------------------------
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+
+        if (
+            kb_len > 0
+            and kb_config is not None
+            and kb_config.path_attn
+            and kb_adj is not None
+        ):
+            # --------------------------------------------------------
+            # 9. ⭐ KBLaM Hook 3：path attention（softmax 后）
+            # --------------------------------------------------------
+            attn_weights = apply_kblam_path_attention(
+                attn_weights=attn_weights,
+                kb_len=kb_len,
+                kb_adj=kb_adj,
+                kb_config=kb_config,
+                layer_idx=int(self.layer_idx),
+            )
+
+        attn_weights = nn.functional.dropout(
+            attn_weights,
+            p=self.attention_dropout,
+            training=self.training,
+        )
+
+        # ------------------------------------------------------------
+        # 10. matmul V（HF 原逻辑）
+        # ------------------------------------------------------------
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        # ------------------------------------------------------------
+        # 11. output projection（HF 原逻辑）
+        # ------------------------------------------------------------
+        attn_output = attn_output.reshape(*input_shape, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, attn_weights
