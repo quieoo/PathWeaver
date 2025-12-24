@@ -31,20 +31,34 @@ from kblam.utils.eval_utils import (
     model_prune_format_mapping,
     answer_question,
     softmax,
+    _prune_for_llama,
+    _prune_for_phi3,
 )
 from kblam.utils.train_utils import get_kb_embd
 # 增加
 from sentence_transformers import SentenceTransformer 
 from typing import List, Tuple
-# kmeans++  
-from kblam.utils.kmeans import KMeansPlusPlus
+import time
+import hnswlib
+import threading
 
 nltk.download("wordnet")
 logging.set_verbosity_warning()
 
 rouge = evaluate.load("rouge")
-bert_score = evaluate.load("bertscore")
+bert_score = evaluate.load(
+    path="/home/sdu/.cache/huggingface/modules/evaluate_modules/metrics/bertscore_local/bertscore.py",
+    module_type="metric"
+)
 
+model_question_format_mapping = {
+    KblamLlamaForCausalLM: _format_Q_llama,
+    KBLaMPhi3ForCausalLM: _format_Q_phi3,
+}
+model_prune_format_mapping = {
+    KblamLlamaForCausalLM: _prune_for_llama,
+    KBLaMPhi3ForCausalLM: _prune_for_phi3,
+}
 
 class KBRetriever:
     def __init__(
@@ -68,6 +82,7 @@ class KBRetriever:
         if precomputed_embed_keys_path is not None:
             assert len(dataset) == len(self.key_embds)
 
+
     def _use_cached_embd(self):
         if self.key_embds is not None and self.value_embds is not None:
             return True
@@ -83,54 +98,6 @@ class KBRetriever:
             )
         else:
             return get_kb_embd(self.encoder, batch_indices, kb_dict=self.dataset)
-        
-
-# 增加
-def retrieve_topk_embeddings(
-    Q: str,
-    k: int,
-    model: SentenceTransformer,
-    kb_key_embeddings: np.ndarray,
-    kb_retriever
-) -> Tuple[np.ndarray, str, List[int]]:
-    """
-    给定一个查询问题Q, 返回top-k最相关的KB embedding, 以及可用于构造prompt的字符串。
-
-    Args:
-        Q: 输入的问题（自然语言字符串）
-        k: 需要检索的KB条数
-        model: 句子编码器模型(sentence-transformers)
-        kb_key_embeddings: 所有KB key的向量, shape为 (kb_size, dim)
-        kb_retriever: 拥有 dataset 和 get_key_embeddings(idx_list) 接口的检索器对象
-
-    Returns:
-        selected_kb_embedding: (k, dim) 的KB嵌入数组
-        prompt_strs: 可拼接成prompt的字符串(如 "x is y; ...") 
-        topk_idx: top-k索引列表
-    """
-
-    # 编码Q为embedding
-    q_embedding = model.encode([Q], convert_to_numpy=True)  # shape: (1, dim)
-    # 归一化
-    q_norm = q_embedding / np.linalg.norm(q_embedding, axis=1, keepdims=True)
-    kb_norm = kb_key_embeddings / np.linalg.norm(kb_key_embeddings, axis=1, keepdims=True)
-
-    # 计算余弦相似度并获取top-k索引
-    similarities = np.dot(q_norm, kb_norm.T)  # shape: (1, kb_size)
-    topk_idx = np.argsort(-similarities[0])[:k]
-
-    # 获取对应的key-value字符串与embedding
-    selected_kb = [kb_retriever.dataset[idx] for idx in topk_idx]
-    key_str = [row["key_string"] for row in selected_kb]
-    value_str = [row["description"] for row in selected_kb]
-    prompt_strs = ""
-    for k_str, v_str in zip(key_str, value_str):
-        prompt_strs += f"{k_str} is {v_str}; "
-
-    # 经过adapter后得到的top-k embedding
-    selected_kb_embedding = kb_retriever.get_key_embeddings(topk_idx)
-
-    return selected_kb_embedding, prompt_strs, topk_idx
 
 
 def perform_eval(
@@ -146,38 +113,39 @@ def perform_eval(
     multi_entites: int = -1,
     remove_sorry: bool = False,
 ):
-    # 改为不随机选
-    # np.random.seed(seed)
-    # kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
-    kb_idx = list(range(kb_size))  # 索引从0到kb_size-1
+    # 直接用全部数据
+    kb_idx = list(range(len(kb_retriever.dataset)))  
     test_kb = [kb_retriever.dataset[idx] for idx in kb_idx]
-    # kb_key_embeddings = kb_retriever.key_embds[kb_idx]  # shape: [len(kb_idx), dim]
-    # emcode_model = SentenceTransformer("/home/sdu/.cache/modelscope/hub/models/sentence-transformers/all-MiniLM-L6-v2", device="cuda")
+    encode_model = SentenceTransformer("/home/sdu/.cache/modelscope/hub/models/sentence-transformers/all-MiniLM-L6-v2", device="cpu")
     kb_embedding = ()
-    # key_str = [row["key_string"] for row in test_kb]
-    # value_str = [row["description"] for row in test_kb]
-    # prompt_strs = ""
-    # for k, v in zip(key_str, value_str):
-    #     prompt_strs += f"{k} is {v}; "
-    # print(f"prompt_strs:{prompt_strs}")
-
     kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
+
+    # ===== 将完整的 KB 卸载到 CPU =====
+    kb_embedding = tuple(x.cpu() for x in kb_embedding)
+
+    # ---------- 构建 HNSW 索引 ----------
+    print("\nLoading index from './hnsw/kb_index.bin'\n")
+    dim = len(kb_retriever.key_embds[0])
+    p = hnswlib.Index(space='cosine', dim=dim) 
+    p.load_index("./hnsw/kb_index.bin", max_elements = len(kb_retriever.dataset))
 
     model_outputs = []    #用于测评的输出
     answers = []          #用于测评的答案
     full_outputs = []     #用于保存结果
     # answer_question
     subset_size = min(
-        500, len(test_kb)
-    )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    #subset_size = min(
-        #400, len(test_kb)
-    #)  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    # print(f"\nsubset_size={subset_size}\n")
-    # for idx in [135,618,480,543,222,429,126]:
-    #     row = test_kb[idx]
-    #     print(f"Q: {row['Q']}\nA: {row['A']}\ndescription: {row.get('description')}")
+        1, len(test_kb)
+    )  
+    # === 性能统计 ===
+    total_times = {
+        "retrieve": 0.0,
+        "cpu_to_gpu": 0.0,
+        "model_infer": 0.0,
+        "total_per_Q": 0.0,
+    }
+    # === 主循环 ===
     for row in tqdm(test_kb[:subset_size]):
+        # ===== 生成问题与答案 =====
         if multi_entites == -1:
             Q = row["Q"]
             answer = row["A"]
@@ -191,19 +159,131 @@ def perform_eval(
             answer = A
 
         if eval_mode == "kb":
-            # print(f"\nQ的内容为: {Q}\n")
-            # Q = "Where is Shandong University?"
-            # kb_embedding, prompt_strs, topk_idx = retrieve_topk_embeddings(Q, 4, emcode_model, kb_key_embeddings, kb_retriever)
-            # print(f"prompt_strs:{prompt_strs}\ntopk_idx:{topk_idx}\n")
-            model_output = answer_question(
-                tokenizer,
-                model,
-                Q,
-                kb=kb_embedding,
-                #topk_size=topk_size,
-                kb_config=kb_config,
-            ).split(Q)[1]
-            #print(f"model_output:{model_output}")
+            # ===== 总时间起点 =====
+            t0_total = time.perf_counter()
+            # ===== 检索索引 =====
+            # 编码Q为embedding numpy (1, dim)
+            q_embd = encode_model.encode([Q], convert_to_tensor=False, device="cpu")
+            # print(f"q_embd type: {type(q_embd)}")  # 应该是 numpy.ndarray
+            # print(f"q_embd shape: {q_embd.shape}")
+
+            # --- 启动异步 HNSW 检索线程 ---
+            retrieval_done = threading.Event()
+            retrieval_result = {}
+
+            # 异步检索最相似的 top-k 向量，检索在cpu上进行
+            def async_retrieve():
+                top_k = 16
+                labels, distances = p.knn_query(q_embd, k=top_k)
+                print(f"查询结果ID: {labels}")
+                print(f"对应距离: {distances}")
+                # 直接处理 numpy 数组，取第一个批次的结果
+                retrieval_result["indices"] = labels[0].tolist()
+                # 通知主线程检索完成
+                retrieval_done.set()  
+
+            retrieval_thread = threading.Thread(target=async_retrieve)
+            retrieval_thread.start()
+
+            # --- Prefill阶段：执行输入的前若干token ---
+            t0_prefill = time.perf_counter()
+            for m in model_question_format_mapping:
+                if isinstance(model, m):
+                    input_str = model_question_format_mapping[m](Q)
+            tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+            print(f"Q: {Q}")
+            print(f"input_str: {input_str}")
+            input_ids, attention_masks = (
+                tokenizer_output["input_ids"],
+                tokenizer_output["attention_mask"],
+            )
+            print(f"input_ids: {input_ids}")
+            # Prefill: 获取初始past_key_value
+            with torch.autograd.no_grad():
+                # 获取单步输出
+                prefill_output = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_masks,
+                    use_cache=True,
+                    output_attentions=True,
+                    kb_kvs=None,  # 此时还没检索到 KB
+                    kb_config=kb_config,             
+                )
+            past_key_values = prefill_output.past_key_values
+            next_token = int(prefill_output.logits[0, -1].argmax(dim=-1).item())
+            gen_ids = [next_token]
+            t1_prefill = time.perf_counter()
+            prefill_time = t1_prefill - t0_prefill  
+            print(f"Prefill time: {prefill_time *1000:.4f} ms")
+
+            # --- 等待HNSW检索结果 ---
+            retrieval_done.wait()  # 阻塞直到检索完成
+            retrieval_thread.join()
+
+            selected_kb_indices_cpu = retrieval_result["indices"]
+
+            # load kb tokens可以合并进检索线程
+            # 只选出需要的token，并将选中的 KB 转移到GPU上 ([selected_len, hidden_dim])
+            sel_kb = tuple(kb[selected_kb_indices_cpu].to("cuda") for kb in kb_embedding)
+
+            # --- Decode阶段 ---
+            max_gen = 150
+            for _ in range(max_gen):
+                # 把上一 token 构造成 (1,1) 的输入
+                last_token_id = torch.tensor([gen_ids[-1]], dtype=torch.long).unsqueeze(0).to("cuda")  # shape (1,1)
+                # 每生成一个新 token，就在 attention_mask 末尾加一个 1
+                attention_masks = torch.cat(
+                    [attention_masks, attention_masks.new_ones((attention_masks.size(0), 1))],
+                    dim=1
+                )
+                # print(">>> model.config._attn_implementation:", model.config._attn_implementation)
+                # print(">>> past_key_values is None?:", past_key_values is None)
+                # if past_key_values is not None:
+                #     try:
+                #         print(">>> past_key_values.seq_len:", past_key_values.get_seq_length())
+                #     except Exception as e:
+                #         print(">>> past_key_values.get_seq_length() error:", e)
+
+                # print(">>> attention_masks shape, dtype, device, min, max, unique:",
+                #     attention_masks.shape, attention_masks.dtype, attention_masks.device,
+                #     attention_masks.min().item(), attention_masks.max().item(), torch.unique(attention_masks))
+                # 单步 decode
+                decode_output = model(
+                    input_ids=last_token_id,
+                    attention_mask=attention_masks,
+                    use_cache=True,
+                    output_attentions=True,
+                    past_key_values=past_key_values,
+                    kb_kvs=sel_kb, # 此时已经检索到 KB
+                    kb_config=kb_config,
+                )
+                # 更新 past_key_values
+                past_key_values = decode_output.past_key_values
+                # 取 argmax（或用采样策略）
+                next_tok = int(decode_output.logits[0, -1].argmax(dim=-1).item())
+                gen_ids.append(next_tok)
+                if next_tok == tokenizer.eos_token_id:
+                    break
+            
+            print(f"生成的 token IDs: {gen_ids}")
+            # 解码生成部分（不包含 prefill 部分）
+            output = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            print(f"output:{output}")
+            # for m in model_prune_format_mapping:
+            #     if isinstance(model, m):
+            #         pruned_output = model_prune_format_mapping[m](output)
+            # model_output = pruned_output
+            # print(f"model_output:{model_output}")
+
+            # ===== 结束计时 =====
+            t_total_end = time.perf_counter()
+
+            # 清理
+            if sel_kb is not None:
+                del sel_kb
+            del past_key_values
+            torch.cuda.empty_cache()
+
         elif eval_mode == "icl":
             if multi_entites != -1:
                 ins_prompt = instruction_prompts_multi_entities
@@ -241,9 +321,6 @@ def perform_eval(
             model_output = "; ".join(matches)
             answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
         model_outputs.append(model_output)
-
-        # 只测试第一个样本
-        # break
 
     print(f"KB size: {kb_size}, mode: {eval_mode}")
     rouge = evaluate.load("rouge")
@@ -728,8 +805,8 @@ def _prepare_models(
         kb_layer_frequency=kb_layer_frequency,
         kb_scale_factor=kb_scale_factor,
         # 打开动态稀疏性
-        dynamic_sparsify=True,
-        top_k_kb=1,
+        # dynamic_sparsify=True,
+        # top_k_kb=20, 
     )
     print(kb_config)
     # config.update(kb_config.to_dict())

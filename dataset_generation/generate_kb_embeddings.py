@@ -68,7 +68,7 @@ if __name__ == "__main__":
         dataset = [DataPoint(**line) for line in loaded_dataset]
     if args.model_name == "all-MiniLM-L6-v2":
         key_embeds = compute_embeddings(args.model_name, dataset, "key_string")
-        value_embeds = compute_embeddings(args.model_name, dataset, "description")
+        # value_embeds = compute_embeddings(args.model_name, dataset, "description")
     elif args.model_name in ["ada-embeddings", "text-embedding-3-large"]:
         gpt = GPT(args.model_name, args.endpoint_url)
 
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         f"{args.output_path}/{args.dataset_name}_{save_name}_embd_key.npy",
         np.array(key_embeds),
     )
-    np.save(
-        f"{args.output_path}/{args.dataset_name}_{save_name}_embd_value.npy",
-        np.array(value_embeds),
-    )
+    # np.save(
+    #     f"{args.output_path}/{args.dataset_name}_{save_name}_embd_value.npy",
+    #     np.array(value_embeds),
+    # )

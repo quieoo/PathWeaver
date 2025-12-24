@@ -94,14 +94,56 @@ def answer_question(
             tokenizer=tokenizer,
             output_attentions=True,
             kb_config=kb_config,
+            return_dict_in_generate=True, # 增加这一行以返回字典
             pad_token_id=tokenizer.eos_token_id,
             save_attention_weights=save_attention_weights,
             attention_file_base_name=attention_file_base_name,
-            attention_save_loc=attention_save_loc,
-        ).squeeze()
-    outputs = tokenizer.decode(outputs, skip_special_tokens=False)
+            attention_save_loc=attention_save_loc,              
+        )
+    # outputs = tokenizer.decode(outputs, skip_special_tokens=False)
+    generated_ids = outputs.sequences.squeeze()  # 使用 .sequences 获取生成的 token ids
+    outputs = tokenizer.decode(generated_ids, skip_special_tokens=True) # 清理特殊符号
 
     for m in model_prune_format_mapping:
         if isinstance(model, m):
             pruned_output = model_prune_format_mapping[m](outputs)
     return pruned_output
+
+# def answer_question_prefill(
+#     tokenizer: transformers.PreTrainedTokenizer,
+#     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
+#     Q: str,
+#     kb=None,
+#     kb_config: Optional[KBLaMConfig] = None,
+#     attention_save_loc: Optional[str] = None,
+#     save_attention_weights: bool = False,
+#     attention_file_base_name: Optional[str] = None,
+# ):
+#     for m in model_question_format_mapping:
+#         if isinstance(model, m):
+#             input_str = model_question_format_mapping[m](Q)
+#     tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+#     input_ids, attention_masks = (
+#         tokenizer_output["input_ids"],
+#         tokenizer_output["attention_mask"],
+#     )
+
+#     with torch.autograd.no_grad():
+#         # Prefill: 获取初始past_key_value
+#         prefill_outputs = model(
+#             input_ids=input_ids,
+#             attention_mask=attention_masks,
+#             kb_kvs=None,  # 此时还没检索到 KB
+#             use_cache=True,
+#             output_attentions=False,
+#             max_new_tokens=1,
+#             tokenizer=tokenizer,
+#             kb_config=kb_config,
+#             return_dict_in_generate=True, # 增加这一行以返回字典
+#             pad_token_id=tokenizer.eos_token_id,
+#             save_attention_weights=save_attention_weights,
+#             attention_file_base_name=attention_file_base_name,
+#             attention_save_loc=attention_save_loc,              
+#         )
+#         past_key_values = prefill_outputs.past_key_values
+#     return past_key_values

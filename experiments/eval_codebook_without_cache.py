@@ -36,15 +36,16 @@ from kblam.utils.train_utils import get_kb_embd
 # 增加
 from sentence_transformers import SentenceTransformer 
 from typing import List, Tuple
-# kmeans++  
-from kblam.utils.kmeans import KMeansPlusPlus
+import time
 
 nltk.download("wordnet")
 logging.set_verbosity_warning()
 
 rouge = evaluate.load("rouge")
-bert_score = evaluate.load("bertscore")
-
+bert_score = evaluate.load(
+    path="/home/sdu/.cache/huggingface/modules/evaluate_modules/metrics/bertscore_local/bertscore.py",
+    module_type="metric"
+)
 
 class KBRetriever:
     def __init__(
@@ -67,6 +68,40 @@ class KBRetriever:
 
         if precomputed_embed_keys_path is not None:
             assert len(dataset) == len(self.key_embds)
+
+        # === 新增: 加载codebook和vq_ids ===
+        self.device = torch.device("cuda")
+        self.codebook = torch.load("./codebook/llama-3-8b-synthetic-embd-codebook.pt").to(self.device)
+        self.vq_ids = torch.from_numpy(np.load("./codebook/llama-3-8b-synthetic-embd-vqids.npy")).long().to(self.device)
+
+    # 新增: 从 codebook 中检索 top-k token indices
+    def retrieve_topk_from_codebook(self, query_emb, topk=3):
+        """
+        query_emb: torch.Tensor [dim] or [batch, dim]
+        topk: 选取多少个 KB token
+        
+        return: (kb_indices, kb_embs)
+        """
+        # (1) query 和 codebook 做点积
+        query_emb = query_emb.to(self.device)  # [dim]
+        scores = torch.matmul(self.codebook, query_emb)   # [codebook_size]
+
+        # (2) 选 top cluster
+        top_clusters = torch.topk(scores, k=min(topk, self.codebook.size(0)), dim=-1).indices.tolist()
+        print(f"top_clusters: {top_clusters}")
+
+        # (3) 找到这些 cluster 对应的 token 索引
+        mask = torch.isin(self.vq_ids, torch.tensor(top_clusters).to(self.device))
+        kb_indices = torch.nonzero(mask, as_tuple=True)[0]  # 所有属于这些 cluster 的 token 索引
+
+        print("mask.shape:", mask.shape)
+        print("kb_indices.shape:", kb_indices.shape)
+
+        # (4) 从 CPU 取出 token embedding
+        # kb_embs = torch.tensor(self.key_embds[kb_indices], dtype=torch.float32, device=self.device)
+
+        # return kb_indices, kb_embs
+        return kb_indices
 
     def _use_cached_embd(self):
         if self.key_embds is not None and self.value_embds is not None:
@@ -146,38 +181,48 @@ def perform_eval(
     multi_entites: int = -1,
     remove_sorry: bool = False,
 ):
-    # 改为不随机选
-    # np.random.seed(seed)
-    # kb_idx = np.random.randint(0, len(kb_retriever.dataset), kb_size)
-    kb_idx = list(range(kb_size))  # 索引从0到kb_size-1
+    # 直接用全部数据
+    kb_idx = list(range(len(kb_retriever.dataset)))  
     test_kb = [kb_retriever.dataset[idx] for idx in kb_idx]
-    # kb_key_embeddings = kb_retriever.key_embds[kb_idx]  # shape: [len(kb_idx), dim]
-    # emcode_model = SentenceTransformer("/home/sdu/.cache/modelscope/hub/models/sentence-transformers/all-MiniLM-L6-v2", device="cuda")
+    encode_model = SentenceTransformer("/home/sdu/.cache/modelscope/hub/models/sentence-transformers/all-MiniLM-L6-v2", device="cuda")
     kb_embedding = ()
-    # key_str = [row["key_string"] for row in test_kb]
-    # value_str = [row["description"] for row in test_kb]
-    # prompt_strs = ""
-    # for k, v in zip(key_str, value_str):
-    #     prompt_strs += f"{k} is {v}; "
-    # print(f"prompt_strs:{prompt_strs}")
-
     kb_embedding = kb_retriever.get_key_embeddings(kb_idx)
+
+    # ===== 将完整的 KB 卸载到 CPU =====
+    kb_embedding = tuple(x.cpu() for x in kb_embedding)
+    kb_keys, kb_values = kb_embedding
+    per_kb_key_size = kb_keys[0].numel() * kb_keys[0].element_size()
+    per_kb_value_size = kb_values[0].numel() * kb_values[0].element_size()
+    print(f"单个 KB key 大小: {per_kb_key_size} bytes")
+    print(f"单个 KB value 大小: {per_kb_value_size} bytes")
+
+    # === 取出 codebook 和 vq_ids 并注入模型 ===
+    # codebook = kb_retriever.codebook
+    # vq_ids = kb_retriever.vq_ids
+    # for layer in model.model.layers:
+    #     layer.self_attn.codebook = codebook
+    #     layer.self_attn.vq_ids = vq_ids
 
     model_outputs = []    #用于测评的输出
     answers = []          #用于测评的答案
     full_outputs = []     #用于保存结果
     # answer_question
     subset_size = min(
-        500, len(test_kb)
-    )  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    #subset_size = min(
-        #400, len(test_kb)
-    #)  # Regardless of KB size, always test 250 questions, otherwise it will be too slow
-    # print(f"\nsubset_size={subset_size}\n")
-    # for idx in [135,618,480,543,222,429,126]:
-    #     row = test_kb[idx]
-    #     print(f"Q: {row['Q']}\nA: {row['A']}\ndescription: {row.get('description')}")
+        1024, len(test_kb)
+    )  
+    # === 性能统计 ===
+    total_times = {
+        "retrieve": 0.0,
+        "cpu_to_gpu": 0.0,
+        "model_infer": 0.0,
+        "total_per_Q": 0.0,
+    }
+    num_Q = 0
+    sel_kb_len = 0
+    # === 主循环 ===
     for row in tqdm(test_kb[:subset_size]):
+        num_Q += 1
+        # ===== 生成问题与答案 =====
         if multi_entites == -1:
             Q = row["Q"]
             answer = row["A"]
@@ -191,19 +236,62 @@ def perform_eval(
             answer = A
 
         if eval_mode == "kb":
-            # print(f"\nQ的内容为: {Q}\n")
-            # Q = "Where is Shandong University?"
-            # kb_embedding, prompt_strs, topk_idx = retrieve_topk_embeddings(Q, 4, emcode_model, kb_key_embeddings, kb_retriever)
-            # print(f"prompt_strs:{prompt_strs}\ntopk_idx:{topk_idx}\n")
+            # ===== 总时间起点 =====
+            t0_total = time.perf_counter()
+            # ===== (1) 检索索引 =====
+            t0 = time.perf_counter()
+            # 编码Q为embedding
+            q_embd = encode_model.encode([Q], convert_to_tensor=True, device="cuda")
+            # === 检索 KB indices ===
+            kb_indices = kb_retriever.retrieve_topk_from_codebook(q_embd[0], topk=3)
+            t1 = time.perf_counter()
+            total_times["retrieve"] += t1 - t0
+            print(f"kb_indices device: {kb_indices.device}")
+            print(f"kb_indices type: {type(kb_indices)}")
+            print(f"kb_indices shape: {kb_indices.shape}")
+            print(f"kb_indices: {kb_indices}")
+            # 确保索引在 CPU 上且为 long 类型
+            selected_kb_indices_cpu = kb_indices.to(torch.long).cpu().tolist()
+            sel_kb_len += len(selected_kb_indices_cpu)
+            print(f"selected_kb_indices_cpu type: {type(selected_kb_indices_cpu)}")
+            print(f"selected_kb_indices_cpu len: {len(selected_kb_indices_cpu)}")
+            print(f"kb_embedding type: {type(kb_embedding)}")
+            if isinstance(kb_embedding, torch.Tensor):
+                print(f"kb_embedding shape: {kb_embedding.shape}")
+            # 只选出需要的token，并将选中的 KB 转移到GPU上 ([selected_len, hidden_dim])
+            t0 = time.perf_counter()
+            sel_kb = tuple(kb[selected_kb_indices_cpu].to("cuda") for kb in kb_embedding)
+            t1 = time.perf_counter()
+            total_times["cpu_to_gpu"] += t1 - t0
+            print(f"First sel_kb element shape: {sel_kb[0].shape}")
+            print(f"Second sel_kb element shape: {sel_kb[1].shape}")
+            print(f"First sel_kb element device: {sel_kb[0].device}")
+            print(f"Second sel_kb element device: {sel_kb[1].device}")
+
+            # ===== (3) 模型推理 =====
+            t0 = time.perf_counter()
             model_output = answer_question(
                 tokenizer,
                 model,
                 Q,
-                kb=kb_embedding,
+                kb=sel_kb, # 在GPU上
                 #topk_size=topk_size,
                 kb_config=kb_config,
             ).split(Q)[1]
             #print(f"model_output:{model_output}")
+            t1 = time.perf_counter()
+            total_times["model_infer"] += t1 - t0
+
+            # ===== 结束计时 =====
+            t_total_end = time.perf_counter()
+            total_times["total_per_Q"] += t_total_end - t0_total
+
+            print(f"\n[Q Timing]")
+            print(f"  检索索引时间: {total_times['retrieve']:.4f}s")
+            print(f"  CPU→GPU加载时间: {total_times['cpu_to_gpu']:.4f}s")
+            print(f"  模型推理时间: {total_times['model_infer']:.4f}s")
+            print(f"  总时间: {total_times['total_per_Q']:.4f}s")
+
         elif eval_mode == "icl":
             if multi_entites != -1:
                 ins_prompt = instruction_prompts_multi_entities
@@ -242,8 +330,18 @@ def perform_eval(
             answers.append(";".join(re.findall(r"(?:is|are) (.*?);", answer)))
         model_outputs.append(model_output)
 
-        # 只测试第一个样本
-        # break
+    # === 吞吐量统计 ===
+    avg_time_per_Q = total_times["total_per_Q"] / num_Q
+    throughput = num_Q / total_times["total_per_Q"]
+
+    print("\n========= 性能统计汇总 =========")
+    print(f"平均每个Q所需kb tokens数量: {sel_kb_len / num_Q:.2f}")
+    print(f"平均检索时间: {total_times['retrieve'] / num_Q:.4f}s")
+    print(f"平均CPU→GPU加载时间: {total_times['cpu_to_gpu'] / num_Q:.4f}s")
+    print(f"平均模型推理时间: {total_times['model_infer'] / num_Q:.4f}s")
+    print(f"平均总时间: {avg_time_per_Q:.4f}s")
+    print(f"吞吐量: {throughput:.2f} Q/s")
+    print("=================================")
 
     print(f"KB size: {kb_size}, mode: {eval_mode}")
     rouge = evaluate.load("rouge")
@@ -729,7 +827,7 @@ def _prepare_models(
         kb_scale_factor=kb_scale_factor,
         # 打开动态稀疏性
         dynamic_sparsify=True,
-        top_k_kb=1,
+        top_k_kb=20, 
     )
     print(kb_config)
     # config.update(kb_config.to_dict())
