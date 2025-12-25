@@ -169,3 +169,11 @@ experiments/results/
 datasets/synthetic_embd/
 datasets/train_test/
 *.json
+
+*.npy
+experiments/attn_*
+experiments/gen_*
+experiments/parsed*
+experiments/train/
+experiments/wandb/
+
