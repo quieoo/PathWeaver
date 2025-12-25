@@ -14,14 +14,14 @@ class Entity:
 
 @dataclass
 class DataPoint:
-    name: str
-    description_type: str
-    description: str
+    # name: str
+    # description_type: str
+    # description: str
     Q: str = None
-    A: str = None
+    # A: str = None
     key_string: str = None
-    extended_Q: str = None
-    extended_A: str = None
+    # extended_Q: str = None
+    # extended_A: str = None
 
 
 def save_entity(pair: Entity | DataPoint, output_file: str) -> None:

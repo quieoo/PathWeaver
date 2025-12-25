@@ -166,8 +166,12 @@ heatmap*
 
 experiments/preliminary_experiments/
 experiments/results/
+experiments/codebook/
+experiments/hnsw/
 datasets/synthetic_embd/
 datasets/train_test/
+datasets/extend/
+datasets/wiki/
 *.json
 
 *.npy

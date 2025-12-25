@@ -252,13 +252,7 @@ class KblamLlamaAttention(nn.Module):
             assert (
                 attention_file_base_name is not None
             ), "Please provide a base name for the attention weights"
-
         bsz, q_len, _ = hidden_states.size()
-
-         # ===== 判断当前阶段：prefill 还是 decode =====
-        is_prefill_stage = q_len > 1  # prefill阶段：多个token同时计算
-        is_decode_stage = q_len == 1  # decode阶段：逐个token生成
-
         if self.config.pretraining_tp > 1:
             key_value_slicing = (
                 self.num_key_value_heads * self.head_dim
@@ -324,9 +318,6 @@ class KblamLlamaAttention(nn.Module):
         dynamic_sparsify = kb_config.dynamic_sparsify
         topk_size = kb_config.top_k_kb
         attn_weights_2 = None
-
-        # ===== 修改：只在decode阶段使用KB tokens =====
-        # if kb_kvs is not None and is_decode_stage:  # 只在decode阶段使用KB
         if kb_kvs is not None:
             if self.layer_idx % kb_layer_frequency == 0:
                 kb_keys, kb_values = (
@@ -410,9 +401,6 @@ class KblamLlamaAttention(nn.Module):
         ) / math.sqrt(self.head_dim)
         sep_query_head = kb_config.sep_query_head
         kb_scale_factor = kb_config.kb_scale_factor
-
-        # ===== 修改：只在decode阶段使用分离的查询头 =====
-        # if sep_query_head and kb_kvs is not None and is_decode_stage:
         if sep_query_head:
             if kb_kvs is not None:
                 if self.layer_idx % kb_layer_frequency == 0:
@@ -689,8 +677,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values,
             output_attentions,
         )
-        # 增加
-        # print("causal_mask:", type(causal_mask), causal_mask.shape if causal_mask is not None else None)
+
         # embed positions
         hidden_states = inputs_embeds
 
