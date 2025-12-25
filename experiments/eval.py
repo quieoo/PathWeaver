@@ -190,7 +190,9 @@ def perform_eval_musique(
                 Q,
                 kb=kb_i,
                 kb_config=kb_config,
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
 
         prof = kblam_profile_get()
         prefill_s = prof["prefill_s"]                # 模型 prefill
@@ -322,7 +324,9 @@ def perform_eval(
                 ins_prompt + prompt_strs + Q,
                 kb=None,
                 kb_config=kb_config,
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
         elif eval_mode == "zeroshot":
             if multi_entites != -1:
                 ins_prompt = zero_shot_prompt_multi_entities
@@ -330,7 +334,9 @@ def perform_eval(
                 ins_prompt = zero_shot_prompt
             model_output = answer_question(
                 tokenizer, model, ins_prompt + Q, kb=None, kb_config=kb_config
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
         # print(model_output)
         if remove_sorry:
             if "sorry" in model_output:
@@ -502,8 +508,10 @@ def perform_eval_2wiki(
                 # attention_file_base_name=f"kb-{idx}",
             )
             # print(f"[DEBUG] output_text={output_text}")
+            if Q in output_text:
+                output_text=output_text.split(Q)[1]
+            # output_text=output_text.split(Q)[1]
 
-            output_text=output_text.split(Q)[1]
             prof = kblam_profile_get()
             kblam_profile_reset()
             prefill_s = prof["prefill_s"]                # 模型 prefill
@@ -556,7 +564,7 @@ def perform_eval_v2(
             model,
             tokenizer,
             kb_retriever,
-            encoder_model_spec,
+            # encoder_model_spec,
             kb_config,
             eval_mode,
             kb_size,
@@ -629,8 +637,13 @@ def perform_eval_v2(
                 # save_attention_weights=debug_flag,
                 # attention_save_loc="./attn_weights_kblam/",
                 # attention_file_base_name=f"kb-{idx}",
-            ).split(Q)[1]
-            model_output=output_text[2:]
+            )
+            if Q in output_text:
+                output_text = output_text.split(Q)[1]
+                model_output=output_text[2:]
+            else:
+                model_output=output_text
+            # print(f"model split output: {model_output}")
 
             prof = kblam_profile_get()
             kblam_profile_reset()
@@ -739,7 +752,9 @@ def perform_eval_refusal(
                 kb=kb_embedding,
                 topk_size=topk_size,
                 kb_config=kb_config,
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
 
         elif eval_mode == "icl":
             model_output = answer_question(
@@ -748,7 +763,10 @@ def perform_eval_refusal(
                 instruction_prompts + prompt_strs + Q,
                 kb=None,
                 kb_config=kb_config,
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
+
         elif eval_mode == "zeroshot":
             model_output = answer_question(
                 tokenizer,
@@ -756,7 +774,9 @@ def perform_eval_refusal(
                 zero_shot_prompt + Q,
                 kb=None,
                 kb_config=kb_config,
-            ).split(Q)[1]
+            )
+            if Q in model_output:
+                model_output=model_output.split(Q)[1]
         model_outputs.append(model_output)
         if i < change_point:
             answers.append(row["description"])

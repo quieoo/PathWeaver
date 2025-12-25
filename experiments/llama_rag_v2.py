@@ -263,6 +263,7 @@ def setup_models(args):
         llm = LLM(
             model=args.model_path,
             enforce_eager=True,
+            disable_log_stats=True, 
         )
     elif 'deepseek' in args.model_path or 'qwen' in args.model_path:
         n_gpus = torch.cuda.device_count()
@@ -275,6 +276,28 @@ def setup_models(args):
             trust_remote_code=True,
             enforce_eager=True,
             max_model_len=16384,
+            disable_log_stats=True, 
+        )
+    elif 'olmo3-7b' in args.model_path.lower():
+        # === 新增：OLMo-3-7B-Instruct ===
+        llm = LLM(
+            model=args.model_path,
+            dtype="bfloat16",
+            trust_remote_code=True,   # 必须
+            enforce_eager=True,
+            max_model_len=8192,
+            disable_log_stats=True, 
+        )
+    elif "olmo3-32b" in args.model_path.lower():
+        llm = LLM(
+            model=args.model_path,
+            # quantization="awq",          # ⭐ 关键
+            dtype="float16",             # ⭐ 不要用 bfloat16
+            trust_remote_code=True,
+            # enforce_eager=True,
+            max_model_len=8192,          # 可后续调大
+            # gpu_memory_utilization=0.90,
+            disable_log_stats=True,
         )
 
     embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
@@ -381,8 +404,6 @@ def _summarize(name: str, values: List[float], unit: str = "s"):
     p50_v = _percentile(values, 50)
     p95_v = _percentile(values, 95)
     print(f"{name}: mean={mean_v:.4f}{unit}, p50={p50_v:.4f}{unit}, p95={p95_v:.4f}{unit}")
-
-
 # =========================
 # 6) 推理主循环（含 TTFT/TPOT）
 # =========================
@@ -490,6 +511,79 @@ def run_rag_inference(
             if "Explanation: " in pred:
                 pred = pred.split("Explanation: ")[0].strip()
             pred = pred.split("\n")[0].strip()
+        elif "olmo3-7b" in args.model_path.lower():
+            system_prompt = (
+                "You are a helpful assistant. "
+                "Answer the question using ONLY the given context. "
+                "Output ONLY the exact answer phrase. "
+                "Do NOT add explanations or extra text."
+            )
+
+            user_prompt = (
+                f"Context:\n{context}\n\n"
+                f"Question: {question}\n"
+                f"Answer:"
+            )
+
+            prompt = (
+                "<|system|>\n" + system_prompt + "\n"
+                "<|user|>\n" + user_prompt + "\n"
+                "<|assistant|>\n"
+            )
+
+            # sp = SamplingParams(
+            #     temperature=0.0,
+            #     top_p=1.0,
+            #     max_tokens=128,
+            # )
+            sp=SamplingParams(
+                temperature=0.6,
+                top_p=0.95,
+                max_tokens=1024,
+            )
+
+            resp = llm.generate(prompt, sampling_params=sp)
+            req_out = resp[0]
+            pred = req_out.outputs[0].text.strip()
+        elif "olmo3-32b" in args.model_path.lower():
+            # ===== 1. 评测专用硬约束 Prompt =====
+            prompt = (
+                f"""
+                You must answer with ONLY the final answer.
+                Rules:
+                - Use ONLY the information in the context.
+                - Output a single short phrase or name.
+                - Do NOT explain.
+                - Do NOT add any extra words.
+                - Do NOT repeat the question.
+                - If the answer is not explicitly stated in the context, output: UNKNOWN.
+                Context:
+                {context}
+                Question:
+                {question}
+                Answer:
+                """
+            )
+
+            # ===== 2. 评测专用 SamplingParams =====
+            sp = SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=16,
+                stop=[
+                    "\n",
+                    "\n\n",
+                    "Context:",
+                    "Question:",
+                    "<|assistant|>",
+                    "<|user|>",
+                ],
+            )
+
+            resp = llm.generate(prompt, sampling_params=sp)
+            print(f"==========================\n Prompts: {prompt} \nOutput: {resp}\n==========================")
+            req_out = resp[0]
+            pred = req_out.outputs[0].text.strip()
 
         else:
             print("Unknown model path (llama/deepseek/qwen).")
@@ -530,7 +624,7 @@ def run_rag_inference(
         stat_tokens.append(num_out)
         stat_e2e.append(retrieval_time + gen_elapsed)
 
-        if i % 100 == 0:
+        if i % 1 == 0:
             print(f"\n[{i + 1}/{len(questions)}] Question: {question}")
             print("\n--- 模型输出 ---")
             print(pred)

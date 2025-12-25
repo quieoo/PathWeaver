@@ -20,6 +20,33 @@ from kblam.kblam_attention import (
 from kblam.kblam_attention.kblam_injector import apply_kblam_sep_query_head
 
 
+def replace_attention_with_kblam(model):
+    """
+    将 HF OLMo3 的每层 self_attn 替换为 KBLAMOlmo3Attention，并严格加载权重。
+    """
+    layers = model.model.layers
+    for layer_idx, layer in enumerate(layers):
+        old = layer.self_attn
+        new = KBLAMOlmo3Attention(model.config, layer_idx=layer_idx)
+
+        # 权重对齐
+        # new.load_state_dict(old.state_dict(), strict=True)
+        missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
+        print(
+            f"Layer {layer_idx} load_state_dict: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+        # device/dtype 对齐（你前面已经验证这是必要的）
+        p = next(old.parameters())
+        new.to(device=p.device, dtype=p.dtype)
+
+        layer.self_attn = new
+
+    # 打印确认
+    print("Attention replacement done.")
+    print("Layer0 self_attn:", type(model.model.layers[0].self_attn).__name__)
+
 class KBLAMOlmo3Attention(Olmo3Attention):
     """
     OLMo3Attention + KBLaM injector (eager attention only)
@@ -139,6 +166,12 @@ class KBLAMOlmo3Attention(Olmo3Attention):
         else:
             kb_len = 0
 
+        # if self.layer_idx == 0:
+        #     print(
+        #         "[Phase1] query:", query_states.shape,
+        #         "key:", key_states.shape
+        #     )
+
         # ------------------------------------------------------------
         # 6. attention logits（HF eager attention 逻辑）
         # ------------------------------------------------------------
@@ -175,6 +208,33 @@ class KBLAMOlmo3Attention(Olmo3Attention):
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
         ).to(query_states.dtype)
+
+        # if self.layer_idx == 0 and kb_config.sep_query_head:
+        #     kb_attn = attn_weights[..., :kb_len]
+        #     text_attn = attn_weights[..., kb_len:]
+
+        #     print(
+        #         "[Phase3][AttnRatio]",
+        #         "kb_mean=", kb_attn.mean().item(),
+        #         "text_mean=", text_attn.mean().item(),
+        #     )
+        # if self.layer_idx == 0 and kb_len > 0:
+        #     kb_part = attn_weights[..., :kb_len]
+        #     print(
+        #         "[Phase1] KB attn stats:",
+        #         "mean=", kb_part.mean().item(),
+        #         "max=", kb_part.max().item(),
+        #     )
+
+        # if self.layer_idx == 0:
+        #     kb_attn = attn_weights[..., :kb_len]
+        #     text_attn = attn_weights[..., kb_len:]
+
+        #     print(
+        #         "[Phase3][AttnRatio]",
+        #         "kb_mean=", kb_attn.mean().item(),
+        #         "text_mean=", text_attn.mean().item(),
+        #     )
 
         if (
             kb_len > 0

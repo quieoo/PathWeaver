@@ -224,38 +224,53 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
         print(f"❌ Error calculating F1-Overlap: {e}")
 
     # --- BERTScore（自动降级）---
-    try:
-        print("Calculating BERTScore on GPU...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        P, R, F1 = score(
-            model_outputs,
-            references,
-            lang=lang,
-            model_type="roberta-large",
-            verbose=True,
-            device=device,
-            batch_size=4,
-            use_fast_tokenizer=True,
-        )
-    except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            print("⚠️ CUDA OOM detected. Retrying on CPU...")
-            torch.cuda.empty_cache()
-            P, R, F1 = score(
-                model_outputs,
-                references,
-                lang=lang,
-                model_type="roberta-large",
-                verbose=True,
-                device="cpu",
-                batch_size=1,
-                use_fast_tokenizer=True,
-            )
-        else:
-            raise e
-    except Exception as e:
-        print(f"❌ Error calculating BERTScore: {e}")
-        P, R, F1 = None, None, None
+    # BertModel="roberta-large"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
+    P, R, F1 = score(
+        model_outputs,
+        references,
+        lang=lang,
+        model_type="microsoft/deberta-xlarge-mnli",
+        verbose=True,
+        device=device,
+        batch_size=4,
+        use_fast_tokenizer=False,
+    )
+    # try:
+    #     print("Calculating BERTScore on GPU...")
+    #     device = "cuda" if torch.cuda.is_available() else "cpu"
+    #     device = "cpu"
+    #     P, R, F1 = score(
+    #         model_outputs,
+    #         references,
+    #         lang=lang,
+    #         model_type=BertModel,
+    #         verbose=True,
+    #         device=device,
+    #         batch_size=4,
+    #         # use_fast_tokenizer=True,
+    #     )
+    # except RuntimeError as e:
+    #     print(f"⚠️ RuntimeError: {e}")
+    #     if "CUDA out of memory" in str(e):
+    #         print("⚠️ CUDA OOM detected. Retrying on CPU...")
+    #         torch.cuda.empty_cache()
+    #         P, R, F1 = score(
+    #             model_outputs,
+    #             references,
+    #             lang=lang,
+    #             model_type=BertModel,
+    #             verbose=True,
+    #             device="cpu",
+    #             batch_size=4,
+    #             # use_fast_tokenizer=True,
+    #         )
+    #     else:
+    #         raise e
+    # except Exception as e:
+    #     print(f"❌ Error calculating BERTScore: {e}")
+    #     P, R, F1 = None, None, None
 
     if P is not None:
         results_dict["bert_score_precision"] = float(np.mean(P.numpy()))

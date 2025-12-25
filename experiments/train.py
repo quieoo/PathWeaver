@@ -14,7 +14,12 @@ import traceback
 import numpy as np
 import torch
 import transformers
+
+import os
+os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_SILENT"] = "true"
 import wandb
+
 from accelerate import Accelerator
 from rich.console import Console
 from rich.logging import RichHandler
@@ -35,7 +40,7 @@ from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, set
 from kblam.kb_retriever import KBRetriever
 from eval import eval_main_process
 from kblam.metrics_evaluator import simple_evaluation
-from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short
+from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short, format_QA_olmo3
 import re
 import shutil
 import random
@@ -104,7 +109,7 @@ parser.add_argument("--kb_token_layer_frequency", type=int, default=3, help="Int
 parser.add_argument("--gradient_accm_step", type=int, default=20, help="Introduce QA with extended open-ended parts")
 parser.add_argument("--verbose", action="store_true", help="Set logging to debug")
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
-parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3"])
+parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3", "olmo3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
@@ -234,6 +239,59 @@ def _create_labels_for_phi3(input_ids: torch.Tensor, input_strs: List[str], toke
         answer_mask[b, : (answer_indices[b].item() + 1)] = 0
     labels = input_ids * answer_mask + (1 - answer_mask) * (-100)
     return labels
+
+def _create_labels_for_olmo3(
+    input_ids: torch.Tensor,
+    input_strs: list[str],
+    tokenizer,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Only compute loss on assistant content for OLMo3.
+    """
+    labels = input_ids.clone()
+    labels[:] = -100
+
+    assistant_start = tokenizer("<|im_start|>assistant", add_special_tokens=False).input_ids
+
+    for b in range(input_ids.size(0)):
+        seq = input_ids[b].tolist()
+
+        # 1. 找到 assistant 起始位置
+        start_idx = None
+        for i in range(len(seq) - len(assistant_start)):
+            if seq[i : i + len(assistant_start)] == assistant_start:
+                start_idx = i + len(assistant_start)
+                break
+
+        if start_idx is None:
+            continue  # 没有 assistant，整行忽略
+
+        # 2. 从 assistant 内容开始算 loss
+        labels[b, start_idx:] = input_ids[b, start_idx:]
+
+        # 3. mask padding
+        if tokenizer.pad_token_id is not None:
+            labels[b, labels[b] == tokenizer.pad_token_id] = -100
+
+        # 4. mask attention_mask == 0
+        if attention_mask is not None:
+            labels[b] = labels[b].masked_fill(attention_mask[b] == 0, -100)
+
+    return labels
+
+def create_labels_for_olmo3_adapter(
+    input_ids,
+    input_strs,        # get_batch 传的，但 OLMo3 不需要
+    tokenizer,
+    attention_masks,
+):
+    return _create_labels_for_olmo3(
+        input_ids=input_ids,
+        input_strs=input_strs,
+        tokenizer=tokenizer,
+        attention_mask=attention_masks,
+    )
 
 # 从数据集中构建训练批次：对应输入字符串的Token id，注意力掩码以及标签
 def get_batch(
@@ -759,7 +817,13 @@ class Trainer:
             else:
                 raise ValueError(f"{dataset_format} not recognised")
             self._get_params = _get_llama3_query_head_parameters
-
+        elif getattr(llm_model.config, "model_type", None) == "olmo3":
+            self._get_batch = partial(
+                get_batch,
+                lambda Q, A: format_QA_olmo3(Q, A, self.tokenizer),
+                create_labels_for_olmo3_adapter,
+            )
+            self._get_params = lambda *args, **kwargs: []
         else:
             raise ValueError(f"{llm_model} not recognised")
 
@@ -987,6 +1051,7 @@ class Trainer:
                     )
                     if a_step == 0 and step % 10 == 0:
                         self.logger.info(f"INPUT IDs SHAPE: {input_ids.shape}")
+
                     # 截断输入
                     if self.max_seq_len is not None:
                         input_ids = input_ids[:, : self.max_seq_len]
@@ -1119,6 +1184,8 @@ class Trainer:
                         kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size, is_inference=False)
                     else:
                         raise ValueError(f"Unknown data set format: {self.dataset_format}")
+                    
+                    
                     if debug_level > 1:
                         out = self.model(
                             input_ids=input_ids,
@@ -1143,11 +1210,28 @@ class Trainer:
                     # 打印部分结果
                     if (a_step == 0 and step % 10 == 0) or debug_level > 1:
                         batch_index = 0  # Which example in the batch to select
-                        max_logits = logits.argmax(axis=2)
-                        decoded_pred = self.tokenizer.decode(max_logits[batch_index, :-1])
-                        sel_labels = labels[batch_index, :]
-                        sel_labels = sel_labels[sel_labels >= 0]  # Remove padding token -100
-                        decoded_gt = self.tokenizer.decode(sel_labels)
+
+                        # max_logits = logits.argmax(axis=2)
+                        # decoded_pred = self.tokenizer.decode(max_logits[batch_index, :-1])
+                        # sel_labels = labels[batch_index, :]
+                        # sel_labels = sel_labels[sel_labels >= 0]  # Remove padding token -100
+                        # decoded_gt = self.tokenizer.decode(sel_labels)
+
+                        # FIX
+                        max_logits = logits.argmax(dim=2)
+                        valid_pos = labels[batch_index] != -100
+                        pred_ids = max_logits[batch_index][valid_pos]
+                        decoded_pred = self.tokenizer.decode(
+                            pred_ids,
+                            skip_special_tokens=False,
+                        )
+                        sel_labels = labels[batch_index]
+                        sel_labels = sel_labels[sel_labels != -100]
+
+                        decoded_gt = self.tokenizer.decode(
+                            sel_labels,
+                            skip_special_tokens=False,
+                        )
                         self.logger.info(f"KB SHAPE: {kb_embedding[0].shape}")
                         self.logger.info(f"GT: {decoded_gt}")
                         self.logger.info(f"PRED: {decoded_pred}")
@@ -1155,7 +1239,11 @@ class Trainer:
                     # 计算交叉熵损失
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-                    weights = (shift_labels > 0).sum(-1, keepdim=True).expand(-1, shift_labels.shape[1]).contiguous()
+                    # weights = (shift_labels > 0).sum(-1, keepdim=True).expand(-1, shift_labels.shape[1]).contiguous()
+                    # FIX
+                    valid_mask = shift_labels != -100
+                    weights = valid_mask.sum(-1, keepdim=True).expand(-1, shift_labels.shape[1]).contiguous()
+
                     # Flatten the tokens
                     model_config = (
                         self.model.config
@@ -1486,6 +1574,18 @@ def main():
             torch_dtype="auto",
             trust_remote_code=True,
         )
+    elif args.llm_type == "olmo3":
+        from transformers import AutoModelForCausalLM
+        from kblam.models.olmo3.kblam_olmo3_attention import replace_attention_with_kblam
+
+        model = AutoModelForCausalLM.from_pretrained(
+            llm_model_spec,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to(device)
+
+        model.set_attn_implementation("eager")
+        replace_attention_with_kblam(model)
     else:
         ValueError(f"LLM type {args.llm_type} not recognised")
 
@@ -1575,18 +1675,24 @@ def main():
 
     print("[INFO]: Training started")
 
-    trainer.train(
-        training_set,
-        B,
-        gradient_accm_step,
-        outlier_num,
-        use_data_aug=use_data_aug,
-        multi_entities=multi_entities,
-        use_extended_qa=use_extended_qa,
-        save_period=args.save_period,
-        resumed_step=resumed_step,
-        kb_config=kb_config,
-    )
+    try: 
+        trainer.train(
+            training_set,
+            B,
+            gradient_accm_step,
+            outlier_num,
+            use_data_aug=use_data_aug,
+            multi_entities=multi_entities,
+            use_extended_qa=use_extended_qa,
+            save_period=args.save_period,
+            resumed_step=resumed_step,
+            kb_config=kb_config,
+        )
+    except Exception as e:
+        print("Training crashed:", e)
+        raise
+    finally:
+        wandb.finish(exit_code=1)
 
 
 

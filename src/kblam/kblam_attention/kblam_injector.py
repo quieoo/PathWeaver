@@ -107,9 +107,31 @@ def apply_kblam_attention(
     key_states = torch.cat([kb_keys, key_states], dim=2)
     value_states = torch.cat([kb_values, value_states], dim=2)
 
+
+    # ===== Phase 1 FIX: attention_mask may be None =====
+    if attention_mask is None:
+        # 构造一个“全 0 的 causal-compatible mask”
+        # shape: (B, 1, Q, K_text)
+        q_len = query_states.size(2)
+        k_len = key_states.size(2)
+
+        attention_mask = torch.zeros(
+            bsz,
+            1,
+            q_len,
+            k_len,
+            device=key_states.device,
+            dtype=key_states.dtype,
+        )
     kb_mask = attention_mask.new_zeros(bsz, 1, attention_mask.size(2), kb_len)
     padding_mask = torch.all(attention_mask < 0, -1, keepdim=True)
     kb_mask = padding_mask * PADDING_VALUE + (~padding_mask) * kb_mask
     attention_mask = torch.cat([kb_mask, attention_mask], dim=-1)
+
+    # print(
+    #     f"[KBLaM-INJECT] layer={layer_idx}, "
+    #     f"kb_len={kb_len}, "
+    #     f"key_states.shape={key_states.shape}"
+    # )
 
     return key_states, value_states, attention_mask, kb_len
