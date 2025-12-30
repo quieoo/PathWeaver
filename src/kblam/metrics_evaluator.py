@@ -225,19 +225,59 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
 
     # --- BERTScore（自动降级）---
     # BertModel="roberta-large"
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = "cpu"
-    P, R, F1 = score(
+    # device = "cuda" if torch.cuda.is_available() else "cpu"    
+    # device = "cpu"
+    # P, R, F1 = score(
+    #     model_outputs,
+    #     references,
+    #     lang=lang,
+    #     model_type="microsoft/deberta-xlarge-mnli",
+    #     # model_type="roberta-large",
+    #     verbose=True,
+    #     device=device,
+    #     batch_size=4,
+    #     use_fast_tokenizer=False,
+    # )
+
+    from transformers import AutoTokenizer, AutoModel
+    import os
+
+    os.environ["TRANSFORMERS_USE_SAFETENSORS"] = "1"
+
+    MODEL_NAME = "microsoft/deberta-xlarge-mnli"
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        use_fast=False,
+    )
+
+    model = AutoModel.from_pretrained(
+        MODEL_NAME,
+        use_safetensors=True,   # 关键
+        torch_dtype=None,
+    )
+    model.eval()
+    from bert_score.scorer import BERTScorer
+    import torch
+
+    scorer = BERTScorer(
+        model_type=None,        # 不让它自己加载
+        num_layers=None,
+        batch_size=4,
+        device="cpu",
+        lang="en",
+    )
+
+    # 🔥 手动注入（关键步骤）
+    scorer._model = model
+    scorer._tokenizer = tokenizer
+    P, R, F1 = scorer.score(
         model_outputs,
         references,
-        lang=lang,
-        model_type="microsoft/deberta-xlarge-mnli",
-        # model_type="roberta-large",
-        verbose=True,
-        device=device,
-        batch_size=4,
-        use_fast_tokenizer=False,
     )
+
+
+
     # try:
     #     print("Calculating BERTScore on GPU...")
     #     device = "cuda" if torch.cuda.is_available() else "cpu"

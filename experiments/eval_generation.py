@@ -250,16 +250,15 @@ def _perform_eval_batched(
             else:
                 kb_keys, kb_vals = kb_retriever.get_key_embeddings(batch_idx)
         else:
-            kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
-                batch_indices=batch_idx,
-                hop_num=hop_num,
-            )
-            # kb_retriever.get_kb_adj_batch_by_hnsw(
-            #     [row["Q"] for row in batch],
-            #     hop_num=hop_num,
-            #     true_indices=batch_idx,
-            #     topk=10,
-            # )
+            if enable_retrieval:
+                questions = [row["Q"] for row in batch]
+                kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, topk=1, device=torch.device("cuda"), random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
+            else:
+                kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
+                    batch_indices=batch_idx,
+                    hop_num=2,
+                )
+            
 
 
 
@@ -271,9 +270,11 @@ def _perform_eval_batched(
             if isinstance(kb_keys, list):
                 target_kb_keys = kb_keys[i]
                 target_kb_vals = kb_vals[i]
+                target_kb_adj = kb_adj[i] if hop_num is not None else None
             else:
                 target_kb_keys = kb_keys
                 target_kb_vals = kb_vals
+                target_kb_adj = kb_adj if hop_num is not None else None
 
             output = answer_question_deterministic(
                 tokenizer,
@@ -281,7 +282,7 @@ def _perform_eval_batched(
                 Q,
                 kb=(target_kb_keys, target_kb_vals),
                 kb_config=kb_config,
-                kb_adj=kb_adj if use_kb_adj else None,
+                kb_adj=target_kb_adj,
             )
 
             if Q in output:
@@ -310,6 +311,7 @@ def _perform_eval_batched(
     print(f"QPS: {query_size / (end_time - start_time):.2f}")
     print(f"Avg TTFT: {np.mean(TTFTs):.4f}")
     print(f"Avg TPOT: {np.mean(TPOTs):.4f}")
+    print(f"2hop_recall@1: {kb_retriever.metrics_2hop_recall_1/query_size:.4f}")
 
     return all_model_outputs, all_answers
 

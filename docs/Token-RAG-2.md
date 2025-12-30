@@ -2011,6 +2011,22 @@ nohup python eval_generation.py generation \
 # 向量检索
 
 ````bash
+conda activate kblam-rag
+
+
+nohup python eval_generation.py generation \
+    --eval_mode kb --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/squad_2.7_stage_2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_llama3_step_7999_encoder/encoder.pt \
+    --model_dir ./train/squad_2.7_stage_2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_llama3_step_7999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/squad/v4/ \
+    --test_dataset test_datasets.json \
+    --precomputed_embed_keys_path /mnt/n0/datasets/squad/v4/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/squad/v4/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+    --query_size 100 --seed 1 >> eval_squad2.7.log 2>&1 &
+
 nohup python eval_generation.py generation \
     --eval_mode kb --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
@@ -2027,9 +2043,12 @@ nohup python eval_generation.py generation \
     --query_size 100 --seed 1 >> eval_squad2.7.log 2>&1 &
 
 # 单跳跑通，需要top-1+random-9
+# 精度变化：0.81 -> 0.8
+
+#-----------------------------------------------------------------------------
 
 # 多跳，2wiki
-nohup python eval.py generation \
+nohup python eval_generation.py generation \
     --eval_mode kb --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
@@ -2056,5 +2075,8 @@ nohup python eval_generation.py generation \
     --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_hnsw \
     --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
     --dataset_type 2wiki --query_size 100 --seed 1 --save_dir ./gen_tmp --path_attn >> eval_2wiki_1.1.log 2>&1 &
+
+# 精度变化： 0.84 -> 0.83
+
 
 ````

@@ -415,14 +415,7 @@ class KBRetriever:
                 print(f"[HNSW] Retrieval Accuracy: top-{topk}={rank_true}")
                 print(f"[HNSW] Retrieval Indexes (true={true_idx}): {idxs}")
 
-            if self._use_cached_embd():
-                train_set_key, train_set_val = get_kb_embd(
-                    self.encoder,
-                    idxs,
-                    precomputed_embd=(self.key_embds, self.value_embds),
-                )
-            else:
-                train_set_key, train_set_val = get_kb_embd(self.encoder, idxs, kb_dict=self.dataset)
+            train_set_key, train_set_val=self.get_key_embeddings(idxs)
 
             all_keys.append(train_set_key)
             all_vals.append(train_set_val)
@@ -440,42 +433,39 @@ class KBRetriever:
         true_indices: Optional[list[int]] = None,
         random_sample: Optional[int] = None,
         hop_num: int =2,
-    )->tuple[list[torch.Tensor], list[torch.Tensor]]:
+    ):
         """
         For inference only.
         Returns:
             kb_keys: (B, topk, d)
             kb_vals: (B, topk, d)
+            kb_adj: (B, topk, topk)
         """
         assert self._use_cached_embd()
         assert self.hnsw_ready
 
         B = len(questions)
 
-        all_keys, all_vals = [], []
+        all_keys, all_vals, all_adj = [], [], []
         q_embs = self.create_query_embeddings(questions)  # (B, D)
         for i, q in enumerate(questions):
             q_emb = q_embs[i]                              # (D,)
             idxs = self.retrieve_topk(q_emb, topk)        # (topk,)
-            
+            # 将索引归一化到hop_num倍
+            idxs = (np.asarray(idxs, dtype=np.int64) // hop_num).tolist()
+            if random_sample is not None:
+                total_samples = int(self.key_embds.shape[0] // hop_num)
+                random_idxs = np.random.choice(total_samples, random_sample, replace=False).astype(np.int64).tolist()
+                idxs = idxs + random_idxs
             # collect retrieval results
             if true_indices is not None:
                 assert len(true_indices) == B, "true_indices must have the same length as questions"
-                true_idx = true_indices[i]*2
-                if true_idx==idxs[0]:
+                true_idx = int(true_indices[i])
+                if len(idxs) > 0 and true_idx == int(idxs[0]):
                     self.metrics_2hop_recall_1 += 1
 
-            
-            # if self._use_cached_embd():
-            #     train_set_key, train_set_val = get_kb_embd(
-            #         self.encoder,
-            #         idxs,
-            #         precomputed_embd=(self.key_embds, self.value_embds),
-            #     )
-            # else:
-            #     train_set_key, train_set_val = get_kb_embd(self.encoder, idxs, kb_dict=self.dataset)
-
-            # all_keys.append(train_set_key)
-            # all_vals.append(train_set_val)
-
-        return all_keys, all_vals
+            kb_k, kb_v, kb_adj=self.get_embeddings_with_adj_2wiki(idxs, hop_num=hop_num)
+            all_keys.append(kb_k)
+            all_vals.append(kb_v)
+            all_adj.append(kb_adj)
+        return all_keys, all_vals, all_adj
