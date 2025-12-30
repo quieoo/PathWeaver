@@ -35,11 +35,16 @@ from kblam.kb_encoder import KBEncoder
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
+from kblam.models.olmo3.kblam_olmo3_attention import load_kblam_olmo3_model, replace_attention_with_kblam
+
+
+
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
 from kblam.kb_retriever import KBRetriever
-from eval import eval_main_process
-from kblam.metrics_evaluator import simple_evaluation
+# from eval import eval_main_process
+from eval_generation import eval_main_process
+from kblam.metrics_evaluator import simple_evaluation, full_evaluation
 from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short, format_QA_olmo3
 import re
 import shutil
@@ -98,6 +103,7 @@ parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1
 
 parser.add_argument("--hf_token", type=str,default=None,help="Huggingface token")
 parser.add_argument("--model_save_dir", type=str, default="output", help="Place to save the checkpoints")
+parser.add_argument("--keep_old_checkpoints", action=argparse.BooleanOptionalAction, default=False, help="Remove old checkpoints")
 parser.add_argument("--kb_size", type=int, default=None, help="The size of the KB set size")
 parser.add_argument("--dynamic_kb_size", nargs=2, type=int, default=None, help="The size of the KB set size. Set a dynamic range for the kbsize specify min and max")
 parser.add_argument("--duplicate_true_kb", action=argparse.BooleanOptionalAction, default=True, help="Duplicate true entity's KB token")
@@ -780,6 +786,7 @@ class Trainer:
         test_kb_scale_factor_range: tuple[float, float] | None = None,
         eval_step: int = 50,
         format_short: bool = False,
+        keep_old_checkpoints: bool = False,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -800,6 +807,7 @@ class Trainer:
         self.llm_savename = llm_savename
         self.output_path = pathlib.Path(output_dir)
         self.dataset_format = dataset_format
+        self.keep_old_checkpoints = keep_old_checkpoints
 
         if isinstance(llm_model, KBLaMPhi3ForCausalLM):  # Phi3
             self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
@@ -1073,115 +1081,6 @@ class Trainer:
                             hop_num=2,
                         )
                         kb_embedding=(key_embd, value_embd)
-                    elif self.dataset_format == "multi_wiki_qa_train":
-                        # 根据batch_indices从training_set中获取"start_id"和"num_triples"域的值
-                        start_ids=[]
-                        num_triples=[]
-                        for i in batch_indices:
-                            start_ids.append(training_set[i]["start_id"])
-                            num_triples.append(training_set[i]["num_triples"])
-
-                        kb_embedding = self.kbretriever.get_key_embeddings_document(
-                            start_ids, num_triples, len(input_ids), step, self.kb_size
-                        )
-                    elif self.dataset_format == "musique":
-                        start_ids = [[] for _ in range(batch_size)]
-                        num_triples = [[] for _ in range(batch_size)]
-
-                        for i in range(batch_size):
-                            sample = training_set[batch_indices[i]]
-                            paragraphs = sample["paragraphs"]
-                            assert len(paragraphs) > 0, f"Sample {batch_indices[i]} has no paragraphs"
-
-                            if self.kb_size == -1:
-                                # Use all triples from all paragraphs as one contiguous block
-                                start_ids[i] = [paragraphs[0]["start_id"]]
-                                total_triples = sum(p["num_triples"] for p in paragraphs)
-                                num_triples[i] = [total_triples]
-                                
-
-                            elif self.kb_size == 1:
-                                # Use only ground-truth supporting paragraphs
-                                true_paras = []
-                                for qd in sample["question_decomposition"]:
-                                    true_idx = qd["paragraph_support_idx"]
-                                    para = paragraphs[true_idx]
-                                    start_ids[i].append(para["start_id"])
-                                    num_triples[i].append(para["num_triples"])
-                                    if debug_level > 1:
-                                        print(f"True paragraph: {para}")
-                                    true_paras.append(true_idx)
-                                if debug_level>0:
-                                    print(f"----TRAIN: {batch_indices[i]}-{true_paras}")
-                                
-                            elif isinstance(self.kb_size, int) and self.kb_size >= 2:
-                                # 1) 真段落（去重 & 过滤空三元组）
-                                true_paras = []
-                                seen = set()
-                                for qd in sample["question_decomposition"]:
-                                    idx = qd["paragraph_support_idx"]
-                                    if idx not in seen and paragraphs[idx]["num_triples"] > 0:
-                                        seen.add(idx)
-                                        true_paras.append(idx)
-
-                                # 2) 负样本池（非真段 & 非空）
-                                neg_pool = [p for p in range(len(paragraphs))
-                                            if (p not in seen) and (paragraphs[p]["num_triples"] > 0)]
-
-                                # 3) 预算上限（段落数）：优先用 self.kb_size，否则以 20 为上限；同时不超过非空段落总数
-                                nonempty_total = len(true_paras) + len(neg_pool)
-                                hard_cap = self.kb_size if isinstance(self.kb_size, int) else 20
-                                max_budget = min(hard_cap, nonempty_total)
-
-                                # 4) 动态增长：从真段落数线性涨到 max_budget
-                                #    alpha ∈ [0.2, 1.0]
-                                denom = max(1, self.num_steps)  # 防止除 0
-                                progress = min(1.0, max(0.0, float(step) / float(denom)))  # 归一化进度 [0,1]
-                                alpha = 0.2 + 0.8 * progress  # 起点0.2，终点1.0
-
-                                target_paras_float = len(true_paras) + (max_budget - len(true_paras)) * alpha
-                                target_paras = int(round(target_paras_float))
-
-                                # 保障范围与单调：至少覆盖真段落，不超过 max_budget
-                                target_paras = max(len(true_paras), min(target_paras, max_budget))
-
-                                # 5) 先放入真段落，再补负样本到 target_paras
-                                selected = list(true_paras)
-                                need_neg = max(0, target_paras - len(selected))
-                                if need_neg > 0 and len(neg_pool) > 0:
-                                    take_neg = min(need_neg, len(neg_pool))
-                                    selected.extend(random.sample(neg_pool, take_neg))
-
-                                # 6) 如总数仍超过目标（真段太多等），做裁剪（尽量保真段）
-                                if len(selected) > target_paras:
-                                    # 若真段落超过或等于预算，只保留随机 target_paras 个真段
-                                    if len(true_paras) >= target_paras:
-                                        selected = random.sample(true_paras, target_paras)
-                                    else:
-                                        remain = target_paras - len(true_paras)
-                                        neg_selected = [p for p in selected if p not in true_paras]
-                                        if remain < len(neg_selected):
-                                            neg_selected = random.sample(neg_selected, remain)
-                                        selected = true_paras + neg_selected
-
-                                # 7) 打乱避免位置偏置
-                                random.shuffle(selected)
-
-                                # 8) 写回
-                                start_ids[i].extend([paragraphs[p]["start_id"] for p in selected])
-                                num_triples[i].extend([paragraphs[p]["num_triples"] for p in selected])
-
-                                # if debug_level > 0 and (step % 10 == 0):
-                                #     sid = sample.get("id", "?")
-                                #     print(f"---- sample-{batch_indices[i]}, id: {sid}, "
-                                #         f"true={sorted(true_paras)}, selected={sorted(selected)}, "
-                                #         f"target={target_paras}, max_budget={max_budget}, nonempty_total={nonempty_total}")
-
-                                
-                            else:
-                                raise ValueError(f"Unsupported kb_size: {self.kb_size}")
-                        # print(f"using {num_triples} triples")
-                        kb_embedding = self.kbretriever.get_embeddings(start_ids, num_triples, batch_size, is_inference=False)
                     else:
                         raise ValueError(f"Unknown data set format: {self.dataset_format}")
                     
@@ -1334,36 +1233,36 @@ class Trainer:
                                 f.write(kb_config.to_json_string())
 
                             # 删除旧的checkpoint
-                            self.logger.info("Removing old checkpoints...")
-
-                            # 获取所有checkpoint目录
-                            for item in self.output_path.iterdir():
-                                if item.is_dir():
-                                    # 匹配checkpoint目录名
-                                    match = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)", item.name)
-                                    if match:
-                                        old_step = int(match.group(1))
-                                        if old_step < step:
-                                            # 删除旧的模型checkpoint
-                                            try:
-                                                shutil.rmtree(item)
-                                                self.logger.info(f"Removed old model checkpoint: {item}")
-                                            except FileNotFoundError:
-                                                # 目录可能已被其他进程删除
-                                                self.logger.info(f"Old model checkpoint already removed: {item}")
-                                    
-                                    # 匹配encoder目录名
-                                    match_encoder = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)_encoder", item.name)
-                                    if match_encoder:
-                                        old_step = int(match_encoder.group(1))
-                                        if old_step < step:
-                                            # 删除旧的encoder checkpoint
-                                            try:
-                                                shutil.rmtree(item)
-                                                self.logger.info(f"Removed old encoder checkpoint: {item}")
-                                            except FileNotFoundError:
-                                                # 目录可能已被其他进程删除
-                                                self.logger.info(f"Old encoder checkpoint already removed: {item}")
+                            if not self.keep_old_checkpoints:
+                                self.logger.info("Removing old checkpoints...")
+                                # 获取所有checkpoint目录
+                                for item in self.output_path.iterdir():
+                                    if item.is_dir():
+                                        # 匹配checkpoint目录名
+                                        match = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)", item.name)
+                                        if match:
+                                            old_step = int(match.group(1))
+                                            if old_step < step:
+                                                # 删除旧的模型checkpoint
+                                                try:
+                                                    shutil.rmtree(item)
+                                                    self.logger.info(f"Removed old model checkpoint: {item}")
+                                                except FileNotFoundError:
+                                                    # 目录可能已被其他进程删除
+                                                    self.logger.info(f"Old model checkpoint already removed: {item}")
+                                        
+                                        # 匹配encoder目录名
+                                        match_encoder = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)_encoder", item.name)
+                                        if match_encoder:
+                                            old_step = int(match_encoder.group(1))
+                                            if old_step < step:
+                                                # 删除旧的encoder checkpoint
+                                                try:
+                                                    shutil.rmtree(item)
+                                                    self.logger.info(f"Removed old encoder checkpoint: {item}")
+                                                except FileNotFoundError:
+                                                    # 目录可能已被其他进程删除
+                                                    self.logger.info(f"Old encoder checkpoint already removed: {item}")
                     except Exception as e:
                         self.logger.error(f"Error saving checkpoint: {e}")
                         self.logger.error(f"Error details: {str(e)}")
@@ -1539,57 +1438,57 @@ def main():
         test_dataset = None
 
     # Set up the LLM
-    llm_model_spec = model_dir_to_resume if model_dir_to_resume else hf_model_spec
+    original_model_spec = hf_model_spec              # base olmo3-7b
+    resume_ckpt_dir = model_dir_to_resume             # None or stage1_lr_..._step_xxxx
 
-    resumed_step = 0 if not model_dir_to_resume else int(model_dir_to_resume.split("_")[-1])
+    if resume_ckpt_dir:
+        resumed_step = int(resume_ckpt_dir.split("_")[-1])
+        print(f"[INFO]: Resuming from {resume_ckpt_dir}, step: {resumed_step}")
+    else:
+        resumed_step = 0
 
     if model_dir_to_resume:
         print(f"[INFO]: Resuming from {model_dir_to_resume}, step: {resumed_step}")
-    if llm_model_spec is None:
-        raise ValueError("Either supply model_dir_to_resume or hf_model_spec")
 
-    if hf_token is None and args.llm_type == "llama3" and not os.path.exists(llm_model_spec):
-        raise ValueError("Please supply HuggingFace token(hf_token) when loading model Llama weights from HuggingFace")
-
-    # Tokenizer comes from the base model
     tokenizer = AutoTokenizer.from_pretrained(
-        hf_model_spec,
+        original_model_spec,
         trust_remote_code=True,
-        token=hf_token if hf_token is args.llm_type == "llama3" else None,
+        token=hf_token if args.llm_type == "llama3" else None,
     )
     tokenizer.pad_token = tokenizer.eos_token
 
     if args.llm_type == "llama3":
         model = KblamLlamaForCausalLM.from_pretrained(
-            llm_model_spec,
+            resume_ckpt_dir if resume_ckpt_dir else original_model_spec,
             device_map=device,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            # token=hf_token,
         )
+
     elif args.llm_type == "phi3":
         model = KBLaMPhi3ForCausalLM.from_pretrained(
-            llm_model_spec,
+            resume_ckpt_dir if resume_ckpt_dir else original_model_spec,
             device_map=device,
             torch_dtype="auto",
             trust_remote_code=True,
         )
+
     elif args.llm_type == "olmo3":
-        from transformers import AutoModelForCausalLM
-        from kblam.models.olmo3.kblam_olmo3_attention import replace_attention_with_kblam
+        model = load_kblam_olmo3_model(
+            base_model_dir=original_model_spec,      # 永远是 base olmo3
+            checkpoint_dir=resume_ckpt_dir,          # 只有 resume 时才非 None
+            device="cuda",
+        )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            llm_model_spec,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-        ).to(device)
-
-        model.set_attn_implementation("eager")
-        replace_attention_with_kblam(model)
     else:
-        ValueError(f"LLM type {args.llm_type} not recognised")
+        raise ValueError(f"LLM type {args.llm_type} not recognised")
 
-    print(f"[INFO]: Initialised model {llm_model_spec}")
+
+    print(
+        f"[INFO]: Initialised model "
+        f"{resume_ckpt_dir if resume_ckpt_dir else original_model_spec}"
+    )
+
     logger.info(model.config)  # type: ignore
 
     model.eval()  # type: ignore
@@ -1660,6 +1559,7 @@ def main():
         sep_query_head=sep_query_head,
         max_seq_len=max_seq_len,
         dataset_format=dataset_type,
+        keep_old_checkpoints=args.keep_old_checkpoints,
         test_dataset=test_dataset,
         precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
         precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,

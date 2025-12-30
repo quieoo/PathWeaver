@@ -855,7 +855,6 @@ parent_parser.add_argument(
     "--llm_type",
     type=str,
     default="phi3",
-    choices=["llama3", "phi3"],
     help="Type of language model to use",
 )
 parent_parser.add_argument(
@@ -1279,6 +1278,19 @@ def _prepare_models(
                 torch_dtype="auto",
                 trust_remote_code=True,
             )
+    elif llm_type == "olmo3":
+        from transformers import AutoModelForCausalLM
+        from kblam.models.olmo3.kblam_olmo3_attention import replace_attention_with_kblam
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to("cuda")
+
+        model.set_attn_implementation("eager")
+        replace_attention_with_kblam(model)
+        model.
     else:
         model = KBLaMPhi3ForCausalLM.from_pretrained(
             model_path,

@@ -38,6 +38,7 @@ from vllm import LLM, SamplingParams
 from kblam.metrics_evaluator import full_evaluation
 
 
+
 # =========================
 # 1) 文本归一化与基础评测
 # =========================
@@ -630,15 +631,15 @@ def run_rag_inference(
             print(pred)
             print(f" → Prediction: {pred}")
             print(f" → Ground Truth: {answers[i]}")
-            print(
-                f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
-                f"prefill(model)={prefill_model*1000:.1f} ms, "
-                f"TTFT={ttft*1000:.1f} ms, "
-                f"decode={decode_time*1000:.1f} ms, "
-                f"TPOT={tpot*1000:.1f} ms/token, "
-                f"out_tokens={num_out}, "
-                f"E2E={(retrieval_time+gen_elapsed):.3f} s"
-            )
+            # print(
+            #     f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
+            #     f"prefill(model)={prefill_model*1000:.1f} ms, "
+            #     f"TTFT={ttft*1000:.1f} ms, "
+            #     f"decode={decode_time*1000:.1f} ms, "
+            #     f"TPOT={tpot*1000:.1f} ms/token, "
+            #     f"out_tokens={num_out}, "
+            #     f"E2E={(retrieval_time+gen_elapsed):.3f} s"
+            # )
 
         predictions.append(pred)
 

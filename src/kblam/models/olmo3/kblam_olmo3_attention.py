@@ -18,6 +18,9 @@ from kblam.kblam_attention import (
     apply_kblam_path_attention,
 )
 from kblam.kblam_attention.kblam_injector import apply_kblam_sep_query_head
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM
+import os
 
 
 def replace_attention_with_kblam(model):
@@ -32,10 +35,10 @@ def replace_attention_with_kblam(model):
         # 权重对齐
         # new.load_state_dict(old.state_dict(), strict=True)
         missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
-        print(
-            f"Layer {layer_idx} load_state_dict: "
-            f"missing={missing}, unexpected={unexpected}"
-        )
+        # print(
+        #     f"Layer {layer_idx} load_state_dict: "
+        #     f"missing={missing}, unexpected={unexpected}"
+        # )
 
         # device/dtype 对齐（你前面已经验证这是必要的）
         p = next(old.parameters())
@@ -46,6 +49,128 @@ def replace_attention_with_kblam(model):
     # 打印确认
     print("Attention replacement done.")
     print("Layer0 self_attn:", type(model.model.layers[0].self_attn).__name__)
+
+
+def _load_hf_sharded_state_dict(ckpt_dir: str) -> dict:
+    """
+    Load HF sharded safetensors using index.json
+    """
+    index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(f"Missing index file: {index_path}")
+
+    import json
+    with open(index_path, "r") as f:
+        index = json.load(f)
+
+    weight_map = index["weight_map"]
+    shard_files = set(weight_map.values())
+
+    state_dict = {}
+    for shard in shard_files:
+        shard_path = os.path.join(ckpt_dir, shard)
+        shard_state = load_file(shard_path)
+        state_dict.update(shard_state)
+
+    return state_dict
+
+def load_kblam_olmo3_model(
+    *,
+    base_model_dir: str,
+    checkpoint_dir: str,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """
+    Canonical loader for KBLaM-OLMo3 (HF sharded safetensors compatible).
+
+    Correct & ONLY valid order:
+      1. load base OLMo3 (architecture only)
+      2. replace attention with KBLaM (create q_proj_new slots)
+      3. load HF checkpoint via from_pretrained(checkpoint_dir)
+      4. assert integrity
+    """
+
+    # --------------------------------------------------
+    # 1. Load BASE OLMo3 (no KB weights yet)
+    # --------------------------------------------------
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_dir,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    ).to(device)
+
+    model.set_attn_implementation("eager")
+
+    # --------------------------------------------------
+    # 2. Replace attention FIRST (CRITICAL)
+    # --------------------------------------------------
+    replace_attention_with_kblam(model)
+
+    # --------------------------------------------------
+    # 3. Load TRAINED weights (HF shard-aware)
+    # --------------------------------------------------
+    # This will read model.safetensors.index.json automatically
+    if checkpoint_dir is not None:
+        state_dict = _load_hf_sharded_state_dict(checkpoint_dir)
+
+        missing, unexpected = model.load_state_dict(
+            state_dict, strict=False
+        )
+
+        # ---- HARD ASSERT ----
+        q_missing = [k for k in missing if "q_proj_new" in k]
+        if q_missing:
+            raise RuntimeError(
+                "[FATAL] q_proj_new missing after state_dict load:\n"
+                + "\n".join(q_missing)
+            )
+
+    # --------------------------------------------------
+    # 4. Load KB config
+    # --------------------------------------------------
+    # kb_config = None
+    # if load_kb_config:
+    #     cfg_path = os.path.join(checkpoint_dir, "kb_config_explicit.json")
+    #     if not os.path.exists(cfg_path):
+    #         raise FileNotFoundError(
+    #             f"kb_config_explicit.json not found in {checkpoint_dir}"
+    #         )
+    #     kb_config = KBLaMConfig.from_pretrained(cfg_path)
+
+    # --------------------------------------------------
+    # 5. Hard integrity check
+    # --------------------------------------------------
+    _assert_kblam_olmo3_integrity(model)
+
+    model.eval()
+    return model
+
+
+def _assert_kblam_olmo3_integrity(model):
+    q_proj_new = [
+        (n, p) for n, p in model.named_parameters()
+        if "q_proj_new" in n
+    ]
+
+    if not q_proj_new:
+        raise RuntimeError(
+            "[FATAL] q_proj_new not found. "
+            "Checkpoint was NOT loaded with KBLaM structure."
+        )
+
+    for n, p in q_proj_new:
+        mean = p.abs().mean().item()
+        if mean < 1e-6:
+            raise RuntimeError(
+                f"[FATAL] {n} looks untrained (mean={mean:.2e})"
+            )
+
+    print(
+        f"[OK] KBLaM-OLMo3 loaded correctly "
+        f"({len(q_proj_new)} q_proj_new tensors)"
+    )
+
 
 class KBLAMOlmo3Attention(Olmo3Attention):
     """

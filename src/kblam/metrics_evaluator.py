@@ -232,6 +232,7 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
         references,
         lang=lang,
         model_type="microsoft/deberta-xlarge-mnli",
+        # model_type="roberta-large",
         verbose=True,
         device=device,
         batch_size=4,
@@ -324,6 +325,10 @@ def print_comparison(model_outputs: list[str], references: list[str]) -> str:
 # 🔹 总控函数
 # ======================
 def full_evaluation(model_outputs: list[str], references: list[str], lang: str = "en") -> tuple[str, dict]:
+    # 打印前5个样本
+    print("===== First 5 Samples =====")
+    print(print_comparison(model_outputs[:5], references[:5]))
+
     comparison_str = print_comparison(model_outputs, references)
     metrics = evaluate_model_outputs(model_outputs, references, lang)
     return comparison_str, metrics

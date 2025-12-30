@@ -5,6 +5,12 @@ import random
 from kblam.kb_encoder import KBEncoder
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd
 
+import hnswlib
+import json
+from pathlib import Path
+from tqdm import tqdm
+import os
+from sentence_transformers import SentenceTransformer 
 
 class KBRetriever:
     def __init__(
@@ -15,6 +21,8 @@ class KBRetriever:
         value_embds: Optional[np.ndarray] = None,
         precomputed_embed_keys_path: Optional[str] = None,
         precomputed_embed_values_path: Optional[str] = None,
+        hnsw_index_path:Optional[str] = None,
+        base_embeder_path:Optional[str] = None,
     ):
 
         self.encoder = encoder
@@ -25,6 +33,25 @@ class KBRetriever:
         else:
             self.key_embds = key_embds
             self.value_embds = value_embds
+        
+        self.hnsw_index_path=hnsw_index_path
+        self.hnsw_index = None
+        self.hnsw_ready = False
+        self.hnsw_dim = None
+        self.hnsw_space = None
+        if hnsw_index_path is not None:
+            print(f"[HNSW] ENABLE")
+            if not self.load_hnsw_index():
+                print(f"Load HNSW index failed: {hnsw_index_path}, create a new one.")
+                self.build_and_save_hnsw_index()
+            if base_embeder_path is None:
+                raise ValueError("base_embeder_path is None, but hnsw_index_path is not None.")
+            self.base_embeder = SentenceTransformer(base_embeder_path, device="cpu")
+        
+        # metrics
+        self.metrics_2hop_recall_1=0
+        
+
 
     def _load_cached_embd(self, precomputed_embed_keys_path, precomputed_embed_values_path):
         self.key_embds = np.load(precomputed_embed_keys_path).astype("float32")
@@ -79,7 +106,6 @@ class KBRetriever:
 
         # return kb_embedding
 
-        # 为每个样本随机插入位置
         B = batch_size
         C = context_set_key.size(1)
         insert_pos = torch.randint(0, C + 1, (B,), device=context_set_key.device)
@@ -87,7 +113,6 @@ class KBRetriever:
         new_keys = []
         new_vals = []
         for b in range(B):
-            # 在随机位置插入 train_set_key[b]
             keys = torch.cat(
                 [context_set_key[b, :insert_pos[b]], train_set_key[b], context_set_key[b, insert_pos[b]:]],
                 dim=0,
@@ -101,7 +126,6 @@ class KBRetriever:
 
         train_set_key = torch.cat(new_keys, dim=0)
         train_set_val = torch.cat(new_vals, dim=0)
-        # === 🟩 新增部分结束 ===
 
         kb_embedding = (train_set_key, train_set_val)
         return kb_embedding
@@ -237,140 +261,221 @@ class KBRetriever:
 
         return key_emb, val_emb, kb_adj
 
+    def build_and_save_hnsw_index(
+        self,
+        space: str = "cosine",
+        ef_construction: int = 200,
+        M: int = 32,
+    ):
+        """
+        Build HNSW index and save to disk.
+        """
+        assert self._use_cached_embd(), "HNSW requires cached embeddings"
 
-# DATASET_SUPPORT
-    def get_key_embeddings_document(self, start_ids, num_triples, batch_size, step, kb_size):
-        if not self._use_cached_embd():
-            print("Current only supports cached KB embedding")
-            return None
-        if len(start_ids) != batch_size:
-            print("Batch size mismatch")
-            return None
+        if not os.path.isdir(self.hnsw_index_path):
+            print(f"[HNSW] index path {self.hnsw_index_path} does not exist, use current directory {os.getcwd()} to save index")
+            self.hnsw_index_path = os.getcwd()
 
-        # 先收集三元组并执行编码
-        key_embeddings = [[] for _ in range(batch_size)]
-        value_embeddings = [[] for _ in range(batch_size)]
+        index_path = os.path.join(self.hnsw_index_path, "hnsw.index")
+        meta_path = os.path.join(self.hnsw_index_path, "hnsw.meta.json")
 
-        for i in range(batch_size):
-            start_id = start_ids[i]
-            for j in range(num_triples[i]):
-                k_embed = self.encoder.encode_key(base_emb=self.key_embds[start_id + j])  # pyright: ignore[reportOptionalSubscript]
-                v_embed = self.encoder.encode_val(base_emb=self.value_embds[start_id + j])  # pyright: ignore[reportOptionalSubscript]
-                key_embeddings[i].append(k_embed)
-                value_embeddings[i].append(v_embed)
+        key_np = self.key_embds.astype("float32")
+        N, D = key_np.shape
 
-        # 处理变长序列：首先将每个样本的嵌入堆叠成张量
-        # 然后进行填充使所有样本具有相同的序列长度
-        key_tensor_list = []
-        value_tensor_list = []
-        
-        for i in range(batch_size):
-            # 将每个样本的嵌入列表转换为张量
-            key_tensor_list.append(torch.stack(key_embeddings[i]))
-            value_tensor_list.append(torch.stack(value_embeddings[i]))
-            
-        # 获取最大序列长度
-        max_seq_len = max([t.size(0) for t in key_tensor_list])
-        
-        # 对所有张量进行填充以匹配最大序列长度
-        padded_key_tensors = []
-        padded_value_tensors = []
-        
-        for i in range(batch_size):
-            current_seq_len = key_tensor_list[i].size(0)
-            if current_seq_len < max_seq_len:
-                # 计算需要填充的数量
-                padding_size = max_seq_len - current_seq_len
-                # 创建填充张量（使用0填充）
-                key_padding = torch.zeros(padding_size, key_tensor_list[i].size(1), 
-                                          dtype=key_tensor_list[i].dtype, 
-                                          device=key_tensor_list[i].device)
-                value_padding = torch.zeros(padding_size, value_tensor_list[i].size(1), 
-                                            dtype=value_tensor_list[i].dtype, 
-                                            device=value_tensor_list[i].device)
-                # 拼接原始张量和填充张量
-                padded_key = torch.cat([key_tensor_list[i], key_padding], dim=0)
-                padded_value = torch.cat([value_tensor_list[i], value_padding], dim=0)
+        index = hnswlib.Index(space=space, dim=D)
+        index.init_index(
+            max_elements=N,
+            ef_construction=ef_construction,
+            M=M,
+        )
+
+        batch_size = int(N / 100)
+        for i in tqdm(range(0, N, batch_size), desc="Building HNSW index"):
+            end_idx = min(i + batch_size, N)
+            index.add_items(key_np[i:end_idx], np.arange(i, end_idx))
+        index.set_ef(ef_construction)
+
+        # ---- save ----
+        index.save_index(str(index_path))
+        meta = {
+            "space": space,
+            "dim": D,
+            "num_elements": N,
+            "ef_construction": ef_construction,
+            "M": M,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # ---- register ----
+        self.hnsw_index = index
+        self.hnsw_ready = True
+        self.hnsw_dim = D
+        self.hnsw_space = space
+
+        print(f"[HNSW] index built & saved to {self.hnsw_index_path}")
+
+
+    def load_hnsw_index(
+        self,
+        ef_search: int = 200,
+    ):
+        """
+        Load prebuilt HNSW index from disk.
+        """
+        index_path = os.path.join(self.hnsw_index_path, "hnsw.index")
+        meta_path = os.path.join(self.hnsw_index_path, "hnsw.meta.json")
+
+        if not os.path.exists(index_path):
+            print(f"HNSW index not found: {index_path}")
+            return False
+        if not os.path.exists(meta_path):
+            print(f"HNSW meta not found: {meta_path}")
+            return False
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        space = meta["space"]
+        dim = meta["dim"]
+        num_elements = meta["num_elements"]
+
+        index = hnswlib.Index(space=space, dim=dim)
+        index.load_index(str(index_path), max_elements=num_elements)
+        index.set_ef(ef_search)
+
+        self.hnsw_index = index
+        self.hnsw_ready = True
+        self.hnsw_dim = dim
+        self.hnsw_space = space
+
+        print(f"[HNSW] index loaded from {self.hnsw_index_path}")
+        return True
+
+
+    def create_query_embeddings(self, questions: list[str]):
+        """
+        Encode question into the SAME embedding space as key_embds.
+        """
+        # return self.encoder.embedding_query_cpu(questions)  # (B, D)
+        return self.base_embeder.encode(questions, convert_to_numpy=True)  # (B, D)
+
+
+    def retrieve_topk(
+        self,
+        query_emb: np.ndarray,
+        topk: int,
+    ):
+        assert self.hnsw_ready, "HNSW index not initialized"
+
+        labels, distances = self.hnsw_index.knn_query(
+            query_emb.reshape(1, -1),
+            k=topk,
+        )
+        return labels[0]   # shape: (topk,)
+
+
+    def get_kb_batch_by_hnsw(
+        self,
+        questions: list[str],
+        topk: int,
+        device = "cuda",
+        true_indices: Optional[list[int]] = None,
+        random_sample: Optional[int] = None,
+    )->tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        For inference only.
+        Returns:
+            kb_keys: (B, topk, d)
+            kb_vals: (B, topk, d)
+        """
+        assert self._use_cached_embd()
+        assert self.hnsw_ready
+
+        B = len(questions)
+
+        all_keys, all_vals = [], []
+        q_embs = self.create_query_embeddings(questions)  # (B, D)
+        for i, q in enumerate(questions):
+            q_emb = q_embs[i]                              # (D,)
+            idxs = self.retrieve_topk(q_emb, topk)        # (topk,)
+            if random_sample is not None:
+                random_idxs = np.random.choice(self.key_embds.shape[0], random_sample, replace=False)
+                idxs = np.concatenate([idxs, random_idxs]).astype(int).tolist()
+
+            # collect retrieval results
+            if true_indices is not None:
+                assert len(true_indices) == B, "true_indices must have the same length as questions"
+                true_idx = true_indices[i]
+                pos = np.where(idxs == true_idx)[0]
+                if len(pos) > 0:
+                    rank_true = int(pos[0]) + 1
+                else:
+                    rank_true = None   # or topk + 1
+                print(f"[HNSW] Retrieval Accuracy: top-{topk}={rank_true}")
+                print(f"[HNSW] Retrieval Indexes (true={true_idx}): {idxs}")
+
+            if self._use_cached_embd():
+                train_set_key, train_set_val = get_kb_embd(
+                    self.encoder,
+                    idxs,
+                    precomputed_embd=(self.key_embds, self.value_embds),
+                )
             else:
-                # 如果已经是最大长度，则不需要填充
-                padded_key = key_tensor_list[i]
-                padded_value = value_tensor_list[i]
-                
-            padded_key_tensors.append(padded_key)
-            padded_value_tensors.append(padded_value)
-        
-        # 最后堆叠所有样本的张量
-        key_embeddings = torch.stack(padded_key_tensors, dim=0)
-        value_embeddings = torch.stack(padded_value_tensors, dim=0)
+                train_set_key, train_set_val = get_kb_embd(self.encoder, idxs, kb_dict=self.dataset)
 
-        # print(f"----shape of key embeddings: {key_embeddings.shape}")
-        return (key_embeddings, value_embeddings)
-    def get_embeddings(self, start_id_lists, num_triples_lists, batch_size, is_inference=False):
-        import random
-        if not self._use_cached_embd():
-            raise RuntimeError("Only supports cached KB embeddings")
+            all_keys.append(train_set_key)
+            all_vals.append(train_set_val)
 
-        if len(start_id_lists) != batch_size or len(num_triples_lists) != batch_size:
-            raise ValueError("Batch size mismatch")
+        return all_keys, all_vals
 
-        all_indices, seq_lengths = [], []
-        total_keys = len(self.key_embds)
+    def is_hnsw_ready(self):
+        return self.hnsw_ready
 
-        for i in range(batch_size):
-            starts = start_id_lists[i] if isinstance(start_id_lists[i], list) else [start_id_lists[i]]
-            nums = num_triples_lists[i] if isinstance(num_triples_lists[i], list) else [num_triples_lists[i]]
+    def get_kb_adj_batch_by_hnsw(
+        self,
+        questions: list[str],
+        topk: int,
+        device = "cuda",
+        true_indices: Optional[list[int]] = None,
+        random_sample: Optional[int] = None,
+        hop_num: int =2,
+    )->tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """
+        For inference only.
+        Returns:
+            kb_keys: (B, topk, d)
+            kb_vals: (B, topk, d)
+        """
+        assert self._use_cached_embd()
+        assert self.hnsw_ready
 
-            sample_indices = []
-            for start, num in zip(starts, nums):
-                if num > 0:
-                    if start < 0 or start + num > total_keys:
-                        raise IndexError(f"Triple index out of range: {start}-{start+num}, total={total_keys}")
-                    sample_indices.extend(range(start, start + num))
+        B = len(questions)
 
-            if not is_inference and len(sample_indices) > 1:
-                random.shuffle(sample_indices)
+        all_keys, all_vals = [], []
+        q_embs = self.create_query_embeddings(questions)  # (B, D)
+        for i, q in enumerate(questions):
+            q_emb = q_embs[i]                              # (D,)
+            idxs = self.retrieve_topk(q_emb, topk)        # (topk,)
+            
+            # collect retrieval results
+            if true_indices is not None:
+                assert len(true_indices) == B, "true_indices must have the same length as questions"
+                true_idx = true_indices[i]*2
+                if true_idx==idxs[0]:
+                    self.metrics_2hop_recall_1 += 1
 
-            all_indices.extend(sample_indices)
-            seq_lengths.append(len(sample_indices))
+            
+            # if self._use_cached_embd():
+            #     train_set_key, train_set_val = get_kb_embd(
+            #         self.encoder,
+            #         idxs,
+            #         precomputed_embd=(self.key_embds, self.value_embds),
+            #     )
+            # else:
+            #     train_set_key, train_set_val = get_kb_embd(self.encoder, idxs, kb_dict=self.dataset)
 
-        total_triples = len(all_indices)
-        if total_triples == 0:
-            dummy_key = self.encoder.encode_key(base_emb=np.zeros_like(self.key_embds[0:1]))
-            dummy_val = self.encoder.encode_val(base_emb=np.zeros_like(self.value_embds[0:1]))
-            dim_k, dim_v = dummy_key.shape[1], dummy_val.shape[1]
-            return (
-                torch.zeros(batch_size, 1, dim_k, device=dummy_key.device, dtype=dummy_key.dtype),
-                torch.zeros(batch_size, 1, dim_v, device=dummy_val.device, dtype=dummy_val.dtype),
-            )
+            # all_keys.append(train_set_key)
+            # all_vals.append(train_set_val)
 
-        key_batch_np = self.key_embds[all_indices]
-        val_batch_np = self.value_embds[all_indices]
-        key_encoded = self.encoder.encode_key(base_emb=key_batch_np)
-        val_encoded = self.encoder.encode_val(base_emb=val_batch_np)
-
-        key_seq_list, val_seq_list = [], []
-        offset = 0
-        for length in seq_lengths:
-            k = key_encoded[offset:offset + length]
-            v = val_encoded[offset:offset + length]
-            offset += length
-            key_seq_list.append(k)
-            val_seq_list.append(v)
-
-        if not is_inference:
-            for i, (k, v) in enumerate(zip(key_seq_list, val_seq_list)):
-                if k.size(0) > 1:
-                    perm = torch.randperm(k.size(0), device=k.device)
-                    key_seq_list[i] = k.index_select(0, perm)
-                    val_seq_list[i] = v.index_select(0, perm)
-
-        max_len = max(k.size(0) for k in key_seq_list) or 1
-        padded_keys, padded_vals = [], []
-        for k, v in zip(key_seq_list, val_seq_list):
-            pad_k = torch.zeros(max_len - k.size(0), k.size(1), dtype=k.dtype, device=k.device)
-            pad_v = torch.zeros(max_len - v.size(0), v.size(1), dtype=v.dtype, device=v.device)
-            padded_keys.append(torch.cat([k, pad_k], dim=0))
-            padded_vals.append(torch.cat([v, pad_v], dim=0))
-
-        return torch.stack(padded_keys, dim=0), torch.stack(padded_vals, dim=0)
-
+        return all_keys, all_vals
