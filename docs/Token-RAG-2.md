@@ -43,7 +43,7 @@ nohup python train.py \
 
 # 正常推理下得分：'rouge1': 0.6742802404134849
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec all-MiniLM-L6-v2 \
     --encoder_dir ./train/debug_train_evaluate/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_synthetic_llama3_step_4799_encoder/encoder.pt \
@@ -282,7 +282,7 @@ python ../tools/semantic_alignment_eval.py --dataset_path /mnt/n0/datasets/squad
 不同的kb_scale_factor对结果的影响
 ````bash
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec all-MiniLM-L6-v2 \
     --encoder_dir ./train/squad-2/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_squad_llama3_step_4999_encoder/encoder.pt \
@@ -303,7 +303,7 @@ nohup python eval.py generation \
 kb_size的影响
 ````bash
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=2 \
+    --kb_size=2 \
     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec all-MiniLM-L6-v2 \
     --encoder_dir ./train/squad-2/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_squad_llama3_step_4999_encoder/encoder.pt \
@@ -439,7 +439,7 @@ nohup python train.py \
 
 # 推理测试,推理得分基本上和训练时的验证得分一致
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /mnt/n0/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec all-MiniLM-L6-v2 \
     --encoder_dir ./train/squad-2/stage1_lr_0.0005KBTokenLayerFreq1UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_all-MiniLM-L6-v2_squad_llama3_step_9700_encoder/encoder.pt  \
@@ -556,7 +556,7 @@ nohup python train.py \
 
 ## 最后的评估
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/squad_2.7_stage_2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_llama3_step_7999_encoder/encoder.pt \
@@ -1332,7 +1332,7 @@ python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/
 
 # 2wiki_1.1
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
@@ -1346,7 +1346,7 @@ nohup python eval.py generation \
 
 # 路径注意力版本
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
@@ -1615,7 +1615,7 @@ nohup python train.py \
 ````bash
 
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/hotpot_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_12999_encoder/encoder.pt  \
@@ -1757,7 +1757,7 @@ nohup python train.py \
 ````bash
 
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/musique_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_13299_encoder/encoder.pt  \
@@ -1770,7 +1770,7 @@ nohup python eval.py generation \
     --dataset_type 2wiki --query_size 100 --seed 1 --path_attn --save_dir ./gen_tmp >> eval_musique_2hop_1.1.log 2>&1 &
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/musique_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_13299_encoder/encoder.pt  \
@@ -1784,7 +1784,7 @@ nohup python eval_generation.py generation \
 
 # 关闭path_attn
 nohup python eval.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/musique_2hop_v1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_13299_encoder/encoder.pt  \
@@ -1948,7 +1948,7 @@ nohup python train.py \
 
 # olmo3_musique_2hop_v1: 2wiki+Musique_2hop
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/olmo3-7b/ --llm_type olmo3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/olmo3_musique_2hop_v1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_olmo3_step_9999_encoder/encoder.pt  \
@@ -1969,7 +1969,7 @@ nohup python eval_generation.py generation \
 
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/olmo3-7b/ --llm_type olmo3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/olmo3_2wiki_1.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_olmo3_step_5600_encoder/encoder.pt \
@@ -1992,7 +1992,7 @@ nohup python llama_rag_v2.py    --dataset-path /mnt/n0/datasets/wiki_hotspot_mus
 nohup python llama_rag_v2.py     --dataset-path /mnt/n0/datasets/squad/plain_text/validation_merged.json     --dataset-type squad     --model-path /home/sdu/zhu/models/olmo3-7b/     --embedding-model sentence-transformers/all-MiniLM-L6-v2     --n-samples 100 --kb-size 100     --similarity-top-k 10 >> eval_olmo3_squad.log 2>&1 &
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/olmo3-7b/ --llm_type olmo3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir  ./train/olmo-squad/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_olmo3_step_4000_encoder/encoder.pt \
@@ -2015,7 +2015,7 @@ conda activate kblam-rag
 
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/squad_2.7_stage_2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_llama3_step_7999_encoder/encoder.pt \
@@ -2028,7 +2028,7 @@ nohup python eval_generation.py generation \
     --query_size 100 --seed 1 >> eval_squad2.7.log 2>&1 &
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/squad_2.7_stage_2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_synthetic_llama3_step_7999_encoder/encoder.pt \
@@ -2048,8 +2048,9 @@ nohup python eval_generation.py generation \
 #-----------------------------------------------------------------------------
 
 # 多跳，2wiki
+## 使用纯向量检索
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
@@ -2062,7 +2063,7 @@ nohup python eval_generation.py generation \
     --dataset_type 2wiki --query_size 100 --seed 1 --save_dir ./gen_tmp --path_attn >> eval_2wiki_1.1.log 2>&1 &
 
 nohup python eval_generation.py generation \
-    --eval_mode kb --kb_size=10 \
+    --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \
     --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
@@ -2078,5 +2079,45 @@ nohup python eval_generation.py generation \
 
 # 精度变化： 0.84 -> 0.83
 
+### 多跳检索的召回率分析
+nohup python eval_generation.py generation \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
+    --model_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique \
+    --test_dataset 2wiki_test_datasets.json \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_value.npy \
+    --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_hnsw \
+    --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+    --dataset_type 2wiki --query_size 100 --seed 1 --save_dir ./gen_tmp --path_attn >> eval_2wiki_1.1.log 2>&1 &
+
+##------------------------------------------------
+# 性能分析：
+ # 单条操作，retrieve_top时间：0.5ms，embedding时间: 60ms (cpu), 17ms (cuda)
+ # 批量操作， Embedding： 5000/7s=1.3ms (批量+cuda)， retrieve： 5000/0.14s=0.028ms. 精度不受影响。
+
+# top-1, 命中率0.95， top-10，命中率0.99
+
+## 实现两种重排算法，轻量重排，语义重排
+nohup python eval_generation.py debug \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999_encoder/encoder.pt \
+    --model_dir ./train/2wiki_1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_2wiki_llama3_step_7999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique \
+    --test_dataset 2wiki_test_datasets.json \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_value.npy \
+    --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_hnsw \
+    --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+    --dataset_type 2wiki --query_size 100 --seed 1 --path_attn >> eval_retrieve.log 2>&1 &
+
 
 ````
+

@@ -11,6 +11,39 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 from sentence_transformers import SentenceTransformer 
+import time
+
+
+def build_path_string(t1: dict, t2: dict) -> str:
+    """
+    Build a 2-hop path string with structural awareness.
+    """
+
+    name1 = t1["name"]
+    type1 = t1["description_type"]
+    type2 = t2["description_type"]
+
+    is_attr1 = t1["key_string"].lower().startswith("the ") and " of " in t1["key_string"].lower()
+    is_attr2 = t2["key_string"].lower().startswith("the ") and " of " in t2["key_string"].lower()
+
+    # ---------- attribute + attribute ----------
+    if is_attr1 and is_attr2:
+        # the mother of the director of Film
+        return f"the {type2} of the {type1} of {name1}"
+
+    # ---------- relation + attribute ----------
+    if not is_attr1 and is_attr2:
+        # the mother of which X directed Film
+        return f"the {type2} of which {name1} {type1}"
+
+    # ---------- attribute + relation ----------
+    if is_attr1 and not is_attr2:
+        # the sequel related to the director of Film
+        return f"the {type2} related to the {type1} of {name1}"
+
+    # ---------- relation + relation ----------
+    # X directed sequel
+    return f"{name1} {type1} {type2}"
 
 class KBRetriever:
     def __init__(
@@ -46,11 +79,23 @@ class KBRetriever:
                 self.build_and_save_hnsw_index()
             if base_embeder_path is None:
                 raise ValueError("base_embeder_path is None, but hnsw_index_path is not None.")
-            self.base_embeder = SentenceTransformer(base_embeder_path, device="cpu")
+            # self.base_embeder = SentenceTransformer(base_embeder_path, device="cpu")
+            self.base_embeder = SentenceTransformer(base_embeder_path, device="cuda")
+            
         
         # metrics
         self.metrics_2hop_recall_1=0
-        
+        self.metrics_2hop_recall_topk=0
+
+        self.retrieval_time=[]
+        self.embedding_time=[]
+
+    
+    def reset_metrics(self):
+        self.metrics_2hop_recall_1=0
+        self.metrics_2hop_recall_topk=0
+        self.retrieval_time=[]
+        self.embedding_time=[]
 
 
     def _load_cached_embd(self, precomputed_embed_keys_path, precomputed_embed_values_path):
@@ -349,7 +394,7 @@ class KBRetriever:
         self.hnsw_dim = dim
         self.hnsw_space = space
 
-        print(f"[HNSW] index loaded from {self.hnsw_index_path}")
+        print(f"[HNSW] index loaded from {self.hnsw_index_path}, data size: {num_elements}")
         return True
 
 
@@ -358,7 +403,11 @@ class KBRetriever:
         Encode question into the SAME embedding space as key_embds.
         """
         # return self.encoder.embedding_query_cpu(questions)  # (B, D)
-        return self.base_embeder.encode(questions, convert_to_numpy=True)  # (B, D)
+        start_time = time.time()
+        q_embs = self.base_embeder.encode( questions, convert_to_numpy=True)  # (B, D)
+        end_time = time.time()
+        self.embedding_time.append(end_time - start_time)
+        return q_embs  # (B, D)
 
 
     def retrieve_topk(
@@ -368,11 +417,44 @@ class KBRetriever:
     ):
         assert self.hnsw_ready, "HNSW index not initialized"
 
+        start_time = time.time()
         labels, distances = self.hnsw_index.knn_query(
             query_emb.reshape(1, -1),
             k=topk,
         )
+        end_time = time.time()
+        self.retrieval_time.append(end_time - start_time)
         return labels[0]   # shape: (topk,)
+
+    def retrieve_topk_batch(
+        self,
+        query_embs: np.ndarray,
+        topk: int,
+    ):
+        """
+        Batch HNSW retrieval.
+
+        Args:
+            query_embs: np.ndarray, shape (B, D)
+            topk: int
+
+        Returns:
+            labels: np.ndarray, shape (B, topk)
+        """
+        assert self.hnsw_ready, "HNSW index not initialized"
+        assert query_embs.ndim == 2, "query_embs must be 2D (B, D)"
+
+        start_time = time.time()
+        labels, distances = self.hnsw_index.knn_query(
+            query_embs,
+            k=topk,
+        )
+        end_time = time.time()
+
+        self.retrieval_time.append(end_time - start_time)
+
+        return labels   # (B, topk)
+
 
 
     def get_kb_batch_by_hnsw(
@@ -428,7 +510,9 @@ class KBRetriever:
     def get_kb_adj_batch_by_hnsw(
         self,
         questions: list[str],
-        topk: int,
+        ann_topk: int = 10,
+        rerank_policy: int = 2,
+        rerank_topk: int = 1,
         device = "cuda",
         true_indices: Optional[list[int]] = None,
         random_sample: Optional[int] = None,
@@ -450,8 +534,19 @@ class KBRetriever:
         q_embs = self.create_query_embeddings(questions)  # (B, D)
         for i, q in enumerate(questions):
             q_emb = q_embs[i]                              # (D,)
-            idxs = self.retrieve_topk(q_emb, topk)        # (topk,)
-            # 将索引归一化到hop_num倍
+            if rerank_policy == 1:
+                idxs = self.get_retrieve_idx_v1(q_emb, topk=ann_topk)        # (topk,)
+            elif rerank_policy == 2:
+                idxs = self.get_retrieve_idx_v2(q_emb, topk=ann_topk)        # (topk,)
+            elif rerank_policy == 3:
+                idxs = self.get_retrieve_idx_v3(q_emb, topk=ann_topk)        # (topk,)
+            else:
+                raise ValueError(f"Unknown rerank_policy: {rerank_policy}")
+
+            # 取前rerank_topk个索引
+            idxs = idxs[:rerank_topk]
+
+            # 统一索引
             idxs = (np.asarray(idxs, dtype=np.int64) // hop_num).tolist()
             if random_sample is not None:
                 total_samples = int(self.key_embds.shape[0] // hop_num)
@@ -469,3 +564,292 @@ class KBRetriever:
             all_vals.append(kb_v)
             all_adj.append(kb_adj)
         return all_keys, all_vals, all_adj
+
+    def get_retrieve_idx_v1(self, q_embd, topk: int = 10):
+        idxs = self.retrieve_topk(q_embd, topk)
+        return idxs
+
+    def get_retrieve_idx_v2(self, q_emb, topk: int = 10, alpha: float = 1.0, beta: float = 0.25, hop_num: int = 2):
+        # ---------- 2) first-hop retrieval ----------
+        first_hop_idxs = self.retrieve_topk(q_emb, topk=topk)  # (topk,)
+        first_hop_idxs = (first_hop_idxs // hop_num) * hop_num
+
+        # ---------- 3) collect first-hop scores ----------
+        first_keys = self.key_embds[first_hop_idxs]          # (K, D)
+        first_scores = first_keys @ q_emb                    # (K,)
+
+        # ---------- 4) collect second-hop scores ----------
+        second_hops = []
+        valid_first = []
+        valid_first_scores = []
+
+        for c, s1 in zip(first_hop_idxs, first_scores):
+            c = int(c)
+            second_hop = c + 1
+            if second_hop < len(self.key_embds):
+                second_hops.append(second_hop)
+                valid_first.append(c)
+                valid_first_scores.append(s1)
+
+        if not second_hops:
+            raise ValueError("No second-hop candidates found.")
+
+        second_keys = self.key_embds[second_hops]             # (K', D)
+        second_scores = second_keys @ q_emb                   # (K',)
+
+        valid_first_scores = np.asarray(valid_first_scores)
+
+        # ---------- 5) combined score ----------
+        combined_scores = alpha * valid_first_scores + beta * second_scores
+
+        # ---------- 6) reorder ----------
+        sorted_idxs = np.argsort(combined_scores)[::-1]
+        first_hop_idxs = first_hop_idxs[sorted_idxs]
+        return first_hop_idxs
+    
+    def get_retrieve_idx_v3(self, q_emb, topk: int = 10, hop_num: int = 2):
+        # ---------- 2) first-hop Top-K retrieval ----------
+        first_hop_idxs = self.retrieve_topk(q_emb, topk=topk)
+
+        # ---------- 3) batch prepare path components ----------
+        # 对齐到 first hop
+        first_hops = (first_hop_idxs // hop_num) * hop_num
+        first_hops = first_hops.astype(int)
+
+        # 过滤非法 second hop
+        valid_mask = (first_hops + 1) < len(self.key_embds)
+        first_hops = first_hops[valid_mask]
+
+        if len(first_hops) == 0:
+            raise ValueError("No valid second-hop candidates found.")
+
+        # 映射到 dataset 行
+        sample_ids = first_hops // hop_num
+
+        # ---------- 4) build path strings (single tight loop) ----------
+        path_strings = [
+            build_path_string(
+                self.dataset[sid]["triple_lists"][0],
+                self.dataset[sid]["triple_lists"][1],
+            )
+            for sid in sample_ids
+        ]
+        
+        # ---------- 5) embed paths ----------
+        path_embs = self.create_query_embeddings(path_strings)  # (K, D)
+
+        # ---------- 6) path-level similarity ----------
+        scores = path_embs @ q_emb
+
+        # ---------- 7) reorder ----------
+        sorted_idxs = np.argsort(scores)[::-1]
+        first_hop_idxs = first_hops[sorted_idxs]
+        return first_hop_idxs
+
+
+
+    def collect_recall_v1(self, topk: int = 1):
+        hop_num=2
+        self.metrics_2hop_recall_1 = 0
+        self.metrics_2hop_recall_topk = 0
+        for idx, row in enumerate(tqdm(self.dataset, desc="Calculating Recall@1")):
+            q=row["Q"]
+            q_embd=self.create_query_embeddings([q])[0]
+            true_idxs=idx*2
+            retrieval_idxs=self.retrieve_topk(q_embd, topk)
+            if true_idxs == retrieval_idxs[0]:
+                self.metrics_2hop_recall_1 += 1
+            if true_idxs in retrieval_idxs:
+                self.metrics_2hop_recall_topk += 1
+            
+
+        self.print_metrics()
+
+
+    def collect_recall_v2(self, topk: int = 10, alpha: float = 1.0, beta: float = 0.25):
+        """
+        Key-level rerank Recall@1 with combined first-hop and second-hop scores.
+        """
+
+        assert self.hnsw_ready
+        assert self._use_cached_embd()
+
+        hop_num = 2
+        self.metrics_2hop_recall_1 = 0
+        self.metrics_2hop_recall_topk = 0
+
+        rerank_time=[]
+
+        for idx, row in enumerate(tqdm(self.dataset, desc="Calculating Recall@1 (Key-level rerank, combined)")):
+            q = row["Q"]
+
+            # ---------- 1) query embedding ----------
+            q_emb = self.create_query_embeddings([q])[0]  # (D,)
+
+            # ---------- 2) first-hop retrieval ----------
+            first_hop_idxs = self.retrieve_topk(q_emb, topk=topk)  # (topk,)
+            first_hop_idxs = (first_hop_idxs // hop_num) * hop_num
+
+            true_first_hop = idx * hop_num
+            start_rerank=time.time()
+            # ---------- 3) collect first-hop scores ----------
+            first_keys = self.key_embds[first_hop_idxs]          # (K, D)
+            first_scores = first_keys @ q_emb                    # (K,)
+
+            # ---------- 4) collect second-hop scores ----------
+            second_hops = []
+            valid_first = []
+            valid_first_scores = []
+
+            for c, s1 in zip(first_hop_idxs, first_scores):
+                c = int(c)
+                second_hop = c + 1
+                if second_hop < len(self.key_embds):
+                    second_hops.append(second_hop)
+                    valid_first.append(c)
+                    valid_first_scores.append(s1)
+
+            if not second_hops:
+                continue
+
+            second_keys = self.key_embds[second_hops]             # (K', D)
+            second_scores = second_keys @ q_emb                   # (K',)
+
+            valid_first_scores = np.asarray(valid_first_scores)
+
+            # ---------- 5) combined score ----------
+            combined_scores = alpha * valid_first_scores + beta * second_scores
+
+            best_idx = int(np.argmax(combined_scores))
+            best_first_hop = valid_first[best_idx]
+            rerank_time.append(time.time()-start_rerank)
+            
+            if best_first_hop == true_first_hop:
+                self.metrics_2hop_recall_1 += 1
+            if true_first_hop in first_hop_idxs:
+                self.metrics_2hop_recall_topk += 1
+
+        print(f"[HNSW] Rerank Time Distribution:")
+        print(f"  - Count: {len(rerank_time)}")
+        print(f"  - Mean: {np.mean(rerank_time):.4f}")
+        print(f"  - 95% Tail: {np.percentile(rerank_time, 95):.4f}")
+        self.print_metrics()
+
+    def collect_recall_v3_1(self, topk: int = 10):
+        assert self.hnsw_ready
+        assert self._use_cached_embd()
+
+        hop_num = 2
+        self.metrics_2hop_recall_1 = 0
+        self.metrics_2hop_recall_topk = 0
+        max_hop_idx = len(self.dataset) * hop_num
+
+        path_str_create_time=[]
+        path_str_embedding_time=[]
+        path_str_rerank_time=[]
+
+        for idx, row in enumerate(tqdm(self.dataset, desc="Calculating Recall@1 (Path-level rerank)")):
+            q = row["Q"]
+
+            # ---------- 1) query embedding ----------
+            q_emb = self.create_query_embeddings([q])[0]  # (D,)
+
+            # ---------- 2) first-hop Top-K retrieval ----------
+            first_hop_idxs = self.retrieve_topk(q_emb, topk=topk)
+
+            true_first_hop = idx * hop_num
+
+            # ---------- 3) batch prepare path components ----------
+            # 对齐到 first hop
+            first_hops = (first_hop_idxs // hop_num) * hop_num
+            first_hops = first_hops.astype(int)
+
+            # 过滤非法 second hop
+            valid_mask = (first_hops + 1) < max_hop_idx
+            first_hops = first_hops[valid_mask]
+
+            if len(first_hops) == 0:
+                continue
+
+            # 映射到 dataset 行
+            sample_ids = first_hops // hop_num
+
+            # ---------- 4) build path strings (single tight loop) ----------
+            t0 = time.time()
+            path_strings = [
+                build_path_string(
+                    self.dataset[sid]["triple_lists"][0],
+                    self.dataset[sid]["triple_lists"][1],
+                )
+                for sid in sample_ids
+            ]
+            t1 = time.time()
+            path_str_create_time.append(t1-t0)
+
+            # ---------- 5) embed paths ----------
+            path_embs = self.create_query_embeddings(path_strings)  # (K, D)
+            t2 = time.time()
+            path_str_embedding_time.append(t2-t1)
+
+            # ---------- 6) path-level similarity ----------
+            scores = path_embs @ q_emb
+            best_idx = int(np.argmax(scores))
+            best_first_hop = first_hops[best_idx]
+
+            if best_first_hop == true_first_hop:
+                self.metrics_2hop_recall_1 += 1
+            if true_first_hop in first_hop_idxs:
+                self.metrics_2hop_recall_topk += 1
+            t3 = time.time()
+            path_str_rerank_time.append(t3-t2)
+
+        self.print_metrics()
+        print(f"[Path-level Rerank] Create Time: {np.mean(path_str_create_time):.4f}")
+        print(f"[Path-level Rerank] Embedding Time: {np.mean(path_str_embedding_time):.4f}")
+        print(f"[Path-level Rerank] Rerank Time: {np.mean(path_str_rerank_time):.4f}")
+
+
+    def collect_recall1_batch(self):
+        """
+        Compute Recall@1 using batch HNSW retrieval.
+        Assumes 2-hop KB layout: true index = idx * 2
+        """
+        hop_num = 2
+        topk = 10
+
+        # 1) batch encode all queries
+        questions = [row["Q"] for row in self.dataset]
+        q_embds = self.create_query_embeddings(questions)  # (B, D)
+
+        # 2) batch retrieve
+        labels = self.retrieve_topk_batch(q_embds, topk=topk)  # (B, 1)
+
+        # 3) compute recall@1
+        for idx in range(len(self.dataset)):
+            true_idx = idx * hop_num
+            if labels[idx, 0] == true_idx:
+                self.metrics_2hop_recall_1 += 1
+            t=10 if topk>10 else topk
+            if true_idx in labels[idx, :t]:
+                self.metrics_2hop_recall_10 += 1
+
+        self.print_metrics()
+
+
+
+    
+    def get_avg_retrieval_time(self):
+        return np.mean(self.retrieval_time)
+
+    def print_metrics(self):
+        print(f"[HNSW] Recall@1: {self.metrics_2hop_recall_1}/{len(self.dataset)}={self.metrics_2hop_recall_1/len(self.dataset):.4f}")
+        print(f"[HNSW] Recall@top-k: {self.metrics_2hop_recall_topk}/{len(self.dataset)}={self.metrics_2hop_recall_topk/len(self.dataset):.4f}")
+        print(f"[HNSW] Retrieval Time Distribution:")
+        print(f"  - Count: {len(self.retrieval_time)}")
+        print(f"  - Mean: {np.mean(self.retrieval_time):.4f}")
+        print(f"  - 95% Tail: {np.percentile(self.retrieval_time, 95):.4f}")
+        print(f"[HNSW] Embedding Time Distribution:")
+        print(f"  - Count: {len(self.embedding_time)}")
+        print(f"  - Mean: {np.mean(self.embedding_time):.4f}")
+        print(f"  - 95% Tail: {np.percentile(self.embedding_time, 95):.4f}")
+        

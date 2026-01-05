@@ -204,14 +204,12 @@ def _perform_eval_batched(
     dataset,
     query_idx,
     kb_size,
-    eval_mode="kb",
     hop_num=None,            # None = single-hop, 2 = 2wiki
     use_kb_adj=False,
     filter_fn=None,          # dataset 级过滤（2wiki 用）
     remove_sorry=False,
     enable_retrieval=False,
 ):
-    assert eval_mode == "kb", "Only kb mode is supported in batched eval"
 
     # ---------- optional filter (2wiki) ----------
     if filter_fn is not None:
@@ -251,8 +249,10 @@ def _perform_eval_batched(
                 kb_keys, kb_vals = kb_retriever.get_key_embeddings(batch_idx)
         else:
             if enable_retrieval:
+                rerank_policy=2
+                print(f"[Retrieve] rerank_policy={rerank_policy}")
                 questions = [row["Q"] for row in batch]
-                kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, topk=1, device=torch.device("cuda"), random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
+                kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, ann_topk=10, rerank_topk=1, rerank_policy=rerank_policy, device=torch.device("cuda"), random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
             else:
                 kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
                     batch_indices=batch_idx,
@@ -295,7 +295,7 @@ def _perform_eval_batched(
             decode_s = prof["decode_s"]
             decode_tokens = max(1, prof["decode_tokens"])
 
-            TTFTs.append(retrieval_time + prefill_s)
+            TTFTs.append(prefill_s)
             TPOTs.append(decode_s / decode_tokens)
 
             model_out = format_output_for_synthetic(output[2:])
@@ -308,10 +308,12 @@ def _perform_eval_batched(
             all_answers.append(gt)
 
     end_time = time.time()
+    if enable_retrieval:
+        kb_retriever.print_metrics()
+        retrieval_time = kb_retriever.get_avg_retrieval_time()
     print(f"QPS: {query_size / (end_time - start_time):.2f}")
-    print(f"Avg TTFT: {np.mean(TTFTs):.4f}")
+    print(f"Avg TTFT: {np.mean(TTFTs)+retrieval_time:.4f}")
     print(f"Avg TPOT: {np.mean(TPOTs):.4f}")
-    print(f"2hop_recall@1: {kb_retriever.metrics_2hop_recall_1/query_size:.4f}")
 
     return all_model_outputs, all_answers
 
@@ -329,7 +331,6 @@ def eval_main_process(
     seed: int = 42,
     kb_size: int = -1,
     query_size: int = -1,
-    eval_mode: str = "kb",
     enable_retrieval: bool = False,
 ):
     if query_size > len(dataset):
@@ -376,7 +377,6 @@ def eval_main_process(
             dataset=dataset,
             query_idx=query_idx,
             kb_size=kb_size,
-            eval_mode=eval_mode,
             hop_num=hop_num,
             use_kb_adj=use_kb_adj,
             filter_fn=filter_fn,
@@ -388,67 +388,8 @@ def eval_main_process(
 
 
 
-def eval_generate():
-    """Evaluate generation using KB"""
-    args = parser.parse_args()
-
-    dataset_dir = args.dataset_dir
-
-    # adapter
-    encoder_model_spec = args.encoder_spec
-    encoder_path = args.encoder_dir
-
-
-    eval_mode = args.eval_mode
-    exp_config = args.exp_config_name
-    kb_layer_frequency = args.kb_layer_frequency
-    kb_scale_factor = args.kb_scale_factor
-    kb_scale_factor_range = args.kb_scale_factor_range
-
-    kb_size = args.kb_size
-    llm_base_dir = args.llm_base_dir
-    llm_type = args.llm_type
-    model_path = args.model_dir
-    seed = args.seed
-    test_dataset = args.test_dataset
-    query_head_path = args.query_head_path
-
-    # embeddings 
-    precomputed_embed_keys_path = args.precomputed_embed_keys_path
-    precomputed_embed_values_path = args.precomputed_embed_values_path
-
-
-    dataset_path=os.path.join(dataset_dir, test_dataset)
-    # 判断数据集是json还是jsonl格式
-    if dataset_path.endswith(".jsonl"):
-        dataset=[json.loads(line.strip()) for line in open(dataset_path)]
-    elif dataset_path.endswith(".json"):
-        dataset=json.load(open(dataset_path))
-    else:
-        raise ValueError(f"Unknown dataset format: {dataset_path}")
-
-    tokenizer, encoder, model, kb_config = _prepare_models(
-        encoder_model_spec,
-        encoder_path,
-        llm_type,
-        llm_base_dir,
-        model_path,
-        query_head_path,
-        kb_layer_frequency,
-        kb_scale_factor,
-    )
-    kb_config.format_short = args.format_short
-    kb_config.path_attn = args.path_attn
-
-    kb_retriever = KBRetriever(
-        encoder,
-        dataset,
-        precomputed_embed_keys_path=precomputed_embed_keys_path,
-        precomputed_embed_values_path=precomputed_embed_values_path,
-        hnsw_index_path=args.hnsw_index_path,
-        base_embeder_path=args.base_embeder_path,
-    )
-
+def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retriever):
+    
     results_pair_list, scale_factor_list = eval_main_process(
         dataset,
         tokenizer,
@@ -456,13 +397,12 @@ def eval_generate():
         encoder,
         kb_config,
         kb_retriever,
-        kb_scale_factor_range,
-        kb_scale_factor,
+        args.kb_scale_factor_range,
+        args.kb_scale_factor,
         args.dataset_type,
-        seed,
-        kb_size,
+        args.seed,
+        args.kb_size,
         args.query_size,
-        args.eval_mode,
         kb_retriever.is_hnsw_ready(),
     )
 
@@ -477,13 +417,27 @@ def eval_generate():
         # print(gen_results)
         print(f"---- kb_scale_factor: {sf}, {score_results}")
         if args.save_dir is not None:
-            (Path(args.save_dir) / exp_config).mkdir(exist_ok=True, parents=True)
-            write_to_json(score_results, Path(args.save_dir) / f"{exp_config}-{sf}.json")
-            text_file = open(os.path.join(args.save_dir, f"{exp_config}-{sf}.txt"), "w")
+            (Path(args.save_dir) / args.exp_config_name).mkdir(exist_ok=True, parents=True)
+            write_to_json(score_results, Path(args.save_dir) / f"{args.exp_config_name}-{sf}.json")
+            text_file = open(os.path.join(args.save_dir, f"{args.exp_config_name}-{sf}.txt"), "w")
             text_file.write(gen_results)
 
+def debug_measure_retrieval_accuracy(kb_retriever: KBRetriever, dataset: list[dict], topk: int = 1):
+    # topk=[1, 10, 100, 1000]
+    # eval_policy=[1, 2, 3]
 
-
+    topk=[10]
+    eval_policy=[2]
+    for k in topk:
+        print(f"==========K={k}==========")
+        for policy in eval_policy:
+            print(f"---------- Policy {policy} ----------")
+            if policy == 1:
+                kb_retriever.collect_recall_v1(topk=k)
+            elif policy == 2:
+                kb_retriever.collect_recall_v2(topk=k)
+            elif policy == 3:
+                kb_retriever.collect_recall_v3_1(topk=k)
 
 parser = argparse.ArgumentParser(description="Evaluation script")
 
@@ -614,13 +568,7 @@ subparsers = parser.add_subparsers(dest="command", required=True)
 gen_parser = subparsers.add_parser(
     "generation", parents=[parent_parser], help="Evaluate generation"
 )
-gen_parser.add_argument(
-    "--eval_mode",
-    type=str,
-    choices=["kb", "icl", "zeroshot"],
-    default="kb",
-    help="Evaluation mode: knowledge base, in-context learning, or zero-shot",
-)
+
 gen_parser.add_argument(
     "--exp_config_name",
     type=str,
@@ -641,12 +589,56 @@ gen_parser.add_argument(
     help='Filter out "sorry" answers from the output',
 )
 
+debug_parser = subparsers.add_parser(
+    "debug", parents=[parent_parser], help="Debug retrieval accuracy"
+)
 
 def main():
     args = parser.parse_args()
 
+    dataset_path=os.path.join(args.dataset_dir, args.test_dataset)
+    # 判断数据集是json还是jsonl格式
+    if dataset_path.endswith(".jsonl"):
+        dataset=[json.loads(line.strip()) for line in open(dataset_path)]
+    elif dataset_path.endswith(".json"):
+        dataset=json.load(open(dataset_path))
+    else:
+        raise ValueError(f"Unknown dataset format: {dataset_path}")
+
+    tokenizer, encoder, model, kb_config = _prepare_models(
+        args.encoder_spec,
+        args.encoder_dir,
+        args.llm_type,
+        args.llm_base_dir,
+        args.model_dir,
+        args.query_head_path,
+        args.kb_layer_frequency,
+        args.kb_scale_factor,
+    )
+    kb_config.format_short = args.format_short
+    kb_config.path_attn = args.path_attn
+
+    kb_retriever = KBRetriever(
+        encoder,
+        dataset,
+        precomputed_embed_keys_path=args.precomputed_embed_keys_path,
+        precomputed_embed_values_path=args.precomputed_embed_values_path,
+        hnsw_index_path=args.hnsw_index_path,
+        base_embeder_path=args.base_embeder_path,
+    )
+
     if args.command == "generation":
-        eval_generate()
+        eval_generate(
+            args,
+            dataset,
+            tokenizer,
+            encoder,
+            model,
+            kb_config,
+            kb_retriever,
+        )
+    elif args.command == "debug":
+        debug_measure_retrieval_accuracy(kb_retriever, dataset)
     else:
         raise ValueError(f"command {args.command} not recognised")
 
