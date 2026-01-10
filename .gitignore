@@ -172,3 +172,5 @@ experiments/train/*
 experiments/attn*
 parsed*
 generation_result*
+hnsw.index
+hnsw.meta.json

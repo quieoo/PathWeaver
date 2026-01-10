@@ -1290,7 +1290,6 @@ def _prepare_models(
 
         model.set_attn_implementation("eager")
         replace_attention_with_kblam(model)
-        model.
     else:
         model = KBLaMPhi3ForCausalLM.from_pretrained(
             model_path,

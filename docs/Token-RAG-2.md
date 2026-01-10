@@ -2121,3 +2121,47 @@ nohup python eval_generation.py debug \
 
 ````
 
+
+# 图增强的RAG检索
+## 使用PathWeaver中的多跳检索
+
+````bash
+conda activate kblam-rag
+export CUDA_VISIBLE_DEVICES=1
+export HF_ENDPOINT=https://hf-mirror.com
+export DASHSCOPE_API_KEY=sk-459cec30805e4538ac2c086a65d32b16
+
+nohup python graph_rag.py \
+  --n-samples 100 \
+  --model-path /home/sdu/zhu/models/llama3_8B_instruct \
+  --similarity-top-k 10 \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/graph_rag \
+  --test_dataset 2wiki.json \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_test_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/2wiki_hnsw \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B >> graph_rag.log 2>&1 &
+
+nohup python graph_rag.py \
+  --n-samples 100 \
+  --model-path /home/sdu/zhu/models/llama3_8B_instruct \
+  --similarity-top-k 10 \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/graph_rag \
+  --test_dataset hotpot_2hop.json \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/hotpot_2hop/test_datasets_qwen-embedding-0.6B_embd_value.npy \
+  --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/hotpot_2hop_hnsw \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B >> graph_rag.log 2>&1 &
+
+nohup python graph_rag.py \
+  --n-samples 100 \
+  --model-path /home/sdu/zhu/models/llama3_8B_instruct \
+  --similarity-top-k 10 \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/graph_rag \
+  --test_dataset musique_2hop.json \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/musique_2hop/test_datasets_triples_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/filtered_data/musique_2hop/test_datasets_triples_qwen-embedding-0.6B_embd_value.npy \
+  --hnsw_index_path /mnt/n0/datasets/wiki_hotspot_musique/musique_2hop_hnsw \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B >> graph_rag.log 2>&1 &
+
+````

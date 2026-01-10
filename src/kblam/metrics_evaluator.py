@@ -74,7 +74,7 @@ def compute_faithfulness_local(model_outputs, references):
 # ======================
 # 🔹 Faithfulness 检测 - 阿里云百炼 API 版
 # ======================
-def compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus"):
+def compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus", absolute=False):
 
     import re, os
     from openai import OpenAI
@@ -99,12 +99,16 @@ def compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plu
 
     # --- Step 2: 一次性请求模型 ---
     try:
+        if absolute:
+            output_format="输出格式：如果语义一致则输出1，否则输出0。不要解释。"
+        else:
+            output_format="输出格式：每一行仅输出一个小数（0.0~1.0），与输入编号对应。不要解释。"
         completion = client.chat.completions.create(
             model=model_name,
             messages=[
                 {"role": "system", "content": (
                     "你是一名文本一致性评估助手。请判断每对文本在事实层面的语义一致程度。\n"
-                    "输出格式：每一行仅输出一个小数（0.0~1.0），与输入编号对应。不要解释。"
+                    f"{output_format}"
                 )},
                 {"role": "user", "content": prompt},
             ],
@@ -223,22 +227,7 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
     except Exception as e:
         print(f"❌ Error calculating F1-Overlap: {e}")
 
-    # --- BERTScore（自动降级）---
-    # BertModel="roberta-large"
-    # device = "cuda" if torch.cuda.is_available() else "cpu"    
-    # device = "cpu"
-    # P, R, F1 = score(
-    #     model_outputs,
-    #     references,
-    #     lang=lang,
-    #     model_type="microsoft/deberta-xlarge-mnli",
-    #     # model_type="roberta-large",
-    #     verbose=True,
-    #     device=device,
-    #     batch_size=4,
-    #     use_fast_tokenizer=False,
-    # )
-
+    # --- BERT ---
     from transformers import AutoTokenizer, AutoModel
     import os
 
@@ -276,43 +265,6 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
         references,
     )
 
-
-
-    # try:
-    #     print("Calculating BERTScore on GPU...")
-    #     device = "cuda" if torch.cuda.is_available() else "cpu"
-    #     device = "cpu"
-    #     P, R, F1 = score(
-    #         model_outputs,
-    #         references,
-    #         lang=lang,
-    #         model_type=BertModel,
-    #         verbose=True,
-    #         device=device,
-    #         batch_size=4,
-    #         # use_fast_tokenizer=True,
-    #     )
-    # except RuntimeError as e:
-    #     print(f"⚠️ RuntimeError: {e}")
-    #     if "CUDA out of memory" in str(e):
-    #         print("⚠️ CUDA OOM detected. Retrying on CPU...")
-    #         torch.cuda.empty_cache()
-    #         P, R, F1 = score(
-    #             model_outputs,
-    #             references,
-    #             lang=lang,
-    #             model_type=BertModel,
-    #             verbose=True,
-    #             device="cpu",
-    #             batch_size=4,
-    #             # use_fast_tokenizer=True,
-    #         )
-    #     else:
-    #         raise e
-    # except Exception as e:
-    #     print(f"❌ Error calculating BERTScore: {e}")
-    #     P, R, F1 = None, None, None
-
     if P is not None:
         results_dict["bert_score_precision"] = float(np.mean(P.numpy()))
         results_dict["bert_score_recall"] = float(np.mean(R.numpy()))
@@ -344,6 +296,33 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
             print(f"✅ Faithfulness: {faith:.4f}")
     except Exception as e:
         print(f"❌ Error calculating Faithfulness: {e}")
+
+    # --- Faithfulness01 ---
+    try:
+        if "OPENAI_API_KEY" in os.environ:
+            faith = compute_faithfulness_gpt(model_outputs, references)
+        elif "DASHSCOPE_API_KEY" in os.environ:
+            if len(model_outputs) > 20:
+                print(f"🔸 Large input detected ({len(model_outputs)} samples), splitting into batches of 20...")
+                all_scores = []
+                for i in range(0, len(model_outputs), 20):
+                    batch_score = compute_faithfulness_bailian(
+                        model_outputs[i:i+20],
+                        references[i:i+20],
+                        model_name="qwen-plus",
+                        absolute=True
+                    )
+                    all_scores.append(batch_score)
+                faith = float(np.mean(all_scores))
+            else:
+                faith = compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus", absolute=True)
+        else:
+            faith = compute_faithfulness_local(model_outputs, references)
+        if faith is not None:
+            results_dict["faithfulness01"] = faith
+            print(f"✅ Faithfulness01: {faith:.4f}")
+    except Exception as e:
+        print(f"❌ Error calculating Faithfulness01: {e}")
 
     return results_dict
 
