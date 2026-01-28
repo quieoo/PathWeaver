@@ -170,8 +170,8 @@ def format_output_for_synthetic(model_output: str) -> str:
 
     text = model_output
 
-    # 找出所有作为「单词」出现的 is / are
-    matches = list(re.finditer(r'\b(is|are)\b', text))
+    # 找出所有作为「单词」出现的 is / are / was / were
+    matches = list(re.finditer(r'\b(is|are|was|were)\b', text))
 
     if matches:
         # 如果有多个 is/are，就取最后一个；否则就取唯一的那个

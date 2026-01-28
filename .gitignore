@@ -174,3 +174,8 @@ parsed*
 generation_result*
 hnsw.index
 hnsw.meta.json
+
+experiments/loss*
+peek*
+tmp*
+

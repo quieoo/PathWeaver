@@ -14,6 +14,8 @@ from sentence_transformers import SentenceTransformer
 import time
 
 
+
+
 def build_path_string(t1: dict, t2: dict) -> str:
     """
     Build a 2-hop path string with structural awareness.
@@ -44,6 +46,246 @@ def build_path_string(t1: dict, t2: dict) -> str:
     # ---------- relation + relation ----------
     # X directed sequel
     return f"{name1} {type1} {type2}"
+
+class StageRetriever:
+    def __init__(self, max_kb_paths=16, hop_num=2):
+        self.max_kb_paths=max_kb_paths
+        self.hop_num=hop_num
+        # 四个阶段
+        # self.stage_config=[0.5, 0.7, 0.85, 1]
+
+        # 五个阶段: 0.1, 0.4, 0.3, 0.15, 0.15
+        self.stage_config=[0.1, 0.4, 0.7, 0.85, 1]
+        self.q_fit_stage=1
+
+        self.path_nums_stage = [
+            [1, 0, self.max_kb_paths-1],
+            [1, 0, self.max_kb_paths-1],
+            [1, int((self.max_kb_paths-1)/2), self.max_kb_paths-1-int((self.max_kb_paths-1)/2)],
+            [1, self.max_kb_paths-1, 0],
+            [0, self.max_kb_paths, 0]
+        ]   # [gold, neg, random_neg]
+            
+    def get_stage(self, current_step ,total_steps):
+        r = current_step / total_steps
+        for s in range(len(self.stage_config)):
+            if r < self.stage_config[s]:
+                return s
+
+    def get_path_stage(self, stage, sample, all_samples, max_kb_paths=16, shuffle=True):
+        kb_paths=[]
+        gold_path = sample.get("gold_path", None)
+        neg_paths = sample.get("triple_lists", [])
+        def random_paths(k):
+            res = []
+            while len(res) < k:
+                s = random.choice(all_samples)
+                if "gold_path" in s:
+                    res.append(s["gold_path"])
+            return res
+
+        if stage <= 1:
+            kb_paths=[gold_path]
+            kb_paths += random_paths(max_kb_paths - 1)
+
+        elif stage == 2:
+            kb_paths = [gold_path]
+            n_neg = min(len(neg_paths), max_kb_paths - 1)
+            if n_neg > 0:
+                kb_paths += random.sample(neg_paths, n_neg)
+            n_random = max_kb_paths - 1 - n_neg
+            if n_random > 0:
+                kb_paths += random_paths(n_random)
+        else:
+            n_neg = min(len(neg_paths), max_kb_paths - 1)
+            if n_neg > 0:
+                kb_paths += random.sample(neg_paths, n_neg)
+            n_random = max_kb_paths - 1 - n_neg
+            if n_random > 0:
+                kb_paths += random_paths(n_random)
+        
+        if shuffle:
+            random.shuffle(kb_paths)
+        
+        return kb_paths
+
+
+    def get_triple_ids_stage(self, stage, sample, all_samples, shuffle=True, verbose=False):
+        sample_base_offset=sample["start_id"]
+
+        # decide the num of paths
+        acutal_gold_path_num=1 if sample.get("gold_path", None) is not None else 0
+        acutal_neg_path_num=len(sample.get("triple_lists", []))
+
+        stage_gold_num, stage_neg_num, stage_random_neg_num = self.path_nums_stage[stage]
+
+
+        stage_gold_num = min(stage_gold_num, acutal_gold_path_num)
+        stage_neg_num = min(stage_neg_num, acutal_neg_path_num)
+        stage_random_num=self.max_kb_paths-stage_gold_num-stage_neg_num
+
+        if verbose:
+            print(f"[DEBUG] S{stage} gold-nega-random {stage_gold_num}-{stage_neg_num}-{stage_random_num}")
+            
+        path_triple_base=[] # 每个path的第一个三元组的id
+        if stage_gold_num > 0:
+            path_triple_base.append(sample_base_offset)
+        
+        if stage_neg_num > 0:
+            for p in range(stage_neg_num):
+                path_triple_base.append(sample_base_offset + self.hop_num + p * self.hop_num)
+
+        if stage_random_num > 0:
+            random_samples=random.sample(all_samples, stage_random_num)
+            for s in random_samples:
+                s_base_offset=s["start_id"]
+                path_triple_base.append(s_base_offset)
+        if shuffle:
+            # triples_ids应该能够分成多个hop_num的组，将组间顺序打乱，保持组内顺序
+            random.shuffle(path_triple_base)
+        
+        triples_ids=[]
+        for p in path_triple_base:
+            for i in range(self.hop_num):
+                triples_ids.append(p + i)
+
+        return triples_ids
+            
+
+    def get_question_type_stage(self, stage):
+        if stage < self.q_fit_stage:
+            return "gold_Q"
+        else:
+            return "Q"
+    
+def get_question_type_sampled_T1(current_step, total_steps, batch_size, verbose=False):
+    # curriculum settings
+    gold_question_ratio_per_stage = [1.0, 0.7, 0.3, 0.1]
+    stage_num = len(gold_question_ratio_per_stage)
+
+    progress = current_step / float(total_steps)
+    cur_stage = min(int(progress * stage_num), stage_num - 1)
+    gold_ratio = gold_question_ratio_per_stage[cur_stage]
+
+    question_type_array = [
+        "gold_Q" if random.random() < gold_ratio else "Q"
+        for _ in range(batch_size)
+    ]
+    if verbose:
+        print(f"[DEBUG] T1-Q-S{cur_stage} gold-ratio {gold_ratio} batch size {batch_size}, actual gold num {question_type_array.count('gold_Q')}")
+
+    return question_type_array
+
+
+# T1: 保持1*gold path + 随机(max_kb_paths-1)个neg path
+def get_triple_ids_T1(sample, all_samples, max_kb_paths=16, hop_num=2, shuffle=True, verbose=False):
+    sample_base_offset=sample["start_id"]
+    stage_gold_num, stage_neg_num, stage_random_num = 1, 0, max_kb_paths-1
+
+    if verbose:
+        print(f"[DEBUG] T1-Path gold-nega-random {stage_gold_num}-{stage_neg_num}-{stage_random_num}")
+
+    path_triple_base=[] # 每个path的第一个三元组的id
+    if stage_gold_num > 0:
+        path_triple_base.append(sample_base_offset)
+    
+    if stage_neg_num > 0:
+        for p in range(stage_neg_num):
+            path_triple_base.append(sample_base_offset + hop_num + p * hop_num)
+
+    if stage_random_num > 0:
+        random_samples=random.sample(all_samples, stage_random_num)
+        for s in random_samples:
+            s_base_offset=s["start_id"]
+            path_triple_base.append(s_base_offset)
+    if shuffle:
+        # triples_ids应该能够分成多个hop_num的组，将组间顺序打乱，保持组内顺序
+        random.shuffle(path_triple_base)
+    
+    triples_ids=[]
+    for p in path_triple_base:
+        for i in range(hop_num):
+            triples_ids.append(p + i)
+
+    return triples_ids
+
+
+def get_question_type_sampled_T2(current_step, total_steps, batch_size, verbose=False):
+    # curriculum settings
+    gold_question_ratio = 0
+
+    question_type_array = [
+        "Q"
+        for _ in range(batch_size)
+    ]
+    if verbose:
+        print(f"[DEBUG] T2-Q gold-ratio {gold_question_ratio} batch size {batch_size}, actual gold num {question_type_array.count('gold_Q')}")
+
+    return question_type_array
+
+def get_triple_ids_T2(sample, all_samples, current_step, total_steps, max_kb_paths=16, hop_num=2, shuffle=True, verbose=False):
+    path_compositions = [
+        # gold path, random path, negative path
+        [1, 3, max_kb_paths],
+        [1, 0, max_kb_paths],
+        [0, 0, max_kb_paths]
+    ]
+    step_ratio=[0.3, 0.5, 0.7, 1.0]
+    stage_num=len(step_ratio)
+
+    progress = current_step / float(total_steps)
+    cur_stage = stage_num - 1
+    for i in range(stage_num):
+        if progress < step_ratio[i]:
+            cur_stage = i
+            break
+
+    
+    def get_path_composition(stage):
+        if stage == 0:
+            return path_compositions[0]
+        elif stage == 1:
+            return path_compositions[1] if random.random() < 0.7 else path_compositions[2]
+        elif stage == 2:
+            return path_compositions[1] if random.random() < 0.3 else path_compositions[2]
+        else:
+            return path_compositions[2]
+
+    sample_base_offset=sample["start_id"]
+    acutal_gold_path_num=1 if sample.get("gold_path", None) is not None else 0
+    acutal_neg_path_num=len(sample.get("triple_lists", []))
+    stage_gold_num, stage_random_num, stage_neg_num = get_path_composition(cur_stage)
+
+    stage_gold_num=min(stage_gold_num, acutal_gold_path_num)
+    stage_neg_num=min(stage_neg_num, acutal_neg_path_num)
+
+    if verbose:
+        print(f"[DEBUG] T2-Path-S{cur_stage} gold-nega-random {stage_gold_num}-{stage_neg_num}-{stage_random_num}")
+
+    path_triple_base=[] # 每个path的第一个三元组的id
+    if stage_gold_num > 0:
+        path_triple_base.append(sample_base_offset)
+    
+    if stage_neg_num > 0:
+        for p in range(stage_neg_num):
+            path_triple_base.append(sample_base_offset + hop_num + p * hop_num)
+
+    if stage_random_num > 0:
+        random_samples=random.sample(all_samples, stage_random_num)
+        for s in random_samples:
+            s_base_offset=s["start_id"]
+            path_triple_base.append(s_base_offset)
+            
+    if shuffle:
+        # triples_ids应该能够分成多个hop_num的组，将组间顺序打乱，保持组内顺序
+        random.shuffle(path_triple_base)
+    
+    triples_ids=[]
+    for p in path_triple_base:
+        for i in range(hop_num):
+            triples_ids.append(p + i)
+
+    return triples_ids
 
 class KBRetriever:
     def __init__(
@@ -77,10 +319,10 @@ class KBRetriever:
             if not self.load_hnsw_index():
                 print(f"Load HNSW index failed: {hnsw_index_path}, create a new one.")
                 self.build_and_save_hnsw_index()
-            if base_embeder_path is None:
-                raise ValueError("base_embeder_path is None, but hnsw_index_path is not None.")
-            # self.base_embeder = SentenceTransformer(base_embeder_path, device="cpu")
-            self.base_embeder = SentenceTransformer(base_embeder_path, device="cuda")
+        if base_embeder_path is not None:
+            self.base_embeder = SentenceTransformer(base_embeder_path)
+            self.base_embeder.to("cuda")
+        
             
         
         # metrics
@@ -89,6 +331,7 @@ class KBRetriever:
 
         self.retrieval_time=[]
         self.embedding_time=[]
+        self.stage_starts=[False, False, False, False] 
 
     
     def reset_metrics(self):
@@ -235,6 +478,7 @@ class KBRetriever:
             values = torch.ones(row_idx.size(0), dtype=key_true.dtype, device=adj_device)
             sparse_adj = torch.sparse_coo_tensor(indices, values, (kb_len, kb_len), device=adj_device).coalesce()
             # kb_adjs.append(sparse_adj)
+
             return key_true, val_true, sparse_adj
 
         # 形状变为(B, 2, d)
@@ -852,4 +1096,357 @@ class KBRetriever:
         print(f"  - Count: {len(self.embedding_time)}")
         print(f"  - Mean: {np.mean(self.embedding_time):.4f}")
         print(f"  - 95% Tail: {np.percentile(self.embedding_time, 95):.4f}")
+
+
+    def build_kb_embedding_and_adj_for_at2qa(
+        self,
+        sample_id,
+        step: int,
+        total_steps: int,
+        max_kb_paths: int = 16,
+        device: torch.device | None = None,
+        hop_num: int = 2,
+    ):
+        sample=self.dataset[sample_id]
+        all_samples=self.dataset
+
+        sr=StageRetriever()
+        # decide current stage
+        stage = sr.get_stage(step, total_steps)
+        kb_paths = sr.get_path_stage(stage, sample, all_samples, max_kb_paths)
+
         
+        for s in range(len(self.stage_starts)):
+            if not self.stage_starts[s] and stage >= s:
+                self.stage_starts[s] = True
+                print(f"[KBRetriever] Stage {s} starts")
+                print(f"Q: {sample['Q']}")
+                print(f"gold_Q: {sample['gold_Q']}")
+                print(f"A: {sample['A']}")
+                print("-------------paths-------------")
+                print(kb_paths)
+                print("-------------------------------")
+
+        # create kb embeddings
+        key_texts = []
+        val_texts = []
+
+        for path in kb_paths:
+            # NOTE: 每个路径最多 hop_num 个 hop
+            path=path[:hop_num]
+            for tri in path:
+                key_texts.append(tri["key_string"])
+                # value 用 description（与你现有 KBEncoder 设计一致）
+                val_texts.append(tri["description"])
+
+        concat=key_texts+val_texts
+        print(concat)
+        concat_emb = self.base_embeder.encode(concat, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        key_emb_base=concat_emb[:len(key_texts)]
+        val_emb_base=concat_emb[len(key_texts):]
+
+        # key_emb_base = self.base_embeder.encode(key_texts, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        # val_emb_base = self.base_embeder.encode(val_texts, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        
+        kb_keys=self.encoder.encode_key(base_emb=key_emb_base)
+        kb_vals=self.encoder.encode_val(base_emb=val_emb_base)
+
+
+        if device is not None:
+            kb_keys = kb_keys.to(device)
+            kb_vals = kb_vals.to(device)
+
+        N = kb_keys.size(0)
+
+        # ------------------------------------------------
+        # 3. Build sparse adjacency (path-local only)
+        # ------------------------------------------------
+        # Edges: (0->1), (2->3), (4->5), ...
+        adj_device = device if device is not None else kb_keys.device
+
+        rows = torch.arange(0, N, hop_num, device=adj_device)
+        cols = rows + 1
+
+
+        indices = torch.stack([rows, cols])   # (3, num_edges)
+        values = torch.ones(rows.size(0), dtype=kb_keys.dtype, device=adj_device)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(N, N),
+            dtype=kb_keys.dtype,
+            device=adj_device,
+        ).coalesce()
+
+        return kb_keys, kb_vals, kb_adj
+
+
+    # load QA datasets, but compute embeddings online
+    def get_embeddings_with_adj_2wiki_at2qa(
+        self,
+        batch_indices,
+        kb_size: int | None = None,
+        step: int | None = None,
+        device: torch.device | None = None,
+        hop_num: int = 2,
+    ):
+        key_texts = []
+        val_texts = []
+
+        for sample_id in batch_indices:
+            sample=self.dataset[sample_id]
+            if len(sample["triple_lists"]) != 2:
+                raise ValueError(f"Sample {sample['id']} has {len(sample['triple_lists'])} triple lists, expected 2.")
+            for triple in sample["triple_lists"]:
+                key_texts.append(triple["key_string"])
+                val_texts.append(triple["description"])
+
+        print(f"key_texts: {key_texts}")
+        print(f"val_texts: {val_texts}")
+
+        concat=key_texts+val_texts
+        concat_emb = self.base_embeder.encode(concat, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        key_emb_base=concat_emb[:len(key_texts)]
+        val_emb_base=concat_emb[len(key_texts):]
+
+        print(f"key_emb_base: {key_emb_base}")
+        print(f"val_emb_base: {val_emb_base}")
+        # 统计key_emb_base的均值和方差
+        print(f"key_emb_base mean: {np.mean(key_emb_base)}")
+        print(f"key_emb_base std: {np.std(key_emb_base)}")
+        # 统计val_emb_base的均值和方差
+        print(f"val_emb_base mean: {np.mean(val_emb_base)}")
+        print(f"val_emb_base std: {np.std(val_emb_base)}")
+
+        # key_emb_base = self.base_embeder.encode(key_texts, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        # val_emb_base = self.base_embeder.encode(val_texts, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        
+        kb_keys=self.encoder.encode_key(base_emb=key_emb_base)
+        kb_vals=self.encoder.encode_val(base_emb=val_emb_base)
+        
+        print(f"kb_keys: {kb_keys}")
+        print(f"kb_vals: {kb_vals}")
+
+
+        if device is not None:
+            kb_keys = kb_keys.to(device)
+            kb_vals = kb_vals.to(device)
+
+        N = kb_keys.size(0)
+
+        # ------------------------------------------------
+        # 3. Build sparse adjacency (path-local only)
+        # ------------------------------------------------
+        # Edges: (0->1), (2->3), (4->5), ...
+        adj_device = device if device is not None else kb_keys.device
+
+        rows = torch.arange(0, N, hop_num, device=adj_device)
+        cols = rows + 1
+
+
+        indices = torch.stack([rows, cols])   # (3, num_edges)
+        values = torch.ones(rows.size(0), dtype=kb_keys.dtype, device=adj_device)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(N, N),
+            dtype=kb_keys.dtype,
+            device=adj_device,
+        ).coalesce()
+        print(f"kb_adj: {kb_adj}")
+        return kb_keys, kb_vals, kb_adj
+
+
+    def get_embeddings_at2qa_from_precompute(
+        self,
+        sample_id,
+        step: int,
+        total_steps: int,
+        max_kb_paths: int = 16,
+        device: torch.device | None = None,
+        hop_num: int = 2,
+    ):
+        sample=self.dataset[sample_id]
+        all_samples=self.dataset
+
+        sr=StageRetriever()
+        # decide current stage
+        stage = sr.get_stage(step, total_steps)
+        
+        # instead of get kb_path, get triple_idx
+        true_triple_indices=sr.get_triple_ids_stage(stage, sample, all_samples, verbose=True if step % 100 == 0 else False)
+
+        key_emb_base=self.key_embds[true_triple_indices]
+        val_emb_base=self.value_embds[true_triple_indices]
+
+        kb_keys=self.encoder.encode_key(base_emb=key_emb_base)
+        kb_vals=self.encoder.encode_val(base_emb=val_emb_base)
+
+
+        if device is not None:
+            kb_keys = kb_keys.to(device)
+            kb_vals = kb_vals.to(device)
+
+        N = kb_keys.size(0)
+
+        # ------------------------------------------------
+        # 3. Build sparse adjacency (path-local only)
+        # ------------------------------------------------
+        # Edges: (0->1), (2->3), (4->5), ...
+        adj_device = device if device is not None else kb_keys.device
+
+        rows = torch.arange(0, N, hop_num, device=adj_device)
+        cols = rows + 1
+
+
+        indices = torch.stack([rows, cols])   # (3, num_edges)
+        values = torch.ones(rows.size(0), dtype=kb_keys.dtype, device=adj_device)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(N, N),
+            dtype=kb_keys.dtype,
+            device=adj_device,
+        ).coalesce()
+
+        return kb_keys, kb_vals, kb_adj
+
+    def build_kb_embedding_and_adj_for_at2qa_batch(
+        self,
+        sample_ids: list[int],
+        step: int,
+        total_steps: int,
+        max_kb_paths: int = 16,
+        hop_num: int = 2,
+        device: torch.device | None = None,
+        verbose: bool = False,
+    ):
+
+        device = device or torch.device("cuda")
+
+        # -----------------------------
+        # 1. decide current stage
+        # -----------------------------
+        sr=StageRetriever()
+        stage=sr.get_stage(step, total_steps)
+        all_samples = self.dataset
+        all_kb_paths = []          # flattened list of paths
+
+
+        # -----------------------------
+        # 3. collect kb_paths for each sample
+        # -----------------------------
+        for sid in sample_ids:
+            sample = all_samples[sid]
+            kb_paths=sr.get_path_stage(stage, sample, all_samples, max_kb_paths)
+
+            # ---- flatten ----
+            for pid, path in enumerate(kb_paths):
+                if path is None:
+                    continue
+                all_kb_paths.append(path)
+
+        if verbose:
+            print(f"[AT2QA-Batch] stage={stage}, "
+                f"samples={len(sample_ids)}, "
+                f"paths={len(all_kb_paths)}")
+
+        key_texts = []
+        val_texts = []
+
+        for path in all_kb_paths:
+            for hop in range(hop_num):
+                key_texts.append(path[hop]["key_string"])
+                val_texts.append(path[hop]["description"])
+        
+        concat=key_texts+val_texts
+        concat_emb = self.base_embeder.encode(concat, convert_to_numpy=True, normalize_embeddings=True)  # (B, D)
+        key_emb_base=concat_emb[:len(key_texts)]
+        val_emb_base=concat_emb[len(key_texts):]
+
+        # key_emb_base = self.base_embeder.encode(key_texts, convert_to_numpy=True)  # (B, D)
+        # val_emb_base = self.base_embeder.encode(val_texts, convert_to_numpy=True)  # (B, D)
+        kb_keys=self.encoder.encode_key(base_emb=key_emb_base)
+        kb_vals=self.encoder.encode_val(base_emb=val_emb_base)
+
+
+        # -----------------------------
+        # 5. build global sparse adj
+        # -----------------------------
+        # for each path: connect hop0 -> hop1
+        num_paths = len(all_kb_paths)
+        total_nodes = num_paths * hop_num
+
+        rows = torch.arange(0, total_nodes, hop_num, device=device)
+        cols = rows + 1
+
+        indices = torch.stack([rows, cols])
+        values = torch.ones(rows.size(0), device=device)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            (total_nodes, total_nodes),
+            device=device,
+        ).coalesce()
+
+        return kb_keys, kb_vals, kb_adj
+    def get_embeddings_at2qa_from_precompute_batch(
+        self,
+        sample_ids: list[int],
+        step: int,
+        total_steps: int,
+        max_kb_paths: int = 16,
+        device: torch.device | None = None,
+        hop_num: int = 2,
+    ):
+        all_samples=self.dataset
+        # sr=StageRetriever()
+        # stage = sr.get_stage(step, total_steps)
+
+        all_true_triple_indices=[]
+        for sid in sample_ids:
+            sample = all_samples[sid]
+            # true_triple_indices=sr.get_triple_ids_stage(stage, sample, all_samples, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
+            # true_triple_indices = get_triple_ids_T1(sample, all_samples, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
+            true_triple_indices = get_triple_ids_T2(sample, all_samples, step, total_steps, max_kb_paths, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
+            all_true_triple_indices.extend(true_triple_indices)
+                
+        key_emb_base=self.key_embds[all_true_triple_indices]
+        val_emb_base=self.value_embds[all_true_triple_indices]
+
+        kb_keys=self.encoder.encode_key(base_emb=key_emb_base)
+        kb_vals=self.encoder.encode_val(base_emb=val_emb_base)
+
+
+        if device is not None:
+            kb_keys = kb_keys.to(device)
+            kb_vals = kb_vals.to(device)
+
+        N = kb_keys.size(0)
+
+        # ------------------------------------------------
+        # 3. Build sparse adjacency (path-local only)
+        # ------------------------------------------------
+        # Edges: (0->1), (2->3), (4->5), ...
+        adj_device = device if device is not None else kb_keys.device
+
+        rows = torch.arange(0, N, hop_num, device=adj_device)
+        cols = rows + 1
+
+
+        indices = torch.stack([rows, cols])   # (3, num_edges)
+        values = torch.ones(rows.size(0), dtype=kb_keys.dtype, device=adj_device)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size=(N, N),
+            dtype=kb_keys.dtype,
+            device=adj_device,
+        ).coalesce()
+
+        return kb_keys, kb_vals, kb_adj 

@@ -41,10 +41,12 @@ from kblam.utils.eval_utils import (
     format_output_for_synthetic,
 )
 from kblam.utils.train_utils import get_kb_embd
-from kblam.kb_retriever import KBRetriever
+from kblam.kb_retriever import KBRetriever, StageRetriever, get_question_type_sampled_T1, get_question_type_sampled_T2
 from kblam.metrics_evaluator import full_evaluation
 import time
 from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
+from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
+
 logging.set_verbosity_warning()
 
 def _prepare_models(
@@ -204,11 +206,13 @@ def _perform_eval_batched(
     dataset,
     query_idx,
     kb_size,
+    dataset_type,
     hop_num=None,            # None = single-hop, 2 = 2wiki
     use_kb_adj=False,
     filter_fn=None,          # dataset 级过滤（2wiki 用）
     remove_sorry=False,
     enable_retrieval=False,
+    verbose=False,
 ):
 
     # ---------- optional filter (2wiki) ----------
@@ -234,6 +238,8 @@ def _perform_eval_batched(
         batch_idx = query_idx[start:end]
         batch = [dataset[i] for i in batch_idx]
 
+
+
         # ---------- KB construction ----------
         if hop_num is None:
             kb_adj = None
@@ -254,17 +260,44 @@ def _perform_eval_batched(
                 questions = [row["Q"] for row in batch]
                 kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, ann_topk=10, rerank_topk=1, rerank_policy=rerank_policy, device=torch.device("cuda"), random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
             else:
-                kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
-                    batch_indices=batch_idx,
-                    hop_num=2,
-                )
-            
+                if "autoschemakg" in dataset_type:
+                    kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_embedding_s(
+                        batch_idx,
+                        n_gold=1,
+                        verbose=verbose,
+                    )
+                elif dataset_type=="at2qa_2wiki":                    
+                    # kb_keys, kb_vals, kb_adj=kb_retriever.get_embeddings_at2qa_from_precompute_batch(
+                    #     sample_ids=batch_idx,
+                    #     step=kb_config.current_step,
+                    #     total_steps=kb_config.total_steps,
+                    #     hop_num=2,
+                    # )
 
+                    kb_keys, kb_vals, kb_adj=kb_retriever.get_embeddings_at2qa_from_precompute_batch(
+                        sample_ids=batch_idx,
+                        step=1,
+                        total_steps=1,
+                        hop_num=2,
+                    )
 
+                else:
+                    kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
+                        batch_indices=batch_idx,
+                        hop_num=2,
+                    )
 
         # ---------- per-query ----------
         for i, row in enumerate(batch):
-            Q, A = row["Q"], row["A"]
+            if dataset_type=="at2qa_2wiki":
+                # sr=StageRetriever()
+                # stage=sr.get_stage(kb_config.current_step, kb_config.total_steps)
+                # question_type = sr.get_question_type_stage(stage)
+                question_type = get_question_type_sampled_T2(kb_config.current_step, kb_config.total_steps, 1, verbose=True if batch_id==0 and i==0 else False)[0]
+                Q = row[question_type]
+                A = row["A"]
+            else:
+                Q, A = row["Q"], row["A"]
 
             #判断kb_keys是否是列表
             if isinstance(kb_keys, list):
@@ -284,6 +317,14 @@ def _perform_eval_batched(
                 kb_config=kb_config,
                 kb_adj=target_kb_adj,
             )
+
+            if verbose:
+                print('-------------------')
+                print(f"stage: {int(kb_config.current_step / kb_config.total_steps * 5)}")
+                print(f"Q: {Q}")
+                print(f"A: {A}")
+                print(f"Output: {output}")
+                print('-------------------')
 
             if Q in output:
                 output = output.split(Q)[1]
@@ -324,11 +365,11 @@ def eval_main_process(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
     encoder: KBEncoder,
     kb_config: KBLaMConfig,
-    kb_retriever: KBRetriever,
+    kb_retriever: KBRetriever | AutoSchemaKGKBRetriever,
     kb_scale_factor_range: list[float] | None = None,
     kb_scale_factor: float | None = None,
     dataset_type: str = "synthetic",
-    seed: int = 42,
+    seed: int = 0,
     kb_size: int = -1,
     query_size: int = -1,
     enable_retrieval: bool = False,
@@ -337,9 +378,11 @@ def eval_main_process(
         query_size = len(dataset)
     if kb_size > query_size:
         kb_size = query_size
-
-    np.random.seed(None if seed < 0 else seed)
-    query_idx = np.random.randint(0, len(dataset), query_size)
+    if seed != 0:
+        np.random.seed(seed)
+        query_idx = np.random.randint(0, len(dataset), query_size)
+    else:
+        query_idx = np.arange(query_size)
 
     if kb_scale_factor_range is not None:
         scale_factor_list=[]
@@ -355,12 +398,13 @@ def eval_main_process(
     results_pair_list=[]
     for sf in scale_factor_list:
         kb_config.kb_scale_factor = sf
-        if dataset_type=="2wiki":
+        if "2wiki" in dataset_type:
             # 2wiki， hotpot_2hop, musique_2hop等两跳数据集
-            def _2hop_filter(row):
-                ans = format_output_for_synthetic(row["A"])
-                return ans == row["triple_lists"][1]["description"]
-            filter_fn=_2hop_filter
+            # def _2hop_filter(row):
+            #     ans = format_output_for_synthetic(row["A"])
+            #     return ans == row["triple_lists"][1]["description"]
+            # filter_fn=_2hop_filter
+            filter_fn=None
             hop_num=2
             use_kb_adj=True
         else:
@@ -377,6 +421,7 @@ def eval_main_process(
             dataset=dataset,
             query_idx=query_idx,
             kb_size=kb_size,
+            dataset_type=dataset_type,
             hop_num=hop_num,
             use_kb_adj=use_kb_adj,
             filter_fn=filter_fn,
@@ -504,7 +549,7 @@ parent_parser.add_argument(
     "--model_dir", type=str, help="Directory containing the model"
 )
 parent_parser.add_argument("--save_dir", type=str, default=None, help="Directory to save outputs")
-parent_parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
+parent_parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
 parent_parser.add_argument(
     "--test_dataset", type=str, help="Source of test KB (assumes KV pair format)"
 )
@@ -557,6 +602,20 @@ parent_parser.add_argument(
     type=str,
     default=None,
     help="Path to base embeder model",
+)
+
+# control stage
+parent_parser.add_argument(
+    "--step",
+    type=int,
+    default=1,
+    help="current step",
+)
+parent_parser.add_argument(
+    "--t_step",
+    type=int,
+    default=1,
+    help="total steps",
 )
 
 
@@ -617,15 +676,25 @@ def main():
     )
     kb_config.format_short = args.format_short
     kb_config.path_attn = args.path_attn
+    kb_config.current_step=args.step
+    kb_config.total_steps=args.t_step
 
-    kb_retriever = KBRetriever(
-        encoder,
-        dataset,
-        precomputed_embed_keys_path=args.precomputed_embed_keys_path,
-        precomputed_embed_values_path=args.precomputed_embed_values_path,
-        hnsw_index_path=args.hnsw_index_path,
-        base_embeder_path=args.base_embeder_path,
-    )
+    if args.dataset_type == "autoschemakg_2wiki":
+        kb_retriever = AutoSchemaKGKBRetriever(
+            encoder,
+            dataset,
+            precomputed_embed_keys_path=args.precomputed_embed_keys_path,
+            precomputed_embed_values_path=args.precomputed_embed_values_path,
+        )
+    else:
+        kb_retriever = KBRetriever(
+            encoder,
+            dataset,
+            precomputed_embed_keys_path=args.precomputed_embed_keys_path,
+            precomputed_embed_values_path=args.precomputed_embed_values_path,
+            hnsw_index_path=args.hnsw_index_path,
+            base_embeder_path=args.base_embeder_path,
+        )
 
     if args.command == "generation":
         eval_generate(

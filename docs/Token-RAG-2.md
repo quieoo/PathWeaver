@@ -1345,7 +1345,7 @@ nohup python eval.py generation \
     --dataset_type 2wiki --query_size 100 --seed 1 --save_dir ./gen_tmp >> eval_2wiki_1.1.log 2>&1 &
 
 # 路径注意力版本
-nohup python eval.py generation \
+nohup python eval_generation.py generation \
     --kb_size=10 \
     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
     --encoder_spec qwen-embedding-0.6B \

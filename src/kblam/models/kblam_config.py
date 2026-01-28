@@ -13,6 +13,9 @@ class KBLaMConfig(PretrainedConfig):
         attn_implementation: str = "eager",
         format_short: bool = False,
         path_attn: bool = False,
+        current_step: int = 1,
+        total_steps: int = 1,
+        base_embeder_path: str | None = None,
         **kwargs,
     ):
         self.base_model_name_or_path = base_model_name_or_path
@@ -24,6 +27,9 @@ class KBLaMConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self.format_short = format_short
         self.path_attn = path_attn
+        self.current_step = current_step
+        self.total_steps = total_steps
+        self.base_embeder_path = base_embeder_path
 
         self.debug_bias = 0.0
 

@@ -118,6 +118,13 @@ if __name__ == "__main__":
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(reformatted_data))
         args.dataset_path = output_path
+    elif args.dataset_type == "autoschemakg_2wiki":
+        for doc in dataset:
+            auto_schema = doc["AutoSchemaKG"]
+            for path in auto_schema["Paths"]:
+                for edge in path:
+                    key_strings.append(edge["key_string"])
+                    value_strings.append(edge["description"])
 
     elif args.dataset_type == "musique":
         sid, reformatted_data = 0, []
@@ -148,6 +155,31 @@ if __name__ == "__main__":
             for triple in sample["triple_lists"]:
                 key_strings.append(triple["key_string"])
                 value_strings.append(triple["description"])
+    elif args.dataset_type == "at2qa_2wiki":
+        # at2qa数据集中每个样本内的negative path数量是可变
+        # 拼接方式：
+            # sample-i: gold_path | nega_path_1 | 
+            # sample-i+1: gold_path | nega_path_1 | nega_path_2 |
+        # 每个数据集额外记录start_id和num_triples
+        sid = 0
+        for sample in dataset:
+            num_triples = 0
+            gold_path = sample["gold_path"]
+            for triple in gold_path:
+                key_strings.append(triple["key_string"])
+                value_strings.append(triple["description"])
+                num_triples += 1
+            for path in sample["triple_lists"]:
+                for triple in path:
+                    key_strings.append(triple["key_string"])
+                    value_strings.append(triple["description"])
+                    num_triples += 1
+            sample["start_id"] = sid
+            sample["num_triples"] = num_triples
+            sid += num_triples
+        with open(args.dataset_path, "w", encoding="utf-8") as f:
+            json.dump(dataset, f, indent=2, ensure_ascii=False)
+        print(f"✅ Reformatted {len(dataset)} samples to {args.dataset_path}")
 
     else:
         raise ValueError(f"Unsupported dataset type: {args.dataset_type}")

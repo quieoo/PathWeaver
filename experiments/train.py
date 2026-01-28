@@ -40,8 +40,11 @@ from kblam.models.olmo3.kblam_olmo3_attention import load_kblam_olmo3_model, rep
 
 
 from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_dont_know_ans
-from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer
-from kblam.kb_retriever import KBRetriever
+from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer, setup_scheduler_and_optimizer_with_warmup
+from kblam.kb_retriever import KBRetriever, get_question_type_sampled_T1, get_question_type_sampled_T2
+from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
+
+
 # from eval import eval_main_process
 from eval_generation import eval_main_process
 from kblam.metrics_evaluator import simple_evaluation, full_evaluation
@@ -98,6 +101,8 @@ parser.add_argument("--train_precomputed_embed_keys_path", type=str, default=Non
 parser.add_argument("--train_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for training")
 
 parser.add_argument("--model_dir_to_resume", type=str, default=None, help="Checkpoint directory to resume training")
+parser.add_argument("--resume_steps", type=bool, default=False, help="Resume training steps when model_dir_to_resume is specified")
+
 # parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct", choices=["meta-llama/Meta-Llama-3-8B-Instruct", "microsoft/Phi-3-mini-4k-instruct", "meta-llama/Llama-3.2-1B-Instruct"])
 parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1B-Instruct")
 
@@ -120,7 +125,14 @@ parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
 parser.add_argument("--path_attn", action="store_true", default=False, help="Use path attention")
-
+parser.add_argument("--grad_clip", type=float, default=None, help="Gradient clipping")
+parser.add_argument("--warmup_ratio", type=float, default=None, help="Warmup ratio")
+parser.add_argument(
+    "--base_embeder_path",
+    type=str,
+    default=None,
+    help="Path to base embeder model",
+)
 
 # fmt: on
 
@@ -308,6 +320,8 @@ def get_batch(
     device: torch.device,
     B: int = 20,
     random_sample=True,
+    step: int = 0,
+    total_steps: int = 0,
     use_data_aug=False,
     include_outlier=False,
     multi_entities=None,
@@ -376,6 +390,90 @@ def get_batch(
     return input_ids, attention_masks, labels, batch_indices
 
 
+def get_batch_at2qa(
+    qa_format_func: Callable[[str, str], str],
+    label_func: Callable[[torch.Tensor, List, Callable, torch.Tensor], torch.Tensor],
+    dataset: List[Dict],
+    tokenizer,
+    device: torch.device,
+    B: int = 20,
+    random_sample=True,
+    step: int = 0,
+    total_steps: int = 0,
+    use_data_aug=False,
+    include_outlier=False,
+    multi_entities=None,
+    use_extended_qa=False,
+    global_step: int = 0,
+):
+
+    labels = []
+    if multi_entities is not None:
+        assert not include_outlier
+
+    # 数据采样
+    if random_sample:
+        if multi_entities is not None:
+            batch_indices = np.random.choice(len(dataset), (B, multi_entities), replace=False)
+        else:
+            batch_indices = np.random.choice(len(dataset), B, replace=False)
+    else:
+        batch_indices = np.arange(B)
+
+    # at2qa 
+    # question_type_array = get_question_type_sampled_T1(step, total_steps, len(batch_indices), verbose=True if step % 100 == 0 else False)
+    question_type_array = get_question_type_sampled_T2(step, total_steps, len(batch_indices), verbose=True if step % 100 == 0 else False)
+
+    # 构建问答对
+    def get_question_and_answer(idx: int, question_type: str = "Q") -> tuple[str, str]:
+        if use_extended_qa:
+            Q, A = dataset[idx]["extended_Q"], dataset[idx]["extended_A"]
+
+        elif multi_entities is not None:
+            Q, A = generate_multi_entity_qa(
+                [dataset[i]["name"] for i in idx],
+                [dataset[i]["description_type"] for i in idx],
+                [dataset[i]["description"] for i in idx],
+            )
+        else:
+            Q = augment_row(dataset[idx]) if use_data_aug else dataset[idx][question_type]
+            A = get_i_dont_know_ans() if include_outlier else dataset[idx]["A"]
+        return Q, A
+
+    # 遍历采样索引，获取有效的问答对并应用格式化函数生成input string
+    with torch.autograd.no_grad():
+        input_strs = []
+        real_batch_indices = []
+        for i, idx in enumerate(batch_indices):
+            Q, A = get_question_and_answer(idx, question_type_array[i])
+            
+            # 消除A中的连续padding
+            import re
+            A = re.sub(r'(<\|eot_id\|>)+', '<|eot_id|>', A.strip())
+            if A == '<|eot_id|>': A = 'N/A'   # 防止整段变空
+
+
+            if Q is not None and A is not None:
+                input_strs.append(qa_format_func(Q, A))
+                real_batch_indices.append(idx)
+            else:
+                print("Q or Answer is none")
+
+        batch_indices = real_batch_indices
+        
+        # 将input string转换为token IDs和注意力掩码 
+        tokenizer_output = tokenizer(input_strs, return_tensors="pt", padding=True).to(device)
+        input_ids, attention_masks = (
+            tokenizer_output["input_ids"],
+            tokenizer_output["attention_mask"],
+        )
+        # 生成训练标签
+        labels = label_func(input_ids, input_strs, tokenizer, attention_masks)
+    if include_outlier:
+        # Generate a new set of indices, such that the KB does not contain the entity where the question comes from
+        batch_indices = np.random.choice(len(dataset), B, replace=False)
+    return input_ids, attention_masks, labels, batch_indices
+
 # DATASET_SUPPORT
 # 随机选择B篇文档，每篇文档随机抽取一个问答对，组成字符串输入，转换成TokenIDs和注意力掩码并返回
 def get_batch_from_document(
@@ -386,6 +484,8 @@ def get_batch_from_document(
     device: torch.device,
     B: int = 20,
     random_sample=True,
+    step: int = 0,
+    total_steps: int = 0,
     use_data_aug=False,
     include_outlier=False,
     multi_entities=None,
@@ -530,6 +630,8 @@ def get_batch_musique(
     device: torch.device,
     B: int = 20,
     random_sample=True,
+    step: int = 0,
+    total_steps: int = 0,
     use_data_aug=False,
     include_outlier=False,
     multi_entities=None,
@@ -658,6 +760,7 @@ def _load_cached_embeddings_v2(precomputed_embed_keys_path: str, precomputed_emb
 
 def get_step_config(
     step: int,
+    total_steps: int,
     current_accum_step: int,
     total_accum_step: int,
     use_data_aug: bool,
@@ -680,6 +783,9 @@ def get_step_config(
     config["include_outlier"] = False
     config["multi_entities"] = None
     config["use_extended_qa"] = False
+    config["step"]=step
+    config["total_steps"]=total_steps
+
     include_outlier = current_accum_step >= total_accum_step - 1 - outlier_num
     # Decide to include outlier and has reached the time
     if include_outlier:
@@ -764,7 +870,7 @@ class Trainer:
     def __init__(
         self,
         llm_model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
-        kbretriever: KBRetriever,
+        kbretriever: KBRetriever | AutoSchemaKGKBRetriever,
         tokenizer: transformers.PreTrainedTokenizer,
         kb_token_layer_frequency: int,
         num_steps: int,
@@ -787,6 +893,8 @@ class Trainer:
         eval_step: int = 50,
         format_short: bool = False,
         keep_old_checkpoints: bool = False,
+        grad_clip: float | None = None,
+        warmup_ratio: float | None = None,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -808,16 +916,19 @@ class Trainer:
         self.output_path = pathlib.Path(output_dir)
         self.dataset_format = dataset_format
         self.keep_old_checkpoints = keep_old_checkpoints
+        self.grad_clip = grad_clip
+        self.warmup_ratio = warmup_ratio
 
         if isinstance(llm_model, KBLaMPhi3ForCausalLM):  # Phi3
             self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
             self._get_params = _get_phi3_query_head_parameters
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
-
             format_func = format_QA_llama if not format_short else format_QA_llama_short
 
-            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad":
+            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad" or dataset_format == "autoschemakg_2wiki":
                 self._get_batch = partial(get_batch, format_func, _create_labels_for_llama_enhanced)
+            elif dataset_format == "at2qa_2wiki":
+                self._get_batch = partial(get_batch_at2qa, format_func, _create_labels_for_llama_enhanced)
             elif dataset_format == "multi_wiki_qa_train":
                 self._get_batch = partial(get_batch_from_document, format_func, _create_labels_for_llama_enhanced)
             elif dataset_format == "musique":
@@ -834,7 +945,7 @@ class Trainer:
             self._get_params = lambda *args, **kwargs: []
         else:
             raise ValueError(f"{llm_model} not recognised")
-
+        
         self.scheduler, self.optim = self.setup_scheduler_and_optim()
 
         self.model, self.optim, self._get_batch, self.kbretriever.encoder = self.accelerator.prepare(
@@ -856,12 +967,19 @@ class Trainer:
         if self.sep_query_head:
             self.logger.info("Query head being fine tuned!")
             llm_q_params = self._get_params(self.model, self.sep_query_head, self.kb_token_layer_frequency)
-            scheduler, optim = setup_scheduler_and_optimizer(
-                chain(self.kbretriever.encoder.parameters(), llm_q_params),
-                self.lr,
-                self.num_steps,
-            )
-            self.logger.info("Optimizer recreated")
+            if self.warmup_ratio is not None:
+                scheduler, optim = setup_scheduler_and_optimizer_with_warmup(
+                    chain(self.kbretriever.encoder.parameters(), llm_q_params),
+                    self.lr,
+                    self.num_steps,
+                    self.warmup_ratio,
+                )
+            else:
+                scheduler, optim = setup_scheduler_and_optimizer(
+                    chain(self.kbretriever.encoder.parameters(), llm_q_params),
+                    self.lr,
+                    self.num_steps,
+                )
         else:
             scheduler, optim = setup_scheduler_and_optimizer(
                 self.kbretriever.encoder.parameters(), self.lr, self.num_steps
@@ -891,18 +1009,28 @@ class Trainer:
         seed,
         train_config: KBLaMConfig = None,
     ):
-        test_kb_retriever = KBRetriever(
-            self.kbretriever.encoder,
-            self.test_dataset,
-            precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
-            precomputed_embed_values_path=self.precomputed_test_embed_values_path,
-        )
+        if "autoschemakg" in self.dataset_format:
+            test_kb_retriever = AutoSchemaKGKBRetriever(
+                self.kbretriever.encoder,
+                self.test_dataset,
+                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
+                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
+            )
+        else:
+            test_kb_retriever = KBRetriever(
+                self.kbretriever.encoder,
+                self.test_dataset,
+                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
+                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
+                base_embeder_path=train_config.base_embeder_path,
+            )
 
-        test_kb_config = KBLaMConfig(
-            sep_query_head=True,
-            kb_layer_frequency=self.kb_token_layer_frequency,
-            path_attn=train_config.path_attn if train_config is not None else False,
-        )
+        # test_kb_config = KBLaMConfig(
+        #     sep_query_head=True,
+        #     kb_layer_frequency=self.kb_token_layer_frequency,
+        #     path_attn=train_config.path_attn if train_config is not None else False,
+        # )
+        test_kb_config = train_config
         
         results_pair_list, scale_factor_list = eval_main_process(
             self.test_dataset,
@@ -1040,6 +1168,7 @@ class Trainer:
                     # 获取当前批次数据：输入IDs，注意力掩码，标签，批次索引
                     step_config = get_step_config(
                         step,
+                        self.num_steps,
                         a_step,
                         grad_accum_steps,
                         use_data_aug,
@@ -1078,6 +1207,20 @@ class Trainer:
                             batch_indices=batch_indices,
                             step=step,
                             kb_size=self.kb_size,
+                            hop_num=2,
+                        )
+                        kb_embedding=(key_embd, value_embd)
+                    elif "autoschemakg" in self.dataset_format:
+                        key_embd, value_embd, kb_adj = self.kbretriever.get_kb_embedding_s(
+                            batch_indices,
+                            n_gold=1, # each sample pick its 1 gold path to create the KB
+                        )
+                        kb_embedding=(key_embd, value_embd)
+                    elif "at2qa" in self.dataset_format:
+                        key_embd, value_embd, kb_adj = self.kbretriever.get_embeddings_at2qa_from_precompute_batch(
+                            sample_ids=batch_indices,
+                            step=step,
+                            total_steps=self.num_steps,
                             hop_num=2,
                         )
                         kb_embedding=(key_embd, value_embd)
@@ -1162,6 +1305,23 @@ class Trainer:
 
                 # 达到累积梯度步数时更新模型参数
                 # 如果启用了学习率衰减，则同时更新学习率
+                # 增加：梯度裁剪
+                if self.grad_clip is not None:
+                    def print_grad_norm():
+                        total_norm = torch.norm(
+                            torch.stack([
+                                p.grad.detach().norm(2)
+                                for p in self.model.parameters()
+                                if p.grad is not None
+                            ]),
+                            2
+                        )
+                        print(f"Grad norm: {total_norm.item():.2f}")
+                    if step % 100 == 0:
+                        print_grad_norm()
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    if step % 100 == 0:
+                        print_grad_norm()
                 self.optim.step()
                 if self.use_lr_decay:
                     self.scheduler.step()
@@ -1269,10 +1429,11 @@ class Trainer:
                         raise e
 
                 
-                
-
+            
                 # 运行模型验证
-                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :                    
+                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :    
+                    kb_config.current_step = step
+                    kb_config.total_steps = self.num_steps
                     self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
 
                 
@@ -1387,10 +1548,10 @@ def main():
 
     os.environ["SCALE_FACTOR"] = ""
 
-    if use_cached_embd:
+    if use_cached_embd and args.train_precomputed_embed_keys_path is not None and args.train_precomputed_embed_values_path is not None:
         key_embds, value_embds = _load_cached_embeddings_v2(args.train_precomputed_embed_keys_path, args.train_precomputed_embed_values_path)
-
-
+    else:
+        key_embds, value_embds = None, None
 
 
     prefix_string = get_prefix_str(args)
@@ -1425,30 +1586,38 @@ def main():
     training_set = dataset[:N]
     print(f"[INFO]: Loaded {N} samples for training")
 
-    if args.test_data_path is not None:
-        # 判断数据集是json还是jsonl格式
-        if args.test_data_path.endswith(".jsonl"):
-            test_dataset=[json.loads(line.strip()) for line in open(args.test_data_path)]
-        elif args.test_data_path.endswith(".json"):
-            test_dataset=json.load(open(args.test_data_path))
+    if args.test_query_size is not None:
+        if args.test_data_path is not None:
+            # 判断数据集是json还是jsonl格式
+            if args.test_data_path.endswith(".jsonl"):
+                test_dataset=[json.loads(line.strip()) for line in open(args.test_data_path)]
+            elif args.test_data_path.endswith(".json"):
+                test_dataset=json.load(open(args.test_data_path))
+            else:
+                raise ValueError(f"Unknown dataset format: {args.test_data_path}")
+            print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
         else:
-            raise ValueError(f"Unknown dataset format: {args.test_data_path}")
-        print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
-    else:
-        test_dataset = None
+            # test_dataset = None
+            print(f"Split the training set into {N-args.test_query_size} samples for training and {args.test_query_size} samples for validation")
+            training_set = dataset[args.test_query_size:]
+            test_dataset = dataset[:args.test_query_size]
 
     # Set up the LLM
     original_model_spec = hf_model_spec              # base olmo3-7b
     resume_ckpt_dir = model_dir_to_resume             # None or stage1_lr_..._step_xxxx
 
-    if resume_ckpt_dir:
-        resumed_step = int(resume_ckpt_dir.split("_")[-1])
-        print(f"[INFO]: Resuming from {resume_ckpt_dir}, step: {resumed_step}")
-    else:
-        resumed_step = 0
+    if args.resume_steps:
+        if resume_ckpt_dir:
+            resumed_step = int(resume_ckpt_dir.split("_")[-1])
+            print(f"[INFO]: Resuming from {resume_ckpt_dir}, step: {resumed_step}")
+        else:
+            resumed_step = 0
 
-    if model_dir_to_resume:
-        print(f"[INFO]: Resuming from {model_dir_to_resume}, step: {resumed_step}")
+        if model_dir_to_resume:
+            print(f"[INFO]: Resuming from {model_dir_to_resume}, step: {resumed_step}")
+    else: 
+        # resume_step总是为0，否则一些依赖步数计算训练的指标会错误
+        resumed_step=0
 
     tokenizer = AutoTokenizer.from_pretrained(
         original_model_spec,
@@ -1524,18 +1693,28 @@ def main():
             path_attn=args.path_attn,
         )
     
+    kb_config.base_embeder_path = args.base_embeder_path    
     print(f"[INFO]: KBLaM config: {kb_config}")
 
     encoder.train()
 
     print(f"[INFO]: Initialised embedding encoder {encoder_spec}")
 
-    kbretriever = KBRetriever(
-        encoder,
-        training_set,
-        key_embds=key_embds,  # type: ignore
-        value_embds=value_embds,  # type: ignore
-    )
+    if "autoschemakg" in dataset_type:
+        kbretriever = AutoSchemaKGKBRetriever(
+            encoder,
+            training_set,
+            key_embds=key_embds,  # type: ignore
+            value_embds=value_embds,  # type: ignore
+        )
+    else:
+        kbretriever = KBRetriever(
+            encoder,
+            training_set,
+            key_embds=key_embds,  # type: ignore
+            value_embds=value_embds,  # type: ignore
+            base_embeder_path=args.base_embeder_path,
+        )
 
     logger.info("Model ready")
 
@@ -1569,6 +1748,8 @@ def main():
         test_kb_scale_factor_range=args.test_kb_scale_factor_range,
         eval_step=args.eval_step,
         format_short=args.format_short,
+        grad_clip=args.grad_clip,
+        warmup_ratio=args.warmup_ratio,
     )
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")

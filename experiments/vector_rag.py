@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-RAG + vLLM 推理，统计：
-- TTFT = Retrieval(检索) + Prefill(模型首 token 前)
-- TPOT = Decode 时间 / 输出 token 数（排除特殊 token）
-并输出总体统计与 full_evaluation 指标。
-"""
 
 import os
 import re
@@ -19,9 +12,9 @@ import random
 
 import numpy as np
 import torch
+import tqdm
 
-# 优化 CUDA 内存分配
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 # -------- LlamaIndex (RAG) --------
 from llama_index.core import Document, VectorStoreIndex
@@ -37,42 +30,6 @@ from vllm import LLM, SamplingParams
 # -------- 你项目中的评测 --------
 from kblam.metrics_evaluator import full_evaluation
 
-
-
-# =========================
-# 1) 文本归一化与基础评测
-# =========================
-def normalize_text(s: str) -> str:
-    def remove_articles(text): return re.sub(r"\b(a|an|the)\b", " ", text)
-    def white_space_fix(text): return " ".join(text.split())
-    def remove_punc(text): return re.sub(r"[^\w\s]", " ", text)
-    def lower(text): return text.lower()
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def f1_score(prediction: str, ground_truth: str) -> float:
-    pred_tokens = normalize_text(prediction).split()
-    gt_tokens = normalize_text(ground_truth).split()
-    common = Counter(pred_tokens) & Counter(gt_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / max(1, len(pred_tokens))
-    recall = num_same / max(1, len(gt_tokens))
-    return 2 * precision * recall / (precision + recall)
-
-
-def exact_match_score(prediction: str, ground_truth: str) -> bool:
-    return normalize_text(prediction) == normalize_text(ground_truth)
-
-
-def info_contain_score(prediction: str, ground_truth: str) -> bool:
-    return normalize_text(ground_truth) in normalize_text(prediction)
-
-
-# =========================
-# 2) 参数与数据加载
-# =========================
 def parse_args():
     parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue (TTFT & TPOT)')
     # 数据集参数（建议直接给到 jsonl 路径）
@@ -101,162 +58,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_musique_dataset(dataset_path: str, max_samples: int | None = None):
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"数据集文件不存在: {dataset_path}")
-    dataset = []
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            item = json.loads(line)
-            dataset.append(item)
-            if max_samples and len(dataset) >= max_samples:
-                break
-    print(f"从本地加载了 {len(dataset)} 个 MuSiQue 样本")
-    return dataset
-
-def load_squad_dataset(dataset_path: str, kb_size: int, max_samples: int | None = None):
-    #读取json文件
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    data = data[:max_samples]
-    # 首先收集所有可能的段落作为候选知识库
-    all_paragraphs = []
-    for item in data:
-        all_paragraphs.append({
-            "paragraph_text": item['context'],
-            "is_supporting": False,
-            # 截取第一句话作为title
-            "title": item['context'].split('.')[0]
-        })
-    
-    
-    ret = []
-    
-    # 为每个QA对创建样本，确保每个样本的paragraphs包含kb_size个段落，其中必定包含正确段落
-    for item in data:
-        # 当前item的段落是正确段落
-        correct_paragraph = {
-            "paragraph_text": item['context'],
-            "is_supporting": True,  # 标记为支持性段落
-            "title": item['context'].split('.')[0]
-        }
-        
-        # 从其他段落中随机选择kb_size-1个段落
-        other_paragraphs = [p for p in all_paragraphs if p["paragraph_text"] != item['context']]
-        # 如果其他段落不足，就重复使用
-        while len(other_paragraphs) < kb_size - 1:
-            other_paragraphs.extend(other_paragraphs)
-        
-        # 随机选择kb_size-1个其他段落
-        selected_paragraphs = random.sample(other_paragraphs, kb_size - 1)
-        
-        # 组合正确段落和随机选择的段落
-        paragraphs = [correct_paragraph] + selected_paragraphs
-        # 打乱顺序，让正确段落的位置随机
-        random.shuffle(paragraphs)
-        
-        # 为当前item中的每个QA对创建样本
-        for qa in item['qas']:
-            ret.append({
-                'question': qa['question'],
-                'answer': qa['answer'],
-                'paragraphs': paragraphs
-            })
-            if len(ret) >= max_samples:
-                break
-        if len(ret) >= max_samples:
-            break
-    
-    return ret
-
-def load_2wiki_dataset(dataset_path: str,
-                       kb_size: int,
-                       max_samples: int | None = None, source_type: str = '2wiki'):
-    dataset = []
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        dataset=json.load(f)
-    
-    new_dataset = []
-    for item in dataset:
-        if item.get('source') != source_type:
-            continue
-        new_dataset.append(item)
-    dataset=new_dataset[:max_samples]
-    print(f"原始数据集大小: {len(new_dataset)}")
-    print(f"过滤后的数据集大小: {len(dataset)}")
-
-    # 1. 把所有“其它”段落展平成候选池
-    candidate_paras = [p for item in new_dataset for p in item['paragraphs']]
-
-    ret = []
-    for item in dataset:
-        # 2. 当前样本的正确段落
-        correct_paras = [
-            {
-                "paragraph_text": p['paragraph_text'],
-                "is_supporting": True,
-                "title": p['title']
-            }
-            for p in item['paragraphs']
-        ]
-
-        # 3. 需要再抽多少条
-        need = kb_size - len(correct_paras)
-        if need < 0:
-            # 如果正确段落本身就比 kb_size 多，直接截断或报错
-            raise ValueError(
-                f"kb_size({kb_size}) < 正确段落数({len(correct_paras)})"
-            )
-
-        # 4. 排除掉当前样本的段落，避免重复
-        this_ids = {id(p) for p in item['paragraphs']}
-        available = [p for p in candidate_paras if id(p) not in this_ids]
-
-        if len(available) < need:
-            raise ValueError("候选池不足，无法凑齐 kb_size 段落")
-
-        chosen_wrong = random.sample(available, need)
-        wrong_paras = [
-            {
-                "paragraph_text": p['paragraph_text'],
-                "is_supporting": False,
-                "title": p['title']
-            }
-            for p in chosen_wrong
-        ]
-
-        # 5. 合并 & 洗牌
-        paragraphs = correct_paras + wrong_paras
-        random.shuffle(paragraphs)
-
-        ret.append({
-            'question': item['question'],
-            'answer': item['answer'],
-            'paragraphs': paragraphs
-        })
-
-    return ret
-
-
-
-def load_data(args):
-    if args.dataset_type == 'musique':
-        # return load_musique_dataset(args.dataset_path, args.n_samples)
-        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
-    elif args.dataset_type == 'squad':
-        return load_squad_dataset(args.dataset_path, args.kb_size, args.n_samples)
-    elif args.dataset_type == '2wiki':
-        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
-    elif args.dataset_type == 'hotpot':
-        return load_2wiki_dataset(args.dataset_path, args.kb_size, args.n_samples, source_type=args.dataset_type)
-    else:
-        raise ValueError(f"未知数据集类型: {args.dataset_type}")
-
-
-# ----------------------------
-# 3. 配置 LLM 和 Embedding
-# ----------------------------
 def setup_models(args):
     print(f"Loading model from {args.model_path}...")
     if 'llama' in args.model_path:
@@ -308,47 +109,20 @@ def setup_models(args):
     return llm
 
 
-def clean_model(llm):
-    if llm is not None:
-        if hasattr(llm, "engine") and llm.engine is not None:
-            try:
-                llm.engine.shutdown()
-                print("✅ vLLM engine shutdown complete.")
-            except Exception as e:
-                print(f"⚠️ engine shutdown failed: {e}")
-        del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats()
-        print(f"✅ CUDA memory cleared. Remaining allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+def load_dataset(dataset_path: str,):
+    dataset = []
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        dataset=json.load(f)
+    
+    return dataset
 
+def normalize_text(s: str) -> str:
+    def remove_articles(text): return re.sub(r"\b(a|an|the)\b", " ", text)
+    def white_space_fix(text): return " ".join(text.split())
+    def remove_punc(text): return re.sub(r"[^\w\s]", " ", text)
+    def lower(text): return text.lower()
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-# =========================
-# 4) RAG 检索（计时）
-# =========================
-def retrieve_single_hop(question: str, paras: List[dict], top_k: int) -> Tuple[str, float]:
-    t0 = time.perf_counter()
-
-    docs = []
-    for p in paras:
-        text = f"{p['title']}: {p['paragraph_text']}"
-        docs.append(Document(text=text))
-
-    index = VectorStoreIndex.from_documents(docs)
-    retriever = index.as_retriever(similarity_top_k=top_k)
-    nodes = retriever.retrieve(question)
-    context = "\n\n".join([node.get_content() for node in nodes])
-
-    t1 = time.perf_counter()
-    retrieval_time = t1 - t0
-    return context, retrieval_time
-
-
-# =========================
-# 5) vLLM 指标提取与统计
-# =========================
 SPECIAL_TOKEN_THRESHOLD = 128000  # 排除如 <|eot_id|>=128009 等特殊 token
 
 
@@ -389,14 +163,11 @@ def _extract_latency_from_request_output(req_out) -> Dict[str, Any]:
 
     return out
 
-
 def _percentile(values: List[float], p: float) -> float:
     if not values:
         return 0.0
     k = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
     return sorted(values)[k]
-
-
 def _summarize(name: str, values: List[float], unit: str = "s"):
     if not values:
         print(f"[WARN] No values for {name}")
@@ -405,14 +176,28 @@ def _summarize(name: str, values: List[float], unit: str = "s"):
     p50_v = _percentile(values, 50)
     p95_v = _percentile(values, 95)
     print(f"{name}: mean={mean_v:.4f}{unit}, p50={p50_v:.4f}{unit}, p95={p95_v:.4f}{unit}")
-# =========================
-# 6) 推理主循环（含 TTFT/TPOT）
-# =========================
-def run_rag_inference(
-    args, llm, questions: List[str], paragraphs_list: List[List[dict]],
-    answers: List[str], correct_paragraphs: List[List[str]]
-):
+
+def run_vector_rag(args, llm, dataset):
+
+    docs=[]
+    gold_contexts=[]
+    for row in dataset:
+        supporting_facts_titles=[]
+        for sp in row['supporting_facts']:
+            supporting_facts_titles.append(sp[0])
+        for ctx in row['context']:
+            title=ctx[0]
+            sentence_text= " ".join(ctx[1])
+            docs.append(Document(text=sentence_text, metadata={'title': title}))
+            if title in supporting_facts_titles:
+                gold_contexts.append(sentence_text)
+    print(f"Loaded {len(docs)} documents")
+    if not args.oracle_retrieval:
+        index = VectorStoreIndex.from_documents(docs)
+        retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+
     predictions: List[str] = []
+    answers: List[str] = []
 
     # 统计容器
     stat_retrieval: List[float] = []
@@ -422,23 +207,21 @@ def run_rag_inference(
     stat_tokens: List[int] = []
     stat_e2e: List[float] = []
 
-    for i, (question, paras) in enumerate(zip(questions, paragraphs_list)):
-        
+    dataset=dataset[:args.n_samples]
+    for i, row in enumerate(dataset):
+        question=row['question']
+        answers.append(row['answer'])
 
-        # ---- 检索阶段 ----
+        time_start=time.perf_counter()
         if args.oracle_retrieval:
-            ctx_list = correct_paragraphs[i] if isinstance(correct_paragraphs[i], list) else [str(correct_paragraphs[i])]
-            context = "\n\n".join(ctx_list)
-            retrieval_time = 0.0
+            context = "\n\n".join(gold_contexts[2*i:2*i+2])
         else:
-            context, retrieval_time = retrieve_single_hop(question, paras, args.similarity_top_k)
-        
-        # 无输入
-        context=""
-        # ---- 生成阶段（计时）----
-        gen_start = time.perf_counter()
+            nodes = retriever.retrieve(question)
+            context = "\n\n".join([node.get_content() for node in nodes])
+        retrieval_time=time.perf_counter()-time_start
 
-        # Prompt 构造 + vLLM generate
+        gen_start=time.perf_counter()
+
         if "llama" in args.model_path.lower():
             prompt = (
                 f"<|begin_of_text|>"
@@ -601,7 +384,6 @@ def run_rag_inference(
         prefill_model = metrics.get("prefill_model", None)
         decode_time = metrics.get("decode_time", None)
         num_out = metrics.get("num_output_tokens", 0)
-
         # 回退策略：拿不到精确 prefill/decode 时，用 gen_elapsed 拆分
         if prefill_model is None or decode_time is None:
             # 优先保证非负与拆分合理
@@ -613,8 +395,7 @@ def run_rag_inference(
                 # 都不可得，平分或置 0
                 prefill_model = max(0.0, gen_elapsed * 0.5)
                 decode_time = max(0.0, gen_elapsed - prefill_model)
-
-        # TTFT = 检索 + 模型 prefill
+         # TTFT = 检索 + 模型 prefill
         ttft = retrieval_time + prefill_model
         # TPOT = decode_time / 输出 token 数
         tpot = decode_time / max(1, num_out)
@@ -627,21 +408,6 @@ def run_rag_inference(
         stat_tokens.append(num_out)
         stat_e2e.append(retrieval_time + gen_elapsed)
 
-        if i % 1 == 0:
-            print(f"\n[{i + 1}/{len(questions)}] Question: {question}")
-            print("\n--- 模型输出 ---")
-            print(pred)
-            print(f" → Prediction: {pred}")
-            print(f" → Ground Truth: {answers[i]}")
-            # print(
-            #     f" ⏱ retrieval={retrieval_time*1000:.1f} ms, "
-            #     f"prefill(model)={prefill_model*1000:.1f} ms, "
-            #     f"TTFT={ttft*1000:.1f} ms, "
-            #     f"decode={decode_time*1000:.1f} ms, "
-            #     f"TPOT={tpot*1000:.1f} ms/token, "
-            #     f"out_tokens={num_out}, "
-            #     f"E2E={(retrieval_time+gen_elapsed):.3f} s"
-            # )
 
         predictions.append(pred)
 
@@ -656,60 +422,33 @@ def run_rag_inference(
         print(f"Throughput (output tokens / E2E seconds): {overall_tps:.2f} tok/s")
     print("==========================================\n")
 
-    return predictions
+    return predictions, answers
 
+def clean_model(llm):
+    if llm is not None:
+        if hasattr(llm, "engine") and llm.engine is not None:
+            try:
+                llm.engine.shutdown()
+                print("✅ vLLM engine shutdown complete.")
+            except Exception as e:
+                print(f"⚠️ engine shutdown failed: {e}")
+        del llm
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+        print(f"✅ CUDA memory cleared. Remaining allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-# =========================
-# 7) 额外评测（可选）
-# =========================
-def evaluate_predictions(predictions: List[str], answers: List[str], n_samples: int):
-    em_scores = [exact_match_score(p, g) for p, g in zip(predictions, answers)]
-    f1_scores = [f1_score(p, g) for p, g in zip(predictions, answers)]
-    contain_scores = [info_contain_score(p, g) for p, g in zip(predictions, answers)]
-    em = sum(em_scores) / max(1, len(em_scores))
-    f1 = sum(f1_scores) / max(1, len(f1_scores))
-    contain = sum(contain_scores) / max(1, len(contain_scores))
-    print("\n" + "=" * 50)
-    print(f"Results on {n_samples} MuSiQue samples:")
-    print(f"Exact Match (EM): {em:.2%}")
-    print(f"F1 Score:        {f1:.2%}")
-    print(f"Info Contain:    {contain:.2%}")
-    print("=" * 50)
-    return em, f1, contain
-
-
-# =========================
-# 8) 主函数
-# =========================
 def main():
-    args = parse_args()
+    args=parse_args()
+    dataset=load_dataset(args.dataset_path)
 
-    # 加载数据
-    dev_set = load_data(args)
-    questions = [ex["question"] for ex in dev_set]
-    answers = [ex["answer"] for ex in dev_set]
-    paragraphs_list = [ex["paragraphs"] for ex in dev_set]
+    llm=setup_models(args)
 
-    # 每个样本的正确段落（oracle 用）
-    correct_paragraphs = [[] for _ in dev_set]
-    for i, ex in enumerate(dev_set):
-        for p in ex["paragraphs"]:
-            if p.get("is_supporting", False):
-                correct_paragraphs[i].append(p["paragraph_text"])
+    predictions, answers = run_vector_rag(args, llm, dataset)
 
-    # 模型
-    llm = setup_models(args)
-
-    # 推理
-    predictions = run_rag_inference(args, llm, questions, paragraphs_list, answers, correct_paragraphs)
-
-    # 清理
     clean_model(llm)
-
-    # # 评测（两种）
-    # # 1) 简单三指标
-    # evaluate_predictions(predictions, answers, args.n_samples)
-    # 2) 你项目内的完整评测
     comparison_str, metrics = full_evaluation(predictions, answers)
     print(metrics)
 

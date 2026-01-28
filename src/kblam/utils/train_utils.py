@@ -5,6 +5,7 @@ import argparse
 
 from torch.optim.optimizer import ParamsT
 from torch.nn.parallel import DistributedDataParallel
+from transformers import get_cosine_schedule_with_warmup
 
 
 def get_tensor_config(x: torch.tensor) -> dict[str, any]:
@@ -191,3 +192,25 @@ def setup_scheduler_and_optimizer(model_parapmeters: ParamsT, lr: float, max_ite
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, max_iter, eta_min=lr * 0.01)  # type: ignore
     return scheduler, optim
+
+def setup_scheduler_and_optimizer_with_warmup(
+    model_parameters,
+    lr: float,
+    total_optimizer_steps: int,
+    warmup_ratio: float = 0.1,
+):
+    optimizer = torch.optim.AdamW(
+        model_parameters,
+        lr=lr,
+        weight_decay=0.0,
+    )
+
+    warmup_steps = int(total_optimizer_steps * warmup_ratio)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_optimizer_steps,
+    )
+
+    return scheduler, optimizer

@@ -1,17 +1,62 @@
 import torch
+import zlib
 
 
 _PATH_ADJ_CACHE = {}
 
+# 这版缓存不够稳定：形状一样就重用，忽略实际邻接矩阵的内容不同
+# def get_cached_adj_t(kb_adj, *, K, device, dtype):
+#     key = (device, dtype, K)
+#     if key not in _PATH_ADJ_CACHE:
+#         adj = kb_adj.coalesce().to(device=device, dtype=dtype)
+#         if adj.size(0) != K:
+#             adj = adj[:K, :K]
+#         adj_t = adj.transpose(0, 1).to_sparse_csr()
+#         _PATH_ADJ_CACHE[key] = adj_t
+#     return _PATH_ADJ_CACHE[key]
+
+_PATH_ADJ_CACHE = {}
+
+def _adj_fingerprint_coo(kb_adj: torch.Tensor, K: int) -> int:
+    """
+    Return a stable fingerprint for a sparse COO adj.
+    We hash a small, deterministic view of (indices, values, shape).
+    """
+    adj = kb_adj.coalesce()
+    if adj.size(0) != K:
+        adj = adj[:K, :K].coalesce()
+
+    idx = adj.indices()
+    val = adj.values()
+
+    # 为了避免 hash 成本太高：只取前/后若干元素（对链式图也足够区分）
+    # 如果你担心碰撞，把 sample 改大一点，比如 4096
+    s = min(idx.size(1), 2048)
+    if s < idx.size(1):
+        sel = torch.cat([torch.arange(s//2), torch.arange(idx.size(1)-s//2, idx.size(1))]).to(idx.device)
+        idx = idx[:, sel]
+        val = val[sel]
+
+    # 转 CPU bytes，做 crc32（快、稳定）
+    b = bytearray()
+    b += int(adj.size(0)).to_bytes(4, "little", signed=False)
+    b += int(adj.size(1)).to_bytes(4, "little", signed=False)
+    b += idx.detach().cpu().to(torch.int64).numpy().tobytes()
+    # values 只用来区分（你的 values 基本全 1，也可以不加）
+    b += val.detach().cpu().to(torch.float32).numpy().tobytes()
+    return zlib.crc32(b)
 
 def get_cached_adj_t(kb_adj, *, K, device, dtype):
-    key = (device, dtype, K)
+    fp = _adj_fingerprint_coo(kb_adj, K)
+    key = (device, dtype, K, fp)
+
     if key not in _PATH_ADJ_CACHE:
         adj = kb_adj.coalesce().to(device=device, dtype=dtype)
         if adj.size(0) != K:
-            adj = adj[:K, :K]
+            adj = adj[:K, :K].coalesce()
         adj_t = adj.transpose(0, 1).to_sparse_csr()
         _PATH_ADJ_CACHE[key] = adj_t
+
     return _PATH_ADJ_CACHE[key]
 
 

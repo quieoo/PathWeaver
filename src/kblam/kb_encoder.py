@@ -93,6 +93,7 @@ class KBEncoder(nn.Module, FeatureExtractionMixin):
                 else:
                     self.base_model.train()
                 self.in_dim = self.base_model.get_sentence_embedding_dimension()
+                print(f"encoder_name: {encoder_name}, in_dim: {self.in_dim}")
         self.out_dim = out_dim
         self.projector_k = get_projector(
             projector_type, self.in_dim, self.out_dim, projector_kwargs

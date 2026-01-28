@@ -191,7 +191,7 @@ def compute_faithfulness_gpt(model_outputs, references):
 # ======================
 # 🔹 综合评估函数
 # ======================
-def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang: str = "en") -> dict:
+def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang: str = "en", bert_device: str = "cpu") -> dict:
     if len(model_outputs) != len(references):
         raise ValueError(
             f"Number of model outputs ({len(model_outputs)}) does not match number of references ({len(references)})"
@@ -243,27 +243,81 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
     model = AutoModel.from_pretrained(
         MODEL_NAME,
         use_safetensors=True,   # 关键
-        torch_dtype=None,
+        torch_dtype="auto",
+        device_map=bert_device,
     )
     model.eval()
     from bert_score.scorer import BERTScorer
     import torch
+    from tqdm import tqdm
 
     scorer = BERTScorer(
         model_type=None,        # 不让它自己加载
         num_layers=None,
         batch_size=4,
-        device="cpu",
+        device=bert_device,
         lang="en",
     )
-
+    print(f"🔸 BERTScore model loaded: {MODEL_NAME}")
+    
     # 🔥 手动注入（关键步骤）
     scorer._model = model
     scorer._tokenizer = tokenizer
-    P, R, F1 = scorer.score(
-        model_outputs,
-        references,
-    )
+
+    def bert_score_with_progress_and_gpu_monitor(candidates, references):
+        """带进度条+GPU监控的BERTScore打分函数"""
+        total_samples = len(candidates)
+        batch_size = scorer.batch_size
+        total_batches = (total_samples + batch_size - 1) // batch_size  # 计算总批次
+        
+        # 初始化返回结果
+        all_P, all_R, all_F1 = [], [], []
+        
+        print(f"\n📊 开始BERTScore打分 | 总样本数: {total_samples} | 批次大小: {batch_size} | 总批次: {total_batches}")
+        print("="*80)
+        
+        # 分批推理 + 进度条展示
+        with torch.no_grad():  # GPU必备：关闭梯度，省显存+提速
+           for idx in tqdm(range(total_batches), desc="📈 打分进度", leave=True, colour="green"):
+                # 切分当前批次数据
+                start = idx * batch_size
+                end = min((idx + 1) * batch_size, total_samples)
+                batch_cand = candidates[start:end]
+                batch_ref = references[start:end]
+                
+                # 单批次打分
+                batch_P, batch_R, batch_F1 = scorer.score(batch_cand, batch_ref)
+                
+                # 收集结果
+                all_P.append(batch_P.cpu())
+                all_R.append(batch_R.cpu())
+                all_F1.append(batch_F1.cpu())
+                
+                # ✅ 实时GPU状态监控 (每5个批次打印一次，避免刷屏)
+                if bert_device == "cuda" and idx % 5 == 0:
+                    used_gpu_mem = torch.cuda.memory_allocated() / 1024**3  # 已用显存(GB)
+                    max_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3 # 峰值显存(GB)
+                    gpu_util = torch.cuda.utilization()  # GPU利用率(%)
+                    cpu_util = psutil.cpu_percent()      # CPU利用率(%)
+                    print(f"\n🖥️ GPU监控 | 显存占用: {used_gpu_mem:.2f}GB | 峰值显存: {max_gpu_mem:.2f}GB | GPU利用率: {gpu_util}% | CPU利用率: {cpu_util}%")
+        
+        # 合并所有批次结果
+        P = torch.cat(all_P)
+        R = torch.cat(all_R)
+        F1 = torch.cat(all_F1)
+        
+        print("="*80)
+        print(f"✅ 打分完成！整体P均值: {P.mean().item():.4f} | R均值: {R.mean().item():.4f} | F1均值: {F1.mean().item():.4f}")
+        return P, R, F1
+
+    # ===================== 执行打分 =====================
+    # 替换成你自己的 model_outputs 和 references 即可
+    P, R, F1 = bert_score_with_progress_and_gpu_monitor(model_outputs, references)
+
+    # P, R, F1 = scorer.score(
+    #     model_outputs,
+    #     references,
+    # )
 
     if P is not None:
         results_dict["bert_score_precision"] = float(np.mean(P.numpy()))
@@ -290,7 +344,9 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
             else:
                 faith = compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus")
         else:
-            faith = compute_faithfulness_local(model_outputs, references)
+            print("🔸 No API key found for Faithfulness, using local model...")
+            faith=None
+            # faith = compute_faithfulness_local(model_outputs, references)
         if faith is not None:
             results_dict["faithfulness"] = faith
             print(f"✅ Faithfulness: {faith:.4f}")
@@ -317,7 +373,9 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
             else:
                 faith = compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus", absolute=True)
         else:
-            faith = compute_faithfulness_local(model_outputs, references)
+            print("🔸 No API key found for Faithfulness01, using local model...")
+            faith=None
+            # faith = compute_faithfulness_local(model_outputs, references)
         if faith is not None:
             results_dict["faithfulness01"] = faith
             print(f"✅ Faithfulness01: {faith:.4f}")
@@ -343,13 +401,14 @@ def print_comparison(model_outputs: list[str], references: list[str]) -> str:
 # ======================
 # 🔹 总控函数
 # ======================
-def full_evaluation(model_outputs: list[str], references: list[str], lang: str = "en") -> tuple[str, dict]:
+def full_evaluation(model_outputs: list[str], references: list[str], lang: str = "en", bert_device: str = "cpu") -> tuple[str, dict]:
     # 打印前5个样本
-    print("===== First 5 Samples =====")
-    print(print_comparison(model_outputs[:5], references[:5]))
+    N=5
+    print(f"===== First {N} Samples =====")
+    print(print_comparison(model_outputs[:N], references[:N]))
 
     comparison_str = print_comparison(model_outputs, references)
-    metrics = evaluate_model_outputs(model_outputs, references, lang)
+    metrics = evaluate_model_outputs(model_outputs, references, lang, bert_device)
     return comparison_str, metrics
 
 
