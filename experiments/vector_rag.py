@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument('--oracle-retrieval', action='store_true',
                         help='使用 oracle 检索：用 is_supporting 段落直接拼接为上下文')
     parser.add_argument('--kb-size', type=int, default=10, help='知识库段落数量')
+    parser.add_argument('--without-knowledge', action='store_true',
+                        help='不使用知识库')
 
 
 
@@ -65,7 +67,7 @@ def setup_models(args):
         llm = LLM(
             model=args.model_path,
             enforce_eager=True,
-            disable_log_stats=True, 
+            disable_log_stats=False, 
         )
     elif 'deepseek' in args.model_path or 'qwen' in args.model_path:
         n_gpus = torch.cuda.device_count()
@@ -78,7 +80,7 @@ def setup_models(args):
             trust_remote_code=True,
             enforce_eager=True,
             max_model_len=16384,
-            disable_log_stats=True, 
+            # disable_log_stats=True, 
         )
     elif 'olmo3-7b' in args.model_path.lower():
         # === 新增：OLMo-3-7B-Instruct ===
@@ -88,7 +90,7 @@ def setup_models(args):
             trust_remote_code=True,   # 必须
             enforce_eager=True,
             max_model_len=8192,
-            disable_log_stats=True, 
+            # disable_log_stats=True, 
         )
     elif "olmo3-32b" in args.model_path.lower():
         llm = LLM(
@@ -99,13 +101,27 @@ def setup_models(args):
             # enforce_eager=True,
             max_model_len=8192,          # 可后续调大
             # gpu_memory_utilization=0.90,
-            disable_log_stats=True,
+            # disable_log_stats=True,
         )
 
-    embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
+    print(f"setting embed model to {args.embedding_model}")
+    # embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
+    if os.path.isdir(args.embedding_model):
+        # 本地 embedding 模型
+        embed_model = HuggingFaceEmbedding(
+            model_name=args.embedding_model,
+            trust_remote_code=True,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+    else:
+        # HuggingFace Hub 模型
+        embed_model = HuggingFaceEmbedding(
+            model_name=args.embedding_model,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+
     Settings.embed_model = embed_model
     Settings.llm = None
-    
     return llm
 
 
@@ -132,36 +148,47 @@ def _count_non_special_token_ids(token_ids) -> int:
     return sum(1 for tid in token_ids if isinstance(tid, int) and tid < SPECIAL_TOKEN_THRESHOLD)
 
 
-def _extract_latency_from_request_output(req_out) -> Dict[str, Any]:
-    """
-    从 vLLM RequestOutput 中提取：
-      prefill_model = first_token_time - first_scheduled_time
-      decode_time   = finished_time - first_token_time
-      num_output_tokens = 生成 token 数（排除特殊 token）
-    """
-    out = {"prefill_model": None, "decode_time": None, "num_output_tokens": 0}
-    try:
-        m = getattr(req_out, "metrics", None)
-        if m is not None:
-            ft = getattr(m, "first_token_time", None)
-            fs = getattr(m, "first_scheduled_time", None)
-            fin = getattr(m, "finished_time", None)
-            if ft is not None and fs is not None:
-                out["prefill_model"] = float(ft) - float(fs)
-            if ft is not None and fin is not None:
-                out["decode_time"] = max(0.0, float(fin) - float(ft))
-    except Exception:
-        pass
+def _extract_latency_from_request_output(req_out):
+    out = {
+        "prefill_model": None,
+        "decode_time": None,
+        "num_output_tokens": 0,
+    }
 
-    try:
-        if getattr(req_out, "outputs", None):
-            token_ids = getattr(req_out.outputs[0], "token_ids", None)
-            if token_ids:
-                out["num_output_tokens"] = _count_non_special_token_ids(token_ids)
-    except Exception:
-        pass
+    m = getattr(req_out, "metrics", None)
+    if m is None:
+        print("Warning: metrics is None")
+        return out
+
+    # ===== 新版 vLLM (RequestStateStats) =====
+    if hasattr(m, "first_token_ts"):
+        # prefill: schedule -> first token
+        if hasattr(m, "first_token_latency"):
+            out["prefill_model"] = float(m.first_token_latency)
+        elif hasattr(m, "scheduled_ts"):
+            out["prefill_model"] = float(m.first_token_ts - m.scheduled_ts)
+
+        # decode: first token -> last token
+        if hasattr(m, "last_token_ts"):
+            out["decode_time"] = max(
+                0.0, float(m.last_token_ts - m.first_token_ts)
+            )
+
+    # ===== token 数 =====
+    if hasattr(m, "num_generation_tokens"):
+        out["num_output_tokens"] = int(m.num_generation_tokens)
+    else:
+        try:
+            token_ids = req_out.outputs[0].token_ids
+            out["num_output_tokens"] = _count_non_special_token_ids(token_ids)
+        except Exception:
+            pass
+
+    if out["prefill_model"] is None or out["decode_time"] is None:
+        print(f"Warning: incomplete metrics: {m}")
 
     return out
+
 
 def _percentile(values: List[float], p: float) -> float:
     if not values:
@@ -215,6 +242,8 @@ def run_vector_rag(args, llm, dataset):
         time_start=time.perf_counter()
         if args.oracle_retrieval:
             context = "\n\n".join(gold_contexts[2*i:2*i+2])
+        elif args.without_knowledge:
+            context = ""
         else:
             nodes = retriever.retrieve(question)
             context = "\n\n".join([node.get_content() for node in nodes])
@@ -386,6 +415,7 @@ def run_vector_rag(args, llm, dataset):
         num_out = metrics.get("num_output_tokens", 0)
         # 回退策略：拿不到精确 prefill/decode 时，用 gen_elapsed 拆分
         if prefill_model is None or decode_time is None:
+            print(f"Warning: prefill_model={prefill_model}, decode_time={decode_time}")
             # 优先保证非负与拆分合理
             if prefill_model is None and decode_time is not None:
                 prefill_model = max(0.0, gen_elapsed - decode_time)
@@ -417,9 +447,10 @@ def run_vector_rag(args, llm, dataset):
     _summarize("Prefill time", stat_prefill, "s")
     _summarize("TTFT (retrieval+prefill)", stat_ttft, "s")
     _summarize("TPOT (time per output token)", stat_tpot, "s/token")
-    if sum(stat_tokens) > 0 and sum(stat_e2e) > 0:
-        overall_tps = sum(stat_tokens) / sum(stat_e2e)  # 含检索在内的整体 tokens/sec
-        print(f"Throughput (output tokens / E2E seconds): {overall_tps:.2f} tok/s")
+    if len(stat_e2e) > 0 and sum(stat_e2e) > 0:
+        overall_tps = len(stat_e2e) / sum(stat_e2e)  # 含检索在内的整体 tokens/sec
+        print(f"Throughput (QPS): {overall_tps:.2f}")
+        print(f"Average E2E time: {sum(stat_e2e)/len(stat_e2e):.2f} s")
     print("==========================================\n")
 
     return predictions, answers

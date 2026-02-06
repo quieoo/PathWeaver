@@ -287,6 +287,80 @@ def get_triple_ids_T2(sample, all_samples, current_step, total_steps, max_kb_pat
 
     return triples_ids
 
+def get_triple_ids_ATFB(sample, all_samples, current_step, total_steps, max_kb_paths=16, hop_num=2, shuffle=True, enable_silver=True, verbose=False):
+
+    # 四阶段
+    # step_ratio=[0.25, 0.5, 0.75, 1.0]
+    # stage_num=len(step_ratio)
+    # negative_path_num=[1,int(max_kb_paths/4), int(max_kb_paths/2), max_kb_paths]
+
+
+    # step_ratio=[0.25, 0.5, 0.75, 1.0]
+    # stage_num=len(step_ratio)
+    # negative_path_num=[2, int(max_kb_paths/4), int(max_kb_paths/2), max_kb_paths]
+
+    # step_ratio=[0.33, 0.66, 1.0]
+    # stage_num=len(step_ratio)
+    # negative_path_num=[int(max_kb_paths/8), int(max_kb_paths/4), int(max_kb_paths/2)]
+
+    step_ratio=[0.5, 1.0]
+    stage_num=len(step_ratio)
+    negative_path_num=[int(max_kb_paths/8), int(max_kb_paths/4)]
+
+    # # 一个阶段：每个样本8条
+    # step_ratio=[1.0]
+    # stage_num=len(step_ratio)
+    # negative_path_num=[int(max_kb_paths/4)]
+
+
+    progress = current_step / float(total_steps)
+    cur_stage = stage_num - 1
+    for i in range(stage_num):
+        if progress < step_ratio[i]:
+            cur_stage = i
+            break
+
+    stage_neg_num=negative_path_num[cur_stage]
+    acutal_neg_path_num=len(sample.get("triple_lists", [])) # maybe 1
+    neg_num=min(stage_neg_num, acutal_neg_path_num)
+    
+
+    # 顺序添加
+    path_triple_base=[] # 每个path的第一个三元组的id
+    sample_base_offset=sample["start_id"]
+
+    # 取前neg_num条作为负样本
+    # nega_path_ids=range(neg_num)
+
+    if enable_silver:
+        silver_path_id=0
+        other_path_id=random.sample(range(1, acutal_neg_path_num), neg_num-1)
+        nega_path_ids=[silver_path_id] + other_path_id
+    else:
+        nega_path_ids=range(acutal_neg_path_num)[:neg_num]
+
+
+    if verbose:
+        print(f"[DEBUG] ATFB-Path-S{cur_stage} path-ids {nega_path_ids}")
+
+    for p in nega_path_ids:
+        # gold path | negative paths
+        path_triple_base.append(sample_base_offset + hop_num + p * hop_num)
+
+    if len(path_triple_base) == 0:
+        print(f"[ERROR] Got 0 negative paths, sample {sample}")
+
+    if shuffle:
+        # triples_ids应该能够分成多个hop_num的组，将组间顺序打乱，保持组内顺序
+        random.shuffle(path_triple_base)
+    
+    triples_ids=[]
+    for p in path_triple_base:
+        for i in range(hop_num):
+            triples_ids.append(p + i)
+
+    return triples_ids
+
 class KBRetriever:
     def __init__(
         self,
@@ -1402,6 +1476,7 @@ class KBRetriever:
         max_kb_paths: int = 16,
         device: torch.device | None = None,
         hop_num: int = 2,
+        enable_silver: bool = True,
     ):
         all_samples=self.dataset
         # sr=StageRetriever()
@@ -1412,7 +1487,8 @@ class KBRetriever:
             sample = all_samples[sid]
             # true_triple_indices=sr.get_triple_ids_stage(stage, sample, all_samples, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
             # true_triple_indices = get_triple_ids_T1(sample, all_samples, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
-            true_triple_indices = get_triple_ids_T2(sample, all_samples, step, total_steps, max_kb_paths, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
+            # true_triple_indices = get_triple_ids_T2(sample, all_samples, step, total_steps, max_kb_paths, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False)
+            true_triple_indices = get_triple_ids_ATFB(sample, all_samples, step, total_steps, max_kb_paths, verbose=True if step % 100 == 0 and sid == sample_ids[0] else False, enable_silver=enable_silver)
             all_true_triple_indices.extend(true_triple_indices)
                 
         key_emb_base=self.key_embds[all_true_triple_indices]

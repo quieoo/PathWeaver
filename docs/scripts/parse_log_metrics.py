@@ -2,7 +2,7 @@ import re
 
 # log_file="../experiments/train_at2qa_2wiki_4_2.log"
 
-log_file="../experiments/train_at2qa_2wiki_4_9_2.log"
+log_file="../experiments/train_atfb_2wiki_v5.log"
 
 
 rouge1_values = []

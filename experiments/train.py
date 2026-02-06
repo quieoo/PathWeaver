@@ -55,6 +55,10 @@ import random
 import gc
 LOGFORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 LOGFORMAT_RICH = "%(message)s"
+import heapq
+
+
+
 
 debug_level=1
 
@@ -92,6 +96,7 @@ parser.add_argument("--sep_query_head", action=argparse.BooleanOptionalAction, h
 parser.add_argument("--use_oai_embd", action="store_true", help="Use OpenAI embedding")
 parser.add_argument("--use_cached_embd", action="store_true", help="Choose to use pre-computed KV embeddings")
 parser.add_argument("--total_steps", type=int, default=20000, help="Total steps")
+parser.add_argument("--keep_top_k_ckpt", type=int, default=1, help="Keep top k checkpoints")
 parser.add_argument("--encoder_spec", type=str, default="OAI")
 parser.add_argument("--key_embd_src", type=str, default="key", choices=["key", "answer", "questions", None], help="Source of key embedding")
 parser.add_argument("--use_data_aug", action="store_true", help="Randomly pick templates for the question")
@@ -108,7 +113,7 @@ parser.add_argument("--hf_model_spec", type=str, default="meta-llama/Llama-3.2-1
 
 parser.add_argument("--hf_token", type=str,default=None,help="Huggingface token")
 parser.add_argument("--model_save_dir", type=str, default="output", help="Place to save the checkpoints")
-parser.add_argument("--keep_old_checkpoints", action=argparse.BooleanOptionalAction, default=False, help="Remove old checkpoints")
+
 parser.add_argument("--kb_size", type=int, default=None, help="The size of the KB set size")
 parser.add_argument("--dynamic_kb_size", nargs=2, type=int, default=None, help="The size of the KB set size. Set a dynamic range for the kbsize specify min and max")
 parser.add_argument("--duplicate_true_kb", action=argparse.BooleanOptionalAction, default=True, help="Duplicate true entity's KB token")
@@ -133,6 +138,9 @@ parser.add_argument(
     default=None,
     help="Path to base embeder model",
 )
+parser.add_argument("--disable_random_sample", action="store_true", default=False, help="Randomly sample training data")
+
+
 
 # fmt: on
 
@@ -418,8 +426,10 @@ def get_batch_at2qa(
         else:
             batch_indices = np.random.choice(len(dataset), B, replace=False)
     else:
-        batch_indices = np.arange(B)
+        # 取连续B个样本，开始位置global_step % len(dataset)
+        batch_indices = np.arange(global_step * B, global_step * B + B) % len(dataset)
 
+    # print(f"{step}-{total_steps}-{global_step}: {batch_indices}")
     # at2qa 
     # question_type_array = get_question_type_sampled_T1(step, total_steps, len(batch_indices), verbose=True if step % 100 == 0 else False)
     question_type_array = get_question_type_sampled_T2(step, total_steps, len(batch_indices), verbose=True if step % 100 == 0 else False)
@@ -892,9 +902,9 @@ class Trainer:
         test_kb_scale_factor_range: tuple[float, float] | None = None,
         eval_step: int = 50,
         format_short: bool = False,
-        keep_old_checkpoints: bool = False,
         grad_clip: float | None = None,
         warmup_ratio: float | None = None,
+        keep_top_k_ckpt: int = 1,
     ):
         self.accelerator = Accelerator()
         self.logger = logging.getLogger("training")
@@ -915,9 +925,9 @@ class Trainer:
         self.llm_savename = llm_savename
         self.output_path = pathlib.Path(output_dir)
         self.dataset_format = dataset_format
-        self.keep_old_checkpoints = keep_old_checkpoints
         self.grad_clip = grad_clip
         self.warmup_ratio = warmup_ratio
+        self.keep_top_k_ckpt = keep_top_k_ckpt
 
         if isinstance(llm_model, KBLaMPhi3ForCausalLM):  # Phi3
             self._get_batch = partial(get_batch, format_QA_phi3, _create_labels_for_phi3)
@@ -1045,20 +1055,24 @@ class Trainer:
             seed=seed,
             kb_size=self.test_kb_size,
             query_size=self.test_query_size,
+            enable_silver=False,
         )
+        results_pair=results_pair_list[0]
+        scale_factor=scale_factor_list[0]
 
-        for (results_pair, scale_factor) in zip(results_pair_list, scale_factor_list):
-            model_outputs, answers = results_pair
-            simple_score_dict=simple_evaluation(model_outputs, answers)
-            self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
-            # 输出前5个样本的结果
-            for idx in range(5):
-                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
-            
-            # 输出5个随机样本的结果
-            random_idxs = np.random.choice(len(model_outputs), 5, replace=False)
-            for idx in random_idxs:
-                self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+
+        model_outputs, answers = results_pair
+        simple_score_dict=simple_evaluation(model_outputs, answers)
+        self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
+        # 输出前5个样本的结果
+        for idx in range(5):
+            self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+        
+        # 输出5个随机样本的结果
+        random_idxs = np.random.choice(len(model_outputs), 5, replace=False)
+        for idx in random_idxs:
+            self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
+        return simple_score_dict["rouge1"]
 
 
 
@@ -1085,7 +1099,8 @@ class Trainer:
 
             # Step 4️⃣ 执行评估（复用已有 evaluate 逻辑）
             self.logger.info("Running evaluation under no-grad mode...")
-            self.evaluate(seed=seed, train_config=train_config)
+            accuracy=self.evaluate(seed=seed, train_config=train_config)
+            return accuracy
 
         except Exception as e:
             self.logger.error(f"[SAFE_EVAL ERROR] {type(e).__name__}: {e}")
@@ -1127,6 +1142,7 @@ class Trainer:
         use_data_aug: bool = False,
         multi_entities: bool = False,
         use_extended_qa: bool = False,
+        random_sample: bool = False,
         save_period: int = 2000,
         resumed_step: int = 0,
         kb_config: KBLaMConfig = None,
@@ -1142,6 +1158,9 @@ class Trainer:
         num_processes = self.accelerator.num_processes
         accum_steps_per_gpu = max(1, grad_accum_steps // num_processes)
         effective_batch_size = batch_size * grad_accum_steps
+
+        # ===== Top-K checkpoint config =====
+        topk_checkpoints = []  # min-heap: (acc, step, path)
 
         if self.accelerator.is_main_process:
             self.logger.info(f"Training with {num_processes} GPUs")
@@ -1183,7 +1202,7 @@ class Trainer:
                         self.tokenizer,
                         self.device,
                         B=batch_size,
-                        random_sample=True,
+                        random_sample=random_sample,
                         **step_config,
                     )
                     if a_step == 0 and step % 10 == 0:
@@ -1300,7 +1319,31 @@ class Trainer:
                         loss_fct(shift_logits, shift_labels) * weights.max() / weights
                     ).mean()  # Make sure each sample is equally weighted
                     # 执行反向传播并将损失值保存
+                    # 检查
+                    if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 100:  # 根据你的正常范围调整阈值
+                        print(f"[CRITICAL] Abnormal loss detected: {loss.item()}")
+                        print(f"  weights: {weights}")
+                        print(f"  weights.max(): {weights.max().item()}")
+                        print(f"  weights.min(): {weights.min().item()}")
+                        print(f"  max/min ratio: {weights.max().item() / weights.min().item()}")
+                        
+                        # 2. 检查具体是哪个样本导致
+                        per_sample_loss = loss_fct(shift_logits, shift_labels)
+                        weighted_loss = per_sample_loss * weights.max() / weights
+                        print(f"  per_sample_loss (raw): {per_sample_loss}")
+                        print(f"  weighted_loss: {weighted_loss}")
+                        print(f"  max weighted_loss idx: {weighted_loss.argmax().item()}")
+
                     self.accelerator.backward(loss)
+
+                    # 检查-2
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any():
+                                print(f"[ERROR] NaN in grad of {name}")
+                            grad_norm = param.grad.norm().item()
+                            if grad_norm > 1000:  # 异常大的梯度
+                                print(f"[WARNING] Large grad norm in {name}: {grad_norm}")
                     losses.append(loss.item())
 
                 # 达到累积梯度步数时更新模型参数
@@ -1345,102 +1388,96 @@ class Trainer:
                     train_losses.append(avg_loss)
                     pbar.update(task, advance=1, loss=avg_loss)
 
-                # 保存模型参数
-                # 如果是最后一步
-                if ((step == self.num_steps-1) or ((step % save_period) == 0 and (step != start_step))) and (debug_level < 2) :
-                    try:
-                        # Log memory usage before synchronization
-                        self.logger.info(
-                            f"Is main process: {self.accelerator.is_main_process}, GPU memory before save: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}GB"
-                        )
-
-                        # Try to free up memory
-                        torch.cuda.empty_cache()
-
-                        # Synchronize before saving
-                        self.accelerator.wait_for_everyone()
-
-                        if self.accelerator.is_main_process:
-                            
-                            self.logger.info("Saving checkpoint...")
-                            self.logger.info("Making dirs...")
-                            # Save model - using proper directory creation
-                            model_ckpt_name = self.output_path / f"{self.llm_savename}_step_{step}"
-                            model_ckpt_name.mkdir(parents=True, exist_ok=True)
-
-                            # Also create encoder directory
-                            encoder_dir = self.output_path / f"{self.llm_savename}_step_{step}_encoder"
-                            encoder_dir.mkdir(parents=True, exist_ok=True)
-
-                            self.logger.info("Saving model...")
-                            # Unwrap and save model
-                            unwrapped_model = self.accelerator.unwrap_model(self.model)
-                            unwrapped_model.save_pretrained(
-                                model_ckpt_name,
-                                is_main_process=self.accelerator.is_main_process,
-                                save_function=self.accelerator.save,
-                            )
-
-                            self.logger.info("Saving encoder...")
-                            # Save encoder and config from main process
-                            encoder_ckpt_name = encoder_dir / "encoder.pt"
-                            torch.save(self.kbretriever.encoder.state_dict(), encoder_ckpt_name)
-
-                            self.logger.info("Saving config...")
-                            # Explicitly save config as JSON
-                            config_path = model_ckpt_name / "kb_config_explicit.json"
-                            with open(config_path, 'w') as f:
-                                f.write(kb_config.to_json_string())
-
-                            # 删除旧的checkpoint
-                            if not self.keep_old_checkpoints:
-                                self.logger.info("Removing old checkpoints...")
-                                # 获取所有checkpoint目录
-                                for item in self.output_path.iterdir():
-                                    if item.is_dir():
-                                        # 匹配checkpoint目录名
-                                        match = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)", item.name)
-                                        if match:
-                                            old_step = int(match.group(1))
-                                            if old_step < step:
-                                                # 删除旧的模型checkpoint
-                                                try:
-                                                    shutil.rmtree(item)
-                                                    self.logger.info(f"Removed old model checkpoint: {item}")
-                                                except FileNotFoundError:
-                                                    # 目录可能已被其他进程删除
-                                                    self.logger.info(f"Old model checkpoint already removed: {item}")
-                                        
-                                        # 匹配encoder目录名
-                                        match_encoder = re.match(rf"{re.escape(self.llm_savename)}_step_(\d+)_encoder", item.name)
-                                        if match_encoder:
-                                            old_step = int(match_encoder.group(1))
-                                            if old_step < step:
-                                                # 删除旧的encoder checkpoint
-                                                try:
-                                                    shutil.rmtree(item)
-                                                    self.logger.info(f"Removed old encoder checkpoint: {item}")
-                                                except FileNotFoundError:
-                                                    # 目录可能已被其他进程删除
-                                                    self.logger.info(f"Old encoder checkpoint already removed: {item}")
-                    except Exception as e:
-                        self.logger.error(f"Error saving checkpoint: {e}")
-                        self.logger.error(f"Error details: {str(e)}")
-                        raise e
-
-                
-            
                 # 运行模型验证
                 if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :    
                     kb_config.current_step = step
                     kb_config.total_steps = self.num_steps
-                    self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
+                    real_time_accuracy=self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
 
-                
-                
-                
+                # 保存模型参数
+                # 如果是最后一步
+                if ((step == self.num_steps-1) or ((step % save_period) == 0 and (step != start_step))) and (debug_level < 2) and real_time_accuracy is not None :
 
-    
+                    acc = float(real_time_accuracy)
+                    # 如果 Top-K 未满，或者当前 acc 更好
+                    should_save = (
+                        len(topk_checkpoints) < self.keep_top_k_ckpt
+                        or acc > topk_checkpoints[0][0]
+                    )
+                    if should_save: 
+                        try:
+                            self.logger.info(
+                                f"[TopK] New checkpoint candidate: step={step}, acc={acc:.4f}"
+                            )
+                            # Log memory usage before synchronization
+                            self.logger.info(
+                                f"Is main process: {self.accelerator.is_main_process}, GPU memory before save: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}GB"
+                            )
+
+                            # Try to free up memory
+                            torch.cuda.empty_cache()
+
+                            # Synchronize before saving
+                            self.accelerator.wait_for_everyone()
+
+                            if self.accelerator.is_main_process:
+                                
+                                self.logger.info("Saving checkpoint...")
+                                self.logger.info("Making dirs...")
+                                # Save model - using proper directory creation
+                                model_ckpt_name = self.output_path / f"{self.llm_savename}_step_{step}"
+                                model_ckpt_name.mkdir(parents=True, exist_ok=True)
+
+                                # Also create encoder directory
+                                encoder_dir = self.output_path / f"{self.llm_savename}_step_{step}_encoder"
+                                encoder_dir.mkdir(parents=True, exist_ok=True)
+
+                                self.logger.info("Saving model...")
+                                # Unwrap and save model
+                                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                                unwrapped_model.save_pretrained(
+                                    model_ckpt_name,
+                                    is_main_process=self.accelerator.is_main_process,
+                                    save_function=self.accelerator.save,
+                                )
+
+                                self.logger.info("Saving encoder...")
+                                # Save encoder and config from main process
+                                encoder_ckpt_name = encoder_dir / "encoder.pt"
+                                torch.save(self.kbretriever.encoder.state_dict(), encoder_ckpt_name)
+
+                                self.logger.info("Saving config...")
+                                # Explicitly save config as JSON
+                                config_path = model_ckpt_name / "kb_config_explicit.json"
+                                with open(config_path, 'w') as f:
+                                    f.write(kb_config.to_json_string())
+
+                                # 更新Top-K
+                                heapq.heappush(
+                                    topk_checkpoints,
+                                    (acc, step, model_ckpt_name, encoder_dir),
+                                )
+                                if len(topk_checkpoints) > self.keep_top_k_ckpt:
+                                    worst_acc, worst_step, worst_model_dir, worst_encoder_dir = heapq.heappop(topk_checkpoints)
+                                    self.logger.info(
+                                        f"[TopK] Removing worst checkpoint: "
+                                        f"step={worst_step}, acc={worst_acc:.4f}"
+                                    )
+                                    try:
+                                        shutil.rmtree(worst_model_dir)
+                                        shutil.rmtree(worst_encoder_dir)
+                                    except FileNotFoundError:
+                                        pass
+                        except Exception as e:
+                            self.logger.error(f"Error saving checkpoint: {e}")
+                            self.logger.error(f"Error details: {str(e)}")
+                            raise e
+
+        # 打印当前Top-K
+        self.logger.info(f"[TopK] Current Top-{self.keep_top_k_ckpt} checkpoints:")
+        for acc, step, model_dir, encoder_dir in topk_checkpoints:
+            self.logger.info(f"step={step}, acc={acc:.4f}, model_dir={model_dir}, encoder_dir={encoder_dir}")
+
 def main():
 
     os.environ["NCCL_TIMEOUT"] = "1200000"
@@ -1738,7 +1775,6 @@ def main():
         sep_query_head=sep_query_head,
         max_seq_len=max_seq_len,
         dataset_format=dataset_type,
-        keep_old_checkpoints=args.keep_old_checkpoints,
         test_dataset=test_dataset,
         precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
         precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,
@@ -1750,6 +1786,7 @@ def main():
         format_short=args.format_short,
         grad_clip=args.grad_clip,
         warmup_ratio=args.warmup_ratio,
+        keep_top_k_ckpt=args.keep_top_k_ckpt,
     )
 
     logger.info(f"Number of trainable parameters: {_get_parameter_count(encoder):,}")
@@ -1765,6 +1802,7 @@ def main():
             use_data_aug=use_data_aug,
             multi_entities=multi_entities,
             use_extended_qa=use_extended_qa,
+            random_sample=not args.disable_random_sample,
             save_period=args.save_period,
             resumed_step=resumed_step,
             kb_config=kb_config,

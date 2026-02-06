@@ -213,6 +213,7 @@ def _perform_eval_batched(
     remove_sorry=False,
     enable_retrieval=False,
     verbose=False,
+    enable_silver: bool = True,
 ):
 
     # ---------- optional filter (2wiki) ----------
@@ -267,19 +268,20 @@ def _perform_eval_batched(
                         verbose=verbose,
                     )
                 elif dataset_type=="at2qa_2wiki":                    
-                    # kb_keys, kb_vals, kb_adj=kb_retriever.get_embeddings_at2qa_from_precompute_batch(
-                    #     sample_ids=batch_idx,
-                    #     step=kb_config.current_step,
-                    #     total_steps=kb_config.total_steps,
-                    #     hop_num=2,
-                    # )
-
                     kb_keys, kb_vals, kb_adj=kb_retriever.get_embeddings_at2qa_from_precompute_batch(
                         sample_ids=batch_idx,
-                        step=1,
-                        total_steps=1,
+                        step=kb_config.current_step,
+                        total_steps=kb_config.total_steps,
                         hop_num=2,
+                        enable_silver=enable_silver,
                     )
+                                        # always run in final stage
+                    # kb_keys, kb_vals, kb_adj=kb_retriever.get_embeddings_at2qa_from_precompute_batch(
+                    #     sample_ids=batch_idx,
+                    #     step=1,
+                    #     total_steps=1,
+                    #     hop_num=2,
+                    # )
 
                 else:
                     kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
@@ -373,6 +375,7 @@ def eval_main_process(
     kb_size: int = -1,
     query_size: int = -1,
     enable_retrieval: bool = False,
+    enable_silver: bool = True,
 ):
     if query_size > len(dataset):
         query_size = len(dataset)
@@ -426,6 +429,7 @@ def eval_main_process(
             use_kb_adj=use_kb_adj,
             filter_fn=filter_fn,
             enable_retrieval=enable_retrieval,
+            enable_silver=enable_silver,
         )
         
         results_pair_list.append((model_outputs, answers))
@@ -433,7 +437,7 @@ def eval_main_process(
 
 
 
-def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retriever):
+def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retriever, enable_silver: bool = True):
     
     results_pair_list, scale_factor_list = eval_main_process(
         dataset,
@@ -449,6 +453,7 @@ def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retrie
         args.kb_size,
         args.query_size,
         kb_retriever.is_hnsw_ready(),
+        enable_silver=enable_silver,
     )
 
     for i in range(len(results_pair_list)):
@@ -663,6 +668,11 @@ def main():
         dataset=json.load(open(dataset_path))
     else:
         raise ValueError(f"Unknown dataset format: {dataset_path}")
+    
+    if "silver" in args.test_dataset:
+        enable_silver=True
+    else:
+        enable_silver=False
 
     tokenizer, encoder, model, kb_config = _prepare_models(
         args.encoder_spec,
@@ -705,6 +715,7 @@ def main():
             model,
             kb_config,
             kb_retriever,
+            enable_silver=enable_silver,
         )
     elif args.command == "debug":
         debug_measure_retrieval_accuracy(kb_retriever, dataset)

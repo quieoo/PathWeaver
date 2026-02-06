@@ -33,6 +33,18 @@ python -m vllm.entrypoints.openai.api_server \
   --tensor-parallel-size 1 \
   --trust-remote-code
 
+export CUDA_VISIBLE_DEVICES=0,1
+nohup python -m vllm.entrypoints.openai.api_server \
+  --model /home/sdu/zhu/models/qwen2.5-14B-Instruct \
+  --served-model-name qwen_14 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-seqs 64 \
+  --enable-prefix-caching \
+  --disable-custom-all-reduce \
+  --trust-remote-code > qwen_14_server.log 2>&1 &
 
 export CUDA_VISIBLE_DEVICES=2,3,4,5
 nohup python -m vllm.entrypoints.openai.api_server \
@@ -149,6 +161,23 @@ python graph_rag_benchmark.py \
   --topN-list 1,2,4,8,16,32,64
 
 python 2.1.atlas_mutihopqa.py
+````
+## Hotpot
+````bash
+# 0.prepare data
+conda activate autoschemakg
+cd AutoSchemaKG/docs
+
+python ../atlas_rag/kg_construction/prepare_datasets.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --dataset_type hotpot \
+  --output ../example/example_data/hotpot_dev.json
+head -n 5 ../example/example_data/hotpot_dev.json
+
+# 修改DATA_DIRECTORY和DATA_NAME
+cd scripts
+nohup python 1.create_kg_2wiki.py > create_kg_2wiki_train.log 2>&1 &
+
 ````
 
 
@@ -980,7 +1009,7 @@ export CUDA_VISIBLE_DEVICES=1
 nohup python train.py \
   --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
   --dataset_type at2qa_2wiki \
-  --sep_query_head --duplicate_true_kb \`
+  --sep_query_head --duplicate_true_kb \
   --dynamic_kb_size 10 50 --outlier_num -999999 \
   --kb_token_layer_frequency 3 \
   --path_attn \
@@ -1007,10 +1036,453 @@ nohup python train.py \
 ````
 
 
+
 ## AT-From-Base
 不在QA数据集上续训练（已经形成了对gold path的依赖），直接从base模型上开始训练，随着训练可以逐渐增加negative path的数量，但是全程使用question和negative path
 
+````bash
+# get_embeddings_at2qa_from_precompute_batch ——》 get_triple_ids_ATFB
+# get_question_type_sampled_T2
 
+# 四个阶段提高negative path的数量
+# 1. 1
+# 2. 4
+# 3. 8
+# 4. 16
+
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_train_2hop_compositional_gold.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_train_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_train_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/at2qa_2wiki_5 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_at2qa_2wiki_5.log  2>&1 &
+
+
+````
+### 提取silver path
+silver path是指negative path中指向正确答案的路径
+确保在每个阶段中都有silver path
+  - extract_silver_path.py, 把数据集中的silver path移动到第一位
+  - 在kb_retriever.py中，从头开始读入negative path之后通过random.shuffle(path_triple_base)打乱顺序
+
+提取silver path
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/extract_siver_path.py
+
+# 在脚本里直接改文件名
+````
+
+````
+Extract silver path from AT2QA_2wiki_test_2hop_compositional_gold.json to ATFB_2wiki_test_2hop_compositional_silver.json
+Total sample: 100
+Exact match ratio: 0.44
+Contain ratio: 0.8
+
+Extract silver path from AT2QA_2wiki_train_2hop_compositional_gold.json to ATFB_2wiki_train_2hop_compositional_silver.json
+Total sample: 74988
+Exact match ratio: 0.5989091587987412
+Contain ratio: 0.8886488504827439
+````
+
+重新计算embedding
+````bash
+export CUDA_VISIBLE_DEVICES=2
+# 测试集
+python scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /home/sdu/zhu/models/qwen-embedding-0.6B/ \
+  --dataset_type at2qa_2wiki \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --batch_size 1024
+
+# 训练集
+python scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /home/sdu/zhu/models/qwen-embedding-0.6B/ \
+  --dataset_type at2qa_2wiki \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --batch_size 1024
+
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 10  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --disable_random_sample \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/at2qa_2wiki_5.1.1 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_at2qa_2wiki_5.1.1.log  2>&1 &
+
+# 1*silver + (n-1)*random negative
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/at2qa_2wiki_5.1.2 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_at2qa_2wiki_5.1.2.log  2>&1 &
+
+
+````
+
+### 训练坍塌问题
+
+````
+[15:17:24] INFO     step: 3654 , loss: 0.013303414644906298        train.py:1348
+3655-8000-73100: [56108 56109 56110 56111 56112 56113 56114 56115 56116 56117]
+3655-8000-73101: [56118 56119 56120 56121 56122 56123 56124 56125 56126 56127]
+3655-8000-73102: [56128 56129 56130 56131 56132 56133 56134 56135 56136 56137]
+3655-8000-73103: [56138 56139 56140 56141 56142 56143 56144 56145 56146 56147]
+3655-8000-73104: [56148 56149 56150 56151 56152 56153 56154 56155 56156 56157]
+3655-8000-73105: [56158 56159 56160 56161 56162 56163 56164 56165 56166 56167]
+3655-8000-73106: [56168 56169 56170 56171 56172 56173 56174 56175 56176 56177]
+3655-8000-73107: [56178 56179 56180 56181 56182 56183 56184 56185 56186 56187]
+3655-8000-73108: [56188 56189 56190 56191 56192 56193 56194 56195 56196 56197]
+3655-8000-73109: [56198 56199 56200 56201 56202 56203 56204 56205 56206 56207]
+3655-8000-73110: [56208 56209 56210 56211 56212 56213 56214 56215 56216 56217]
+3655-8000-73111: [56218 56219 56220 56221 56222 56223 56224 56225 56226 56227]
+3655-8000-73112: [56228 56229 56230 56231 56232 56233 56234 56235 56236 56237]
+3655-8000-73113: [56238 56239 56240 56241 56242 56243 56244 56245 56246 56247]
+3655-8000-73114: [56248 56249 56250 56251 56252 56253 56254 56255 56256 56257]
+3655-8000-73115: [56258 56259 56260 56261 56262 56263 56264 56265 56266 56267]
+3655-8000-73116: [56268 56269 56270 56271 56272 56273 56274 56275 56276 56277]
+3655-8000-73117: [56278 56279 56280 56281 56282 56283 56284 56285 56286 56287]
+3655-8000-73118: [56288 56289 56290 56291 56292 56293 56294 56295 56296 56297]
+3655-8000-73119: [56298 56299 56300 56301 56302 56303 56304 56305 56306 56307]
+[15:17:27] INFO     step: 3655 , loss: 0.021708486590068788        train.py:1348
+3656-8000-73120: [56308 56309 56310 56311 56312 56313 56314 56315 56316 56317]
+3656-8000-73121: [56318 56319 56320 56321 56322 56323 56324 56325 56326 56327]
+3656-8000-73122: [56328 56329 56330 56331 56332 56333 56334 56335 56336 56337]
+3656-8000-73123: [56338 56339 56340 56341 56342 56343 56344 56345 56346 56347]
+3656-8000-73124: [56348 56349 56350 56351 56352 56353 56354 56355 56356 56357]
+3656-8000-73125: [56358 56359 56360 56361 56362 56363 56364 56365 56366 56367]
+3656-8000-73126: [56368 56369 56370 56371 56372 56373 56374 56375 56376 56377]
+3656-8000-73127: [56378 56379 56380 56381 56382 56383 56384 56385 56386 56387]
+3656-8000-73128: [56388 56389 56390 56391 56392 56393 56394 56395 56396 56397]
+3656-8000-73129: [56398 56399 56400 56401 56402 56403 56404 56405 56406 56407]
+3656-8000-73130: [56408 56409 56410 56411 56412 56413 56414 56415 56416 56417]
+3656-8000-73131: [56418 56419 56420 56421 56422 56423 56424 56425 56426 56427]
+3656-8000-73132: [56428 56429 56430 56431 56432 56433 56434 56435 56436 56437]
+3656-8000-73133: [56438 56439 56440 56441 56442 56443 56444 56445 56446 56447]
+3656-8000-73134: [56448 56449 56450 56451 56452 56453 56454 56455 56456 56457]
+3656-8000-73135: [56458 56459 56460 56461 56462 56463 56464 56465 56466 56467]
+3656-8000-73136: [56468 56469 56470 56471 56472 56473 56474 56475 56476 56477]
+3656-8000-73137: [56478 56479 56480 56481 56482 56483 56484 56485 56486 56487]
+3656-8000-73138: [56488 56489 56490 56491 56492 56493 56494 56495 56496 56497]
+3656-8000-73139: [56498 56499 56500 56501 56502 56503 56504 56505 56506 56507]
+[15:17:30] INFO     step: 3656 , loss: 2.1545043233782053          train.py:1348
+````
+
+目前来看似乎是数据集切换到silver之后出的问题。
+  - 数据集变化
+  - batch size 5 -> 10
+
+### B=5
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/at2qa_2wiki_5.1.2 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_at2qa_2wiki_5.1.2.log  2>&1 &
+
+python eval_generation.py generation \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/at2qa_2wiki_5.1.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7999_encoder/encoder.pt \
+    --model_dir ./train/at2qa_2wiki_5.1.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples \
+    --test_dataset ATFB_2wiki_test_2hop_compositional_silver.json \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+    --dataset_type at2qa_2wiki --query_size 100 --seed 1 --path_attn 
+
+# 1 + 1 -> 1 + 15
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v2 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v2.log  2>&1 &
+
+
+python eval_generation.py generation \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir ./train/atfb_2wiki_v2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7999_encoder/encoder.pt \
+    --model_dir ./train/atfb_2wiki_v2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7999 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples \
+    --test_dataset ATFB_2wiki_test_2hop_compositional_silver.json \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+    --dataset_type at2qa_2wiki --query_size 100 --seed 1 --path_attn 
+````
+### keep_top_k_ckpt=10
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v3 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v3.log  2>&1 &
+
+
+# 跑一组 2-4-8-16作对比
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v3.1 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v3.1.log  2>&1 &
+
+
+  # 跑一组 2-4作对比
+  # 使用w/o siliver数据集作为验证输入
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v3.2 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v3.2.log  2>&1 &
+````
+
+#### top-k ckpt的测试
+````bash
+
+# 批量测试
+
+nohup python scripts/batch_inference.py > batch_inference.log 2>&1 &
+
+````
+### silver+random; 2,4 path
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v4 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v4.log  2>&1 &
+
+````
+
+### retrieve; 2-4-8 path
+
+````bash
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_v5 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_v5.log  2>&1 &
+
+export DASHSCOPE_API_KEY=sk-xxxx
+export CUDA_VISIBLE_DEVICES=0
+nohup python scripts/batch_inference.py > batch_inference_v5.log 2>&1 &
+````
 
 
 ## testing
