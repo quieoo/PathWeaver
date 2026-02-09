@@ -46,6 +46,7 @@ nohup python -m vllm.entrypoints.openai.api_server \
   --disable-custom-all-reduce \
   --trust-remote-code > qwen_14_server.log 2>&1 &
 
+
 export CUDA_VISIBLE_DEVICES=2,3,4,5
 nohup python -m vllm.entrypoints.openai.api_server \
   --model /home/sdu/zhu/models/qwen2.5-14B-Instruct \
@@ -180,6 +181,35 @@ nohup python 1.create_kg_2wiki.py > create_kg_2wiki_train.log 2>&1 &
 
 ````
 
+## Musique
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python -m vllm.entrypoints.openai.api_server \
+  --model /home/sdu/zhu/models/qwen2.5-14B-Instruct \
+  --served-model-name qwen_14 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-seqs 64 \
+  --enable-prefix-caching \
+  --disable-custom-all-reduce \
+  --trust-remote-code > qwen_14_server.log 2>&1 &
+
+conda activate autoschemakg
+cd AutoSchemaKG/docs
+
+python ../atlas_rag/kg_construction/prepare_datasets.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_dev.jsonl \
+  --dataset_type musique \
+  --output ../example/example_data/musique_dev.json
+head -n 5 ../example/example_data/musique_dev.json
+
+# 修改DATA_DIRECTORY和DATA_NAME
+cd scripts
+nohup python 1.create_kg_2wiki.py > create_kg_musique_dev.log 2>&1 &
+````
 
 # AutoSchemaKG to KBLaM
 ## Prepare Dataset

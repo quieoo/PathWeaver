@@ -18,6 +18,10 @@ import tqdm
 
 # -------- LlamaIndex (RAG) --------
 from llama_index.core import Document, VectorStoreIndex
+from llama_index.core.storage import StorageContext
+from llama_index.core import load_index_from_storage
+from llama_index.vector_stores.faiss import FAISSVectorStore
+import faiss
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 try:
     from llama_index.core import Settings
@@ -49,6 +53,9 @@ def parse_args():
     parser.add_argument('--embedding-model', type=str,
                         default='sentence-transformers/all-MiniLM-L6-v2',
                         help='嵌入模型名称')
+    parser.add_argument('--index-path', type=str,
+                        default=None,
+                        help='索引路径')
     parser.add_argument('--oracle-retrieval', action='store_true',
                         help='使用 oracle 检索：用 is_supporting 段落直接拼接为上下文')
     parser.add_argument('--kb-size', type=int, default=10, help='知识库段落数量')
@@ -61,6 +68,28 @@ def parse_args():
 
 
 def setup_models(args):
+
+    print(f"setting embed model to {args.embedding_model}")
+    # embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
+    if os.path.isdir(args.embedding_model):
+        # 本地 embedding 模型
+        embed_model = HuggingFaceEmbedding(
+            model_name=args.embedding_model,
+            trust_remote_code=True,
+            # device="cuda" if torch.cuda.is_available() else "cpu",
+            device="cpu",
+        )
+    else:
+        # HuggingFace Hub 模型
+        embed_model = HuggingFaceEmbedding(
+            model_name=args.embedding_model,
+            # device="cuda" if torch.cuda.is_available() else "cpu",
+            device="cpu",
+        )
+
+    Settings.embed_model = embed_model
+    Settings.llm = None
+
     print(f"Loading model from {args.model_path}...")
     if 'llama' in args.model_path:
     # 使用VLLM加载模型
@@ -69,7 +98,15 @@ def setup_models(args):
             enforce_eager=True,
             disable_log_stats=False, 
         )
-    elif 'deepseek' in args.model_path or 'qwen' in args.model_path:
+    elif 'qwen2.5-72B' in args.model_path:
+        llm = LLM(
+            model=args.model_path,
+            enforce_eager=True,
+            disable_log_stats=False, 
+            max_model_len=5000,
+            gpu_memory_utilization=0.95,
+        )
+    elif 'deepseek' in args.model_path:
         n_gpus = torch.cuda.device_count()
         print(f"Detected {n_gpus} GPUs")
         llm = LLM(
@@ -104,24 +141,8 @@ def setup_models(args):
             # disable_log_stats=True,
         )
 
-    print(f"setting embed model to {args.embedding_model}")
-    # embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
-    if os.path.isdir(args.embedding_model):
-        # 本地 embedding 模型
-        embed_model = HuggingFaceEmbedding(
-            model_name=args.embedding_model,
-            trust_remote_code=True,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-    else:
-        # HuggingFace Hub 模型
-        embed_model = HuggingFaceEmbedding(
-            model_name=args.embedding_model,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
 
-    Settings.embed_model = embed_model
-    Settings.llm = None
+    print("Setup models done")
     return llm
 
 
@@ -204,6 +225,22 @@ def _summarize(name: str, values: List[float], unit: str = "s"):
     p95_v = _percentile(values, 95)
     print(f"{name}: mean={mean_v:.4f}{unit}, p50={p50_v:.4f}{unit}, p95={p95_v:.4f}{unit}")
 
+
+def get_rag_retriever(docs, args):
+
+    if os.path.exists(args.index_path):
+        print(f"Load index from {args.index_path}")
+        storage_context = StorageContext.from_defaults(persist_dir=args.index_path)
+        index = load_index_from_storage(storage_context)
+    else:
+        print(f"Index not found in {args.index_path}, create index from documents...")
+        index = VectorStoreIndex.from_documents(docs)
+        index.storage_context.persist(persist_dir=args.index_path)
+        print(f"Index saved to {args.index_path}")
+    
+    retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+    return retriever
+
 def run_vector_rag(args, llm, dataset):
 
     docs=[]
@@ -219,10 +256,12 @@ def run_vector_rag(args, llm, dataset):
             if title in supporting_facts_titles:
                 gold_contexts.append(sentence_text)
     print(f"Loaded {len(docs)} documents")
-    if not args.oracle_retrieval:
-        index = VectorStoreIndex.from_documents(docs)
-        retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+    if not args.oracle_retrieval and not args.without_knowledge:
+        # index = VectorStoreIndex.from_documents(docs)
+        # retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+        retriever = get_rag_retriever(docs, args)
 
+    print("Create RAG engine done")
     predictions: List[str] = []
     answers: List[str] = []
 

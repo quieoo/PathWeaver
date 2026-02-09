@@ -7,6 +7,8 @@ export CUDA_VISIBLE_DEVICES=2
 
 nohup python ../../experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model all-MiniLM-L6-v2     --n-samples 100  --similarity-top-k 16 --without-knowledge >> overall_wo_kb.log 2>&1 &
 
+python ../../experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/qwen2.5-72B-4bit     --embedding-model all-MiniLM-L6-v2     --n-samples 100  --similarity-top-k 16 --without-knowledge
+
 ````
 
 
@@ -29,6 +31,18 @@ export CUDA_VISIBLE_DEVICES=2
 
 
 nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model all-MiniLM-L6-v2     --n-samples 100  --similarity-top-k 16 >> overall_vector_rag.log 2>&1 &
+````
+
+### BGE-embedding
+
+````bash
+nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/     --n-samples 100  --similarity-top-k 16 >> overall_vector_rag.log 2>&1 &
+````
+
+### qwen-72B-int4
+
+````bash
+python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/qwen2.5-72B-4bit     --embedding-model all-MiniLM-L6-v2     --n-samples 100  --similarity-top-k 16 --index-path ../../experiments/vector_rag_index/2wiki_allmini
 
 
 ````

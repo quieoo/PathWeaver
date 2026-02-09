@@ -10,7 +10,7 @@ retrieval modules, and unlike in-context learning, its computational overhead sc
 
 ## Supported Models
 The following models from Hugging Face hub are currently supported:
-
+    
 - [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
 - [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
 - [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
