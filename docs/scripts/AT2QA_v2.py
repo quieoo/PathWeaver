@@ -219,6 +219,18 @@ def collect_target_triples(sample: Dict[str, Any]) -> List[Dict[str, Any]]:
                     triples.append(t)
     return triples
 
+def collect_all_triples(sample: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Collect all triples from context, including those not supported by facts.
+    """
+    triples: List[Dict[str, Any]] = []
+    for ctx in sample.get("context", []):
+        if not isinstance(ctx, dict):
+            continue
+        for t in ctx.get("triple_list", []) or []:
+            if isinstance(t, dict):
+                triples.append(t)
+    return triples
 
 def build_edges(triples: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
     """
@@ -495,7 +507,9 @@ def pick_topk_path_v2(
     topk_scores = [float(scores[i]) for i in topk_idx]
     if verbose:
         if answer not in topk_paths[0].desc2:
+            print("\n")
             print(f"Question: {question}")
+            print(f"Answer: {answer}")
             print(f"Answer LOSS---")
             for i in sorted_idx:
                 pks = pks_list[i]
@@ -639,6 +653,7 @@ def convert_dataset(
     batch_size: int = 256,
     keep_score: bool = False,
     verbose: bool = True,
+    supporting_only: bool = False,
 ) -> List[Dict[str, Any]]:
     if max_samples is None:
         max_samples = len(samples)
@@ -656,15 +671,18 @@ def convert_dataset(
         a = s.get("answer")
         if not isinstance(q, str) or not isinstance(a, str):
             continue
-
-        triples = collect_target_triples(s)
+        
+        if supporting_only:
+            triples = collect_target_triples(s)
+        else:
+            triples = collect_all_triples(s)
         # edges = build_edges(triples)
         edges = build_edges_approx(triples)
 
         st = time.time()
         # ret = pick_top1_path_multi_view(q, a, triples, edges, embedder, batch_size=batch_size)
         # ret = pick_topk_path_multi_view(q, a, triples, edges, embedder, batch_size=batch_size, k=k)
-        ret=pick_topk_path_v2(q, a, triples, edges, embedder, batch_size=batch_size, k=k, verbose=False)
+        ret=pick_topk_path_v2(q, a, triples, edges, embedder, batch_size=batch_size, k=k, verbose=verbose)
 
         if ret is None: 
             continue
@@ -690,6 +708,8 @@ def convert_dataset(
                 found_answer = True
         if found_answer:
             answer_recall+=1
+        else: 
+            print(s)
 
         row: Dict[str, Any] = {"id": s["_id"], "Q": q, "A": a, "triple_lists": path_triple_lists}
         if keep_score:
@@ -721,11 +741,14 @@ def main():
     ap.add_argument("--keep_score", action="store_true", help="keep similarity scores & variant id")
     ap.add_argument("--limit", type=int, default=None, help="limit number of samples (take last N)")
     ap.add_argument("--k", type=int, default=1, help="top-k paths to pick")
+    ap.add_argument("--supporting_only", action="store_true", help="only pick paths with supporting triples")
+    ap.add_argument("--verbose", action="store_true", help="verbose debug")
     args = ap.parse_args()
 
     embedder = SentenceTransformer(args.st_model)
 
     samples = read_json_or_jsonl(args.input)
+    print(f"Load {len(samples)} samples from {args.input}")
 
     out = convert_dataset(
         samples=samples,
@@ -734,6 +757,8 @@ def main():
         k=args.k,
         batch_size=args.batch_size,
         keep_score=args.keep_score,
+        verbose=args.verbose,
+        supporting_only=args.supporting_only,
     )
 
     if args.output.endswith(".jsonl"):

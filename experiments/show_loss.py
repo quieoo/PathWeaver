@@ -58,7 +58,7 @@ with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
 
             last_time_sec = cur_sec
 
-            x = current_date.replace(hour=h, minute=m_, second=s)
+            x = len(xs)
             y = float(m.group(4))
 
         # ---------- ROUGE1 ----------
@@ -77,10 +77,9 @@ with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
                         current_date += timedelta(days=1)
 
                 last_time_sec = cur_sec
-                x = current_date.replace(hour=h, minute=m_, second=s)
+                x = len(xs)
             else:
-                # fallback：用行号（极少出现）
-                x = idx
+                x = len(xs)
 
             y = float(m.group(1))
 
@@ -94,11 +93,10 @@ plt.figure(figsize=(8, 5))
 plt.plot(xs, ys, linewidth=1.5)
 plt.grid(True)
 
-plt.xlabel("Time")
+plt.xlabel("Step")
 plt.ylabel(args.k.upper())
 plt.title(f"{args.k.upper()} Curve")
 
-plt.gcf().autofmt_xdate()
 plt.tight_layout()
 plt.savefig(out_file, dpi=300)
 plt.close()

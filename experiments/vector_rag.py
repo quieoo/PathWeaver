@@ -20,19 +20,21 @@ import tqdm
 from llama_index.core import Document, VectorStoreIndex
 from llama_index.core.storage import StorageContext
 from llama_index.core import load_index_from_storage
-from llama_index.vector_stores.faiss import FAISSVectorStore
-import faiss
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 try:
     from llama_index.core import Settings
 except ImportError:
     from llama_index import Settings
 
-# -------- vLLM --------
 from vllm import LLM, SamplingParams
-
-# -------- 你项目中的评测 --------
 from kblam.metrics_evaluator import full_evaluation
+
+import faiss
+try:
+    from llama_index.vector_stores.faiss import FaissVectorStore
+except Exception:
+    # older naming in some versions
+    from llama_index.vector_stores.faiss import FAISSVectorStore as FaissVectorStore
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue (TTFT & TPOT)')
@@ -53,6 +55,7 @@ def parse_args():
     parser.add_argument('--embedding-model', type=str,
                         default='sentence-transformers/all-MiniLM-L6-v2',
                         help='嵌入模型名称')
+    parser.add_argument('--embedding-device', type=str, default='cuda', help='嵌入模型设备')
     parser.add_argument('--index-path', type=str,
                         default=None,
                         help='索引路径')
@@ -66,9 +69,47 @@ def parse_args():
 
     return parser.parse_args()
 
+def _faiss_vector_store_for_dir(persist_dir: str):
+    """Load a persisted FAISS vector store from a LlamaIndex persist directory."""
+    if hasattr(FaissVectorStore, "from_persist_dir"):
+        return FaissVectorStore.from_persist_dir(persist_dir=persist_dir)
+    if hasattr(FaissVectorStore, "from_persist_path"):
+        # Some versions persist to a single file path; try the common filename.
+        idx_path = os.path.join(persist_dir, "faiss.index")
+        return FaissVectorStore.from_persist_path(persist_path=idx_path)
+    raise RuntimeError("This LlamaIndex FaissVectorStore does not support loading from disk.")
 
-def setup_models(args):
+def get_rag_retriever(docs, args):
+    if args.index_path is None:
+        raise ValueError("--index-path must be set when using Vector-RAG (FAISS backend).")
 
+    if os.path.exists(args.index_path):
+        print(f"Load FAISS index from {args.index_path}")
+        faiss_store = _faiss_vector_store_for_dir(args.index_path)
+        storage_context = StorageContext.from_defaults(
+            persist_dir=args.index_path,
+            vector_store=faiss_store,
+        )
+        index = load_index_from_storage(storage_context)
+    else:
+        print(f"Index not found in {args.index_path}, create FAISS index from documents...")
+        # Probe embedding dimension once (embed model is set in setup_models)
+        dim = len(Settings.embed_model.get_text_embedding("dimension probe"))
+        # Inner-product flat index; works well if embeddings are normalized.
+        # If you prefer L2 distance, switch to faiss.IndexFlatL2(dim).
+        print(f"Create FAISS index with dimension {dim}")
+        faiss_index = faiss.IndexFlatIP(dim)
+        faiss_store = FaissVectorStore(faiss_index=faiss_index)
+        storage_context = StorageContext.from_defaults(vector_store=faiss_store)
+        index = VectorStoreIndex.from_documents(docs, storage_context=storage_context)
+        index.storage_context.persist(persist_dir=args.index_path)
+        print(f"FAISS index saved to {args.index_path}")
+
+    retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+    return retriever
+
+def setup_retriever(args, dataset):
+    retriever = None
     print(f"setting embed model to {args.embedding_model}")
     # embed_model = HuggingFaceEmbedding(model_name=args.embedding_model)
     if os.path.isdir(args.embedding_model):
@@ -76,20 +117,40 @@ def setup_models(args):
         embed_model = HuggingFaceEmbedding(
             model_name=args.embedding_model,
             trust_remote_code=True,
-            # device="cuda" if torch.cuda.is_available() else "cpu",
-            device="cpu",
+            device=args.embedding_device,
         )
     else:
         # HuggingFace Hub 模型
         embed_model = HuggingFaceEmbedding(
             model_name=args.embedding_model,
-            # device="cuda" if torch.cuda.is_available() else "cpu",
-            device="cpu",
+            device=args.embedding_device,
         )
 
     Settings.embed_model = embed_model
     Settings.llm = None
 
+    docs=[]
+    gold_contexts=[]
+    for row in dataset:
+        supporting_facts_titles=[]
+        for sp in row['supporting_facts']:
+            supporting_facts_titles.append(sp[0])
+        for ctx in row['context']:
+            title=ctx[0]
+            sentence_text= " ".join(ctx[1])
+            docs.append(Document(text=sentence_text, metadata={'title': title}))
+            if title in supporting_facts_titles:
+                gold_contexts.append(sentence_text)
+    print(f"Loaded {len(docs)} documents")
+    if not args.oracle_retrieval and not args.without_knowledge:
+        # index = VectorStoreIndex.from_documents(docs)
+        # retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
+        retriever = get_rag_retriever(docs, args)
+    
+    return retriever, gold_contexts
+
+
+def setup_models(args):
     print(f"Loading model from {args.model_path}...")
     if 'llama' in args.model_path:
     # 使用VLLM加载模型
@@ -102,9 +163,9 @@ def setup_models(args):
         llm = LLM(
             model=args.model_path,
             enforce_eager=True,
-            disable_log_stats=False, 
-            max_model_len=5000,
+            disable_log_stats=False,
             gpu_memory_utilization=0.95,
+            tensor_parallel_size=2,
         )
     elif 'deepseek' in args.model_path:
         n_gpus = torch.cuda.device_count()
@@ -226,40 +287,9 @@ def _summarize(name: str, values: List[float], unit: str = "s"):
     print(f"{name}: mean={mean_v:.4f}{unit}, p50={p50_v:.4f}{unit}, p95={p95_v:.4f}{unit}")
 
 
-def get_rag_retriever(docs, args):
 
-    if os.path.exists(args.index_path):
-        print(f"Load index from {args.index_path}")
-        storage_context = StorageContext.from_defaults(persist_dir=args.index_path)
-        index = load_index_from_storage(storage_context)
-    else:
-        print(f"Index not found in {args.index_path}, create index from documents...")
-        index = VectorStoreIndex.from_documents(docs)
-        index.storage_context.persist(persist_dir=args.index_path)
-        print(f"Index saved to {args.index_path}")
-    
-    retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
-    return retriever
 
-def run_vector_rag(args, llm, dataset):
-
-    docs=[]
-    gold_contexts=[]
-    for row in dataset:
-        supporting_facts_titles=[]
-        for sp in row['supporting_facts']:
-            supporting_facts_titles.append(sp[0])
-        for ctx in row['context']:
-            title=ctx[0]
-            sentence_text= " ".join(ctx[1])
-            docs.append(Document(text=sentence_text, metadata={'title': title}))
-            if title in supporting_facts_titles:
-                gold_contexts.append(sentence_text)
-    print(f"Loaded {len(docs)} documents")
-    if not args.oracle_retrieval and not args.without_knowledge:
-        # index = VectorStoreIndex.from_documents(docs)
-        # retriever = index.as_retriever(similarity_top_k=args.similarity_top_k)
-        retriever = get_rag_retriever(docs, args)
+def run_vector_rag(args, llm, retriever, gold_contexts, dataset):
 
     print("Create RAG engine done")
     predictions: List[str] = []
@@ -514,9 +544,10 @@ def main():
     args=parse_args()
     dataset=load_dataset(args.dataset_path)
 
+    retriever, gold_contexts = setup_retriever(args, dataset)
     llm=setup_models(args)
 
-    predictions, answers = run_vector_rag(args, llm, dataset)
+    predictions, answers = run_vector_rag(args, llm, retriever, gold_contexts, dataset)
 
     clean_model(llm)
     comparison_str, metrics = full_evaluation(predictions, answers)

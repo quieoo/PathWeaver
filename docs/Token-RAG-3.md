@@ -1514,6 +1514,460 @@ export CUDA_VISIBLE_DEVICES=0
 nohup python scripts/batch_inference.py > batch_inference_v5.log 2>&1 &
 ````
 
+### bge-embedding
+
+````bash
+export CUDA_VISIBLE_DEVICES=1
+conda activate kblam_tf457
+
+python scripts/embedding_v2.py \
+  --model_name bge \
+  --local_model_path /home/sdu/zhu/models/bge-en-v1.5/ \
+  --dataset_type at2qa_2wiki \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --batch_size 1024
+
+python scripts/embedding_v2.py \
+  --model_name bge \
+  --local_model_path /home/sdu/zhu/models/bge-en-v1.5/ \
+  --dataset_type at2qa_2wiki \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --batch_size 1024
+
+cd experiments
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec bge --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_bge-en-v1.5_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_bge-en-v1.5_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_bge-en-v1.5_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_bge-en-v1.5_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_bge_v1 --keep_top_k_ckpt 10 --save_period 100 \
+  > train_atfb_2wiki_bge_v1.log  2>&1 &
+
+  
+````
+NOTE：不确定是过程出的错还是bge-embedidng本身在这类任务上性能更差，导致训练出来的模型精度降低大约10%.
+
+### 复现qwen-embedding
+同时做一个小修改:
+- 训练过程中的验证集使用和推理时一模一样的配置：2条、无silver
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_qwen_embedding_v1 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_qwen_embedding_v1.log  2>&1 &
+
+````
+
+- 训练路径：8或16条，1 silver + n random
+- 验证路径：和训练一样
+````bash
+
+# 4阶段
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 12000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_qwen_embedding_v3 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_qwen_embedding_v3.log  2>&1 &
+
+
+# 一组一模一样配置的
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 12000 --N 9999999 \
+  --model_save_dir ./train/atfb_2wiki_qwen_embedding_v3.1 --keep_top_k_ckpt 10 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  > train_atfb_2wiki_qwen_embedding_v3.1.log  2>&1 &
+````
+
+
+## 修复训练过程中不稳定的崩溃问题
+在训练PathWeaver模型过程中出现精度崩溃的现象，在训练一定步数后loss突然大增，之后的训练虽然可以使得loss继续降低，但是模型的推理精度会受到不可恢复的影响。
+这种现象并不总是会发生，但是发现随着训练的批量大小增加发生概率会变大。
+
+### 问题复现
+跑两组，不同的B值
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v1 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v1.log  2>&1 &
+
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 20  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v2 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v2.log  2>&1 &
+
+````
+### 解决1：训练集过滤
+filter_valid_sample.py: 将路径为空，或者不包含正确答案的样本过滤掉
+````
+Original samples: 74988
+Valid samples: 66752
+Saved valid samples to ATFB_2wiki_train_2hop_compositional_silver_filtered.json
+````
+重新生成embedding:
+
+````bash
+python scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /home/sdu/zhu/models/qwen-embedding-0.6B/ \
+  --dataset_type at2qa_2wiki \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered.json \
+  --batch_size 1024
+````
+
+重新训练：
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v3 --save_period 100 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v3.log  2>&1 &
+
+````
+效果：似乎稳定了很多，Training loss不再波动
+
+
+进一步测试：
+ - 修改路径选择，训练时候：silver+random -> silver+sequencial, 验证时候：2条逐渐增加到8条 -> 固定2条(固定current_step=0)
+ - keep_top_k_ckpt=10
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v4 --save_period 100 --keep_top_k_ckpt 10 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v4.log  2>&1 &
+
+````
+### 解决2： 降低batch size
+````bash
+export CUDA_VISIBLE_DEVICES=1
+nohup python train.py \
+  --seed 1 --B 2  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v5 --save_period 100 --keep_top_k_ckpt 10 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v5.log  2>&1 &
+
+````
+结论：减少batch size仍旧会出现崩溃现象
+
+
+
+### 解决3：不要分阶段，直接固定路径数量
+
+修改kb_retriever.py中的get_triple_ids_ATFB：
+````python
+    step_ratio=[1.0]
+    stage_num=len(step_ratio)
+    negative_path_num=[max_kb_paths]
+````
+
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python train.py \
+  --seed 1 --B 2  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type at2qa_2wiki \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered.json \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_train_2hop_compositional_silver_filtered_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/ATFB_2wiki_test_2hop_compositional_silver.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir ./train/debug_spikes_v6 --save_period 100 --keep_top_k_ckpt 10 \
+  --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+  >> train_debug_spikes_v6.log  2>&1 &
+````
+
+结论：这不行，模型完全不收敛
+
+
+
+## Hotpot
+一些新的挑战：
+ - Hotpot上答案可能出现在head、relation位置，而不是一定在tail
+ - 答案和上下文可能存在相同意思，但是拼写不同的情况 （数据集过滤时候需要注意）
+
+
+### 原版AT2QA_v2
+
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python scripts/AT2QA_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/hotpot_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_hotpot_paths_train.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000 \
+  --k 16 >> at_hotpot.log 2>&1 &
+
+nohup python scripts/AT2QA_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_hotpot_paths_dev.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --k 16 >> at_hotpot.log 2>&1 &
+````
+输出：
+````
+100条
+Average pick time: 0.1253s
+Graph recall: 0.4900
+Answer recall: 0.4500
+
+1000条
+Average pick time: 0.1141s
+Graph recall: 0.5470
+Answer recall: 0.4930
+````
+### 原版 + bge-embedding
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python scripts/AT2QA_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/hotpot_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_hotpot_paths_train.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --k 16 >> at_hotpot.log 2>&1 &
+
+nohup python scripts/AT2QA_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_hotpot_paths_dev.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --k 16 >> at_hotpot.log 2>&1 &
+````
+输出：
+````
+Average pick time: 0.0693s
+Graph recall: 0.4900
+Answer recall: 0.4200
+````
+结论：bge更快，但是性能比qwen-embedding-0.6B略微慢点
+
+### 开启verbose debug
+
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python scripts/AT2QA_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/hotpot_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_hotpot_paths_train_debug.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --k 16 > at_hotpot.log 2>&1 &
+````
+
+
+
 
 ## testing
 
@@ -1599,5 +2053,917 @@ python eval_generation.py generation \
     --test_dataset AT2QA_2wiki_test_2hop_compositional_gold.json \
     --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
     --dataset_type at2qa_2wiki --query_size 100 --seed 1 --path_attn
+
+````
+
+
+# DAG-KV
+
+DAG-KV问题描述：
+- 有一张知识图谱，其中包含若干实体，实体与实体之间拥有关系，从而产生关系三元组，每个实体又有属性从而产生属性三元组。实体和属性值是节点，关系和属性类型是边。
+- 每个三元组可以表达成两个键值对（关系和属性类型作为双向边）
+- 对于一个问题首先判断它与哪些实体有关，这些实体之间必须是有关系的。从实体图中找到一个最小子图。目标是限制搜索范围，避免包含噪音三元组（比如不同实体但是拥有相似的属性）
+- 在最小实体子图中继续筛选和问题有关的属性，获得一个最小实体属性图。最小实体属性图应该只包含单向边，不应该拥有环。
+- 将最小实体属性图中的每一条边转换为键值对，保存邻接矩阵代表键值对之间的关系。
+
+## 知识图谱提取(LLM-based-triple-extractor)
+
+### 提取规则
+
+  1. 实体抽取
+    - 抽取所有显式出现的 named entities（人/组织/地点/作品/事件等）
+    - 日期/数值/职业/国籍/描述短语不当作实体节点
+  2. 关系抽取 (entity-entity)
+    - 仅抽取文本中明确陈述的实体-实体关系
+    - 关系名为短动词/介词短语，不包含数值/日期
+  3. 属性抽取 (entity-attribute)
+    - 抽取实体的显式属性：时间、地点、数量、身份、类别、头衔、描述等
+    - 属性名短且一致
+  4. KV 生成规则
+    - 对每个属性事实(e,a,v)输出两对KV:
+      - key=natural_forward_string(e,a), value=v
+      - key=natural_reverse_string(v,a), value=e
+    - 对每个关系事实(e1,r,e2)输出两对KV:
+      - key=natural_forward_string(e1,r), value=e2
+      - key=natural_reverse_string(e2,r), value=e1
+    - natural_reverse_string必须是对同一事实在反向视角下的等价描述，不能引入新条件
+    - 例如：
+      - 例如，属性事实(India,location,South Asia)，输出 ('the location of India', 'South Asia'), ('South Asia is the location of', 'India')
+      - 例如，关系事实(Bill Gates, founded, Microsoft), 输出 ('Bill Gates founded', 'Microsoft'), ('Microsoft is founded by', 'Bill Gates')
+  5. 关系派生属性
+    - 对每个关系事实(e1,r,e2)派生出一个等价的属性事实 (e1,a,e2), a是派生属性名，再额外生成两对KV:
+      - key=natural_forward_string(e1,a), value=e2
+      - key=natural_reverse_string(e2,a), value=e1
+      - 例如：
+        - 关系事实 (Albert Einstein, was born in, Ulm), 派生出属性名 'birthplace'，因此额外输出两个派生属性KV('the birthplace of Albert Einstein', 'Ulm'), ('the person born in Ulm', 'Albert Einstein')
+
+### Prompt模板
+````python
+Prompt_prefix = (
+  """
+  You are a precise knowledge extraction system designed to build a clean bidirectional KV-based knowledge graph.
+
+Your task is to extract factual knowledge from ONE given context and output structured key/value pairs.
+
+============================================================
+I. ENTITY EXTRACTION
+============================================================
+
+1. Extract ALL explicitly mentioned named entities:
+   - Persons
+   - Organizations
+   - Locations
+   - Works (books, films, songs, etc.)
+   - Events
+   - Clearly named real-world entities
+
+2. The following MUST NOT be treated as entities:
+   - Dates
+   - Numbers
+   - Quantities
+   - Job titles
+   - Nationalities
+   - Descriptive phrases
+   - Categories
+
+If unsure, treat it as a VALUE, not an entity.
+
+============================================================
+II. RELATION EXTRACTION (entity → entity)
+============================================================
+
+1. Extract only explicitly stated entity-to-entity relations.
+2. Do NOT infer or create multi-hop relations.
+3. Relation names must:
+   - Be short verb phrases or prepositional phrases
+   - NOT contain dates or numbers
+   - Reflect the wording of the text
+
+Example:
+(Bill Gates, founded, Microsoft)
+
+============================================================
+III. ATTRIBUTE EXTRACTION (entity → value)
+============================================================
+
+Extract explicit attributes of entities, including:
+- Time
+- Location
+- Quantity
+- Identity
+- Category
+- Title
+- Description
+
+Attribute names must:
+- Be short
+- Be consistent
+- Not include value information inside the attribute name
+
+Example:
+(Albert Einstein, date of birth, 14 March 1879)
+
+============================================================
+IV. KV GENERATION RULES (BIDIRECTIONAL)
+============================================================
+
+For EACH extracted fact, generate TWO key/value pairs.
+
+A. For attribute fact (e, a, v):
+
+1) Forward KV:
+   key = natural_forward_string(e, a)
+   value = v
+
+2) Reverse KV:
+   key = natural_reverse_string(v, a)
+   value = e
+
+B. For relation fact (e1, r, e2):
+
+1) Forward KV:
+   key = natural_forward_string(e1, r)
+   value = e2
+
+2) Reverse KV:
+   key = natural_reverse_string(e2, r)
+   value = e1
+
+------------------------------------------------------------
+Reverse Equivalence Constraint (CRITICAL)
+------------------------------------------------------------
+
+natural_reverse_string MUST:
+- Be a logically equivalent restatement of the SAME fact
+- Only reverse perspective
+- NOT introduce new assumptions
+- NOT introduce new type labels
+- Use neutral wording if needed
+
+If strict equivalence cannot be achieved, use a safe neutral reverse phrasing.
+
+------------------------------------------------------------
+Examples
+------------------------------------------------------------
+
+Attribute fact:
+(India, location, South Asia)
+
+Output:
+('the location of India', 'South Asia')
+('South Asia is the location of', 'India')
+
+Relation fact:
+(Bill Gates, founded, Microsoft)
+
+Output:
+('Bill Gates founded', 'Microsoft')
+('Microsoft is founded by', 'Bill Gates')
+
+============================================================
+V. RELATION-DERIVED ATTRIBUTE
+============================================================
+
+For each relation (e1, r, e2), derive ONE equivalent attribute fact (e1, a, e2) 
+
+Rules:
+- The derived attribute must not change meaning.
+- It must not introduce new type information.
+- It must be interchangeable with the relation in question-answer form.
+
+For each valid derived attribute, generate TWO additional KV pairs:
+
+1) Forward:
+   key = natural_forward_string(e1, a)
+   value = e2
+
+2) Reverse:
+   key = natural_reverse_string(e2, a)
+   value = e1
+
+------------------------------------------------------------
+Example (SAFE)
+------------------------------------------------------------
+
+Relation:
+(Albert Einstein, was born in, Ulm)
+
+Derived attribute:
+(Albert Einstein, birthplace, Ulm)
+
+Additional KV:
+('the birthplace of Albert Einstein', 'Ulm')
+('the person born in Ulm', 'Albert Einstein')
+
+============================================================
+VI. OUTPUT FORMAT (STRICT)
+============================================================
+
+Output plain text only.
+Each KV pair must be written on one line:
+
+key | value
+
+Do NOT output JSON.
+Do NOT output explanations.
+Do NOT infer missing facts.
+Do NOT merge contexts.
+Preserve surface names exactly as written.
+
+============================================================
+Convert the following context:
+  """
+)
+````
+
+## 图谱检索
+
+
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python scripts/DAG_KV_Retriever_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 3 --max_sinks 3 --use_seededge_beam \
+  --verbose  > dag_hotpot.log 2>&1 &
+
+nohup python scripts/DAG_KV_Retriever_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 3 --max_sinks 3  --use_seededge_beam > dag_hotpot.log 2>&1 &
+
+
+````
+Answer recall: 0.269
+增加entity normalization： 0.278
+
+增加字符级的相似度作为得分计算
+
+````bash
+nohup python scripts/DAG_KV_Retriever_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 3 --max_sinks 3 --use_seededge_beam \
+  --verbose  >> dag_hotpot.log 2>&1 &
+
+````
+
+直接清理sink
+````bash
+
+nohup python scripts/DAG_KV_Retriever_v3.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 10 --use_seededge_beam --pred_weight 1 \
+  --sink_prune_qrel \
+  --promote_topk_nodes 32 \
+  --promote_margin 0.015 \
+  --promote_drop_th 0.18 \
+  --protect_high_out 0.45 >> dag_hotpot.log 2>&1 &
+````
+
+回到原版
+````bash
+nohup python scripts/DAG_KV_Retriever_v3.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 100 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 10 --use_seededge_beam --pred_weight 1 \
+  --keep_one_attr_direction \
+  --verbose >> dag_hotpot.log 2>&1 &
+
+````
+
+
+### Related work-1: PropRAG
+
+### Related work-2: HippoRAG
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python scripts/DAG_KV_HippoRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000 \
+  --max_hops 3 --beam_width 3 --max_edges 20 --max_nodes 25 --seed_top_m 3 --max_sinks 3 \
+  --score_mode ppr --verbose > dag_hotpot_hipporag.log 2>&1 &
+
+nohup python scripts/DAG_KV_HippoRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000  > dag_hotpot_hipporag.log 2>&1 &
+
+nohup python scripts/DAG_KV_HippoRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/qwen-embedding-0.6B \
+  --batch_size 256 \
+  --keep_score \
+  --limit 1000  \
+    --max_hops 4 \
+  --beam_width 6 \
+  --max_nodes 80 \
+  --max_edges 140 \
+  --max_sinks 12 \
+  --seed_top_m 60 \
+  --hippo_topk_evidence 200 \
+  --hippo_iters 50 \
+  --hippo_mix_beta 0.35  > dag_hotpot_hipporag.log 2>&1 &
+````
+
+### Related work-3: Multi-hop Dense Retrieval
+
+
+## DAG-KV 检索相关工作
+问题建模：
+输入：
+  一个由实体节点和属性/实体值节点组成的有向候选图，边来自
+  head + rel -> tail 和 rel + tail -> head。
+
+目标：
+找到一个子图满足：
+- 尽量小（少边、少噪声）；
+- 覆盖问题中的锚点与约束；
+- 连通且无环；
+- 内部节点更像“中间实体/桥接实体”，叶子更像“属性值/答案候选”；
+- 不用答案监督建图，但答案在评测时更容易出现在 sink。
+
+这本质上就是一个带方向偏置与叶子偏置的 Prize-Collecting Steiner Arborescence 问题。
+
+Prompt：
+我现在已经提取出来一些三元组，并构建一个实体-属性图，其中实体和属性都是图上的节点，图上的边基于三元组生成“head+rel -> tail”和"rel + tail -> head"，我现在需要在这个图上生成一个最小DAG图，同时保证答案尽可能出现在DAG图的末梢（我虽然有答案但是只能用它来检查结果是否正确，不能用来建图）。我的想法是这样的：先找一些SOTA的这领域相关工作，把他们直接用到我的这个问题上，然后比较一下效果，如果有效果好的，我就直接套用，如果效果不好的话我再自己动手实现一个新的方法。这样子这个过程以及结果放在我的论文里头会更加具有说服力。目前我已经确定了5个相关工作：IRCoT、HippoRAG、G-Retriever、UNIQORN、SubgraphRAG。接下来给我一版基于IRCoT的新代码，和现有的DAG_KV_Retriever_v3.py保持一致的输入、输出格式，统计graph recall、answer recall和none-sink recall。其它代码可以随便改，目标是尽可能符合IRCoT的思想，如果需要的话我可以去下载找来相关的论文或者开源代码给你参考。
+
+
+### 现有方法 IRCoT
+IRCoT-style iterative graph retrieval
+一次性检索改为 IRCoT-style 迭代检索
+- 第 0 步先用 question 做 seed retrieval。
+- 后续每一步根据当前 frontier、已选 relation、已覆盖 clue，构造一个 structured thought，再用这个 thought 去重排候选边。
+- 本质上对应 IRCoT 的 “retrieve → reason → retrieve → reason”。
+
+把 CoT 句子替换成结构化 thought state
+- 因为你这里的知识源不是自然语言段落，而是 KV-edge 图。
+- 所以我没有强行引入一个 LLM 去生成自然语言 CoT，而是用frontier entities + recent relations + unresolved question tokens组成下一轮检索查询。这样更贴近你的任务，也更容易做 ablation。
+
+显式偏向“答案落在末梢”
+- 在 iterative ranking 里保留了对 attribute/value-like edge 的 leaf_bonus。
+- 最后继续做 DAG 去环和 max_sinks 约束，尽量把终点压缩成少量 sinks。
+
+和原始 IRCoT 不同的地方：没有真的调用 LLM 生成自然语言 CoT；现在是 deterministic 的 graph-native thought。
+
+````bash
+python scripts/graph_gen/DAG_KV_IRCoT.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5 \
+  --supporting_only \
+  --seed_top_m 6 \
+  --max_steps 4 \
+  --edges_per_step 4 \
+  --beam_width 2 \
+  --max_nodes 32 \
+  --max_edges 44 \
+  --max_sinks 2 \
+  --leaf_bonus 0.08 \
+  --limit 100 \
+  --keep_score
+
+# graph_recall	path_recall	answer_recall
+# 0.96	0.51	0.27
+
+cd scripts
+nohup ./run_sweep_ir_cot.sh >> dag_hotpot_ircot.log 2>&1 &
+cd ..
+
+````
+结果：
+  - answer recall: 0.24 ~ 0.4
+
+
+### 现有方法 HippoRAG
+在 DAG_KV_HippoRAG.py 中，我们将原始 HippoRAG/HippoRAG2 面向文本证据的检索流程适配到结构化三元组图场景：首先将问题与图中实体节点进行语义匹配与显式提及匹配，选取得分最高的实体作为 query seeds；随后不再采用局部 beam 搜索，而是按照 HippoRAG 的核心思想，在图上执行以这些 seeds 为个性化重启分布的 Personalized PageRank（PPR）传播，从而获得与问题相关的全局实体重要性分数。对于 HippoRAG 版本，PPR 直接在实体图上进行；对于 HippoRAG2 版本，则进一步将每条 KV 边视为一个 memory node，构建“实体—记忆”二部图，在实体节点与 KV 证据节点之间联合传播，使传播结果能够同时刻画实体相关性与证据相关性。最后，根据实体 PPR 分数及 memory node 分数对 KV 边进行排序，并在保留连通性的前提下截取得到规模受限的子图，再通过 DAG 化与 sink 数量约束，使答案更倾向于落在子图末梢。这样，HippoRAG/HippoRAG2 的“query concept linking—graph propagation—evidence readout”框架就被自然迁移到了本文的实体—属性 DAG 检索任务中。
+
+````bash
+
+python scripts/graph_gen/DAG_KV_HippoRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --variant hipporag2 \
+  --supporting_only \
+  --seed_top_m 8 \
+  --ppr_alpha 0.15 \
+  --ppr_iters 50 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --leaf_bonus 0.08 \
+  --limit 100 \
+  --keep_score
+
+cd scripts
+nohup ./run_sweep_hipporag.sh >> dag_hotpot_hipporag.log 2>&1 &
+cd ..
+
+````
+- HippoRAG 0.32~0.44
+- HippoRAG2 0.33~0.45
+
+
+
+### 现有方法-1 G-Retriever：PCST 子图检索
+这版是**“G-Retriever 风格 / PCST-like”**，不是逐行复刻官方实现。原因是你现在这个任务不是论文里的“文本图 + LLM 生成”，而是“已有 DAG-KV 候选图上做最小 DAG 检索”；另外当前环境里没有 pcst_fast 这类专用 PCST 求解器，所以我采用的是：
+
+问题感知节点 prize
+用 node-question 相似度、问题显式 mention、最佳 incident edge 分数、桥接度来构造节点奖励。
+
+PCST-like 终端选择
+从 anchor 节点出发，按 prize - connect_cost 贪心扩展 terminal。
+
+加权 Steiner tree 连通
+用 networkx 的加权 Steiner tree 把这些 terminal 连成一个小骨架。
+
+从 root 向外定向成 DAG
+再用 leaf bonus 把 value-like 节点更倾向放到末梢，尽量提高 sink answer recall。
+
+````bash
+pip install pcst_fast
+python scripts/graph_gen/DAG_KV_GRetriever_PCST_v2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 256 \
+  --topk_node_prize 6 \
+  --topk_edge_prize 12 \
+  --pcst_cost_e 0.5 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --limit 100
+
+cd scripts
+nohup ./batch_run_pcst_v2.sh >> dag_hotpot_pcst.log 2>&1 &
+cd ..
+````
+结论：
+将 G-Retriever 的 PCST 子图检索思想迁移到 DAG-KV 图后，可以稳定保持较高的 graph recall（约 0.96），说明 PCST 风格的全局子图选择能够有效检索到答案相关区域。然而，answer recall 仅在 0.40–0.47 间小幅波动，表明现有 PCST 检索虽然能够找回答案相关子图，但缺乏将答案节点进一步组织为 DAG 末梢的结构归纳偏置。因此，仅依赖 PCST 风格的相关子图选择不足以满足 DAG-KV 的 answer-terminalization 需求，还需进一步设计面向末梢答案节点的定向与剪枝机制。
+
+
+
+### 现有方法-2 UNIQORN：Group Steiner Tree
+UNIQORN 是一种面向知识图谱与文本联合问答的统一推理框架，其核心思想是在问题相关证据构建的上下文图（context graph）上，通过问题线索（question cues）生成若干 anchor groups，并利用 Group Steiner Tree (GST) 在图中寻找能够同时连接这些锚点的最小子图，从而得到支持答案推理的证据结构。该机制能够在复杂图结构中自动发现连接多跳证据的关键路径，因此与本文需要从实体–属性图中检索最小推理子图的任务具有天然的契合性。
+
+在本工作中，我们将已抽取的三元组构建为实体–属性图，并将其作为 UNIQORN 的上下文图输入。具体而言，我们首先根据问题文本与节点标签之间的语义相似度生成若干锚点集合，并将其组织为 anchor groups；随后在图上执行 Group Steiner Tree 搜索以获得若干候选证据子图，并根据节点在多棵 GST 中的出现频次进行排序。最终，我们将得到的无向子图定向为一个最小 DAG，使推理路径由问题相关实体逐步收敛至潜在答案节点，从而使答案尽可能位于 DAG 的末梢节点。通过这种方式，我们能够在保持 UNIQORN 推理思想的同时，使其适配本文的 DAG 子图检索任务。
+
+````bash
+python scripts/graph_gen/DAG_KV_UNIQORN.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --supporting_only \
+  --limit 100 \
+  --keep_score
+
+cd scripts
+./run_sweep_uniqorn.sh
+cd ..
+
+````
+
+answer recall: 0.35~0.4
+
+### 现有方法-3 SubgraphRAG：all-at-once 子图检索
+
+我们选择 SubgraphRAG 作为 DAG-KV 检索任务的重要对比方法，主要因为它与本文问题在检索目标和结构形式上具有较高一致性：本文需要从由实体节点、属性节点及定向 KV 边构成的大图中，直接检索出一个规模受控、结构紧凑且尽可能包含答案证据的子图，而 SubgraphRAG 的核心思想正是对图中候选三元组进行并行打分，并在此基础上一次性选出与问题最相关的子图，避免了传统多跳逐步扩展方法中容易出现的路径误差累积与早期决策偏置问题。因此，本文将 SubgraphRAG 适配到 DAG-KV 场景中：首先将每个三元组对应的两条 KV 边视为有向图中的候选检索单元；然后结合问题与 key、value、relation 语义相似度，以及从问题锚点实体出发的方向性结构特征，对候选边进行统一评分；接着选取得分最高的一组边并进行连通性补全与环路消解，构造满足节点数和边数约束的最小化 DAG 子图；最后以答案是否出现在 DAG 末梢节点对应的 value 中来评估其检索效果。这样的适配既较好保留了 SubgraphRAG“并行子图检索”的方法优势，也使其能够自然服务于本文“答案尽可能落在 DAG 末梢”的任务目标。
+
+````bash
+python scripts/DAG_KV_SubgraphRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 256 \
+  --keep_score \
+  --supporting_only \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --limit 100 \
+  --max_sinks 8
+
+cd scripts
+nohup ./run_sweep_subgraphrag.sh >> dag_hotpot_subgraphrag.log 2>&1 &
+cd ..
+````
+
+直接硬推：answer recall: 0.21~0.42
+
+实现2：trainable MLP scorer
+
+trainable MLP scorer：先为每条候选 KV edge 构造 question / src / relation / dst / key / value 的语义表示，再拼上 topic entity indicator 和 DDE 风格方向结构特征，最后用 MLP 学一个 relevance score
+
+先训练，再推理
+````bash
+python scripts/DAG_KV_SubgraphRAG_trainable.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --train_batch_size 512 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 10 \
+  --lr 1e-3 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache.pkl \
+  --hidden_dim 512
+
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --seed_edge_topk 18 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+
+# batch run
+cd scripts
+nohup ./run_sweep_subgrapn_train_infer.sh >> dag_hotpot_subgraphrag_trainable.log 2>&1 &
+cd ..
+
+````
+answer recall: 0.61 ~ 0.73
+
+mlp模型的迁移能力，Hotpot上训练，2wiki上推理
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/2wiki_train.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/2wiki_train_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/sweep_train_infer/checkpoints/train_08_hd768_lr5e-4_neg6.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --seed_edge_topk 18 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+
+````
+
+
+### 现有方法最优
+
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/sweep_train_infer/checkpoints/train_08_hd768_lr5e-4_neg6.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+
+````
+Answer recall: 0.7000
+Graph  recall: 0.9600
+None-sink recall: 0.8800
+
+#### parameter-free最优
+````bash
+python scripts/graph_gen/DAG_KV_HippoRAG.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/dag_hotpot_dev_tmp.json \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --variant hipporag2 \
+  --supporting_only \
+  --seed_top_m 8 \
+  --ppr_alpha 0.15 \
+  --max_sinks 4 \
+  --leaf_bonus 0.08 \
+  --limit 100 \
+  --keep_score
+````
+Answer recall: 0.4500
+Graph  recall: 0.9500
+None-sink recall: 0.6900
+
+
+### Next: Terminal-Aware DAG Pruning
+
+首先确定：答案未成为 sink 的样本里，有多少是因为“答案节点还有出边”导致的。
+````
+Answer recall: 0.4500
+Graph  recall: 0.9500
+None-sink recall: 0.6900
+Miss sink but in graph: 24
+Among sink-miss samples, due to answer node having outgoing edges: 24 / 24 = 1.0000
+Among sink-miss samples, other reasons: 0 / 24 = 0.0000
+
+Answer recall: 0.7000
+Graph  recall: 0.9600
+None-sink recall: 0.8800
+Miss sink but in graph: 18
+Among sink-miss samples, due to answer node having outgoing edges: 18 / 18 = 1.0000
+Among sink-miss samples, other reasons: 0 / 18 = 0.0000
+
+````
+两种情况下都是100%
+结论：
+- 现有方法的主要失败模式是 answer terminalization failure。
+- 在失败样本中，答案节点未成为 sink 的原因 100% 是其仍有出边。
+- 这些出边既包括 ATTRIBUTE，也包括 RELATION，说明问题不是局部属性噪声，而是缺少对“终点性”的全局建模
+
+很多系统把重点放在“下一步扩什么”，却没有把“什么时候该停”建模成独立控制变量。2026 年一篇专门综述多跳 QA 检索—推理流程的工作，直接把 stop/continue criteria 列为四大设计轴之一，认为这是影响效果、效率和证据忠实度的关键环节 [Retrieval–Reasoning Processes for Multi-hop Question Answering: A Four-Axis Design Framework and Empirical Trends]
+
+## 在SubGraphRAG上继续优化
+
+- 现有方法的主要失败模式是 answer terminalization failure。
+- 在失败样本中，答案节点未成为 sink 的原因 100% 是其仍有出边。
+- 这些出边既包括 ATTRIBUTE，也包括 RELATION，说明问题不是局部属性噪声，而是缺少对“终点性”的全局建模
+
+### answer-terminalization 后处理
+
+对于最终子图中每个仍有出边的内部节点 v：
+  看它的最佳入边 best_in
+  如果 best_in 已经很强，且这个节点相对其前驱更“贴近问题”
+  同时它的后继边整体明显更弱
+  那么认为这个节点更像“应该停下来的终点”，就删除它的弱后继边
+  如果所有后继都弱，则直接把它变成 sink
+
+
+
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/sweep_train_infer/checkpoints/train_08_hd768_lr5e-4_neg6.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --answer_terminalization \
+  --keep_score --cpu
+````
+结果：
+Answer recall: 0.6900
+Graph  recall: 0.9600
+None-sink recall: 0.8600
+
+纯后处理、又不依赖 answer 的 stop-expansion 偏置，已经开始伤到 coverage 了
+
+### 增强hard negatives
+
+把“答案节点的出边”强行加入负样本池，让模型学会“到答案后不要继续扩展”
+
+重新collect_training_examples，再训练。
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v3.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --train_batch_size 512 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 5e-4 \
+  --neg_pos_ratio 6 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_v2.pkl \
+  --rebuild_train_cache \
+  --hard_neg_ratio 0.25 \
+  --hard_neg_min 1 \
+  --hidden_dim 768
+
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v3.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+````
+
+训练参数 hard_neg_ratio:
+ - 0.5: Answer recall: 0.6900 Graph  recall: 0.9600 None-sink recall: 0.8100
+ - 0.25: Answer recall: 0.7400 Graph  recall: 0.9600 None-sink recall: 0.8800
+
+扫参数：
+````bash
+cd scripts/graph_gen
+nohup ./run_sweep_subgrapn_train_infer_v3.sh > sweep_train_infer_v3.log  2>&1 &
+cd ..
+````
+
+
+
+
+### 增加end_node model
+
+把 edge scorer 改成 node-ending aware 的两阶段打分。
+
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v4.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v4.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --train_batch_size 512 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 5e-4 \
+  --neg_pos_ratio 6 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_v4.pkl \
+  --hidden_dim 768 \
+  --end_hidden_dim 768 \
+  --end_neg_pos_ratio 8 \
+  --end_lr 5e-4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3 \
+  --patience 10   --rebuild_train_cache
+
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v4.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v4.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+
+````
+Answer recall: 0.7800
+Graph  recall: 0.9600
+None-sink recall: 0.8600
+
+### 共享编码器-联合训练
+
+
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v5_joint.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --train_batch_size 512 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_v4.pkl \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3
+
+
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev.jsonl \
+  --output /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/hotpot_dev_subgraphrag_trainable.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v5_joint.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --infer_batch_size 4096 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 8 \
+  --limit 100 \
+  --keep_score --cpu
+
+````
+
+Answer recall: 0.8200
+Graph  recall: 0.9600
+None-sink recall: 0.8800
+
+#### 微调参数
+
+
+
+尝试增加 Node 任务权重
+--joint_lambda 0.5    # 或 0.6
+--patience 15         # 给更多收敛时间
+
+````bash
+python scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v5_joint.pt \
+  --st_model /home/sdu/zhu/models/bge-en-v1.5/ \
+  --batch_size 512 \
+  --train_batch_size 512 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 1000 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_v4.pkl \
+  --hidden_dim 768 \
+  --patience 15 \
+  --joint_training \
+  --joint_lambda 0.5 \
+  --end_alpha 0.50 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3
+
 
 ````

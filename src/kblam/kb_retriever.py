@@ -290,27 +290,22 @@ def get_triple_ids_T2(sample, all_samples, current_step, total_steps, max_kb_pat
 def get_triple_ids_ATFB(sample, all_samples, current_step, total_steps, max_kb_paths=16, hop_num=2, shuffle=True, enable_silver=True, verbose=False):
 
     # 四阶段
-    # step_ratio=[0.25, 0.5, 0.75, 1.0]
-    # stage_num=len(step_ratio)
-    # negative_path_num=[1,int(max_kb_paths/4), int(max_kb_paths/2), max_kb_paths]
-
-
-    # step_ratio=[0.25, 0.5, 0.75, 1.0]
-    # stage_num=len(step_ratio)
-    # negative_path_num=[2, int(max_kb_paths/4), int(max_kb_paths/2), max_kb_paths]
+    step_ratio=[0.25, 0.5, 0.75, 1.0]
+    stage_num=len(step_ratio)
+    negative_path_num=[2, int(max_kb_paths/4), int(max_kb_paths/2), max_kb_paths]
 
     # step_ratio=[0.33, 0.66, 1.0]
     # stage_num=len(step_ratio)
     # negative_path_num=[int(max_kb_paths/8), int(max_kb_paths/4), int(max_kb_paths/2)]
 
-    step_ratio=[0.5, 1.0]
-    stage_num=len(step_ratio)
-    negative_path_num=[int(max_kb_paths/8), int(max_kb_paths/4)]
+    # step_ratio=[0.5, 1.0]
+    # stage_num=len(step_ratio)
+    # negative_path_num=[int(max_kb_paths/8), int(max_kb_paths/4)]
 
-    # # 一个阶段：每个样本8条
+    # # 一个阶段：每个样本16条
     # step_ratio=[1.0]
     # stage_num=len(step_ratio)
-    # negative_path_num=[int(max_kb_paths/4)]
+    # negative_path_num=[max_kb_paths]
 
 
     progress = current_step / float(total_steps)
@@ -329,7 +324,7 @@ def get_triple_ids_ATFB(sample, all_samples, current_step, total_steps, max_kb_p
     path_triple_base=[] # 每个path的第一个三元组的id
     sample_base_offset=sample["start_id"]
 
-    # 取前neg_num条作为负样本
+    # # 取前neg_num条作为负样本
     # nega_path_ids=range(neg_num)
 
     if enable_silver:

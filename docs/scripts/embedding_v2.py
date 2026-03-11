@@ -13,9 +13,7 @@ torch.cuda.empty_cache()
 
 def parser_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="all-MiniLM-L6-v2",
-                        choices=["all-MiniLM-L6-v2", "text-embedding-3-large", "ada-embeddings",
-                                 "text-embedding-v4", "qwen3-embedding-0.6B"])
+    parser.add_argument("--model_name", type=str, default="all-MiniLM-L6-v2")
     parser.add_argument("--local_model_path", type=str, default=None)
     parser.add_argument("--dataset_type", type=str, default="synthetic_data")
     parser.add_argument("--dataset_path", type=str, required=True)

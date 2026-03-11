@@ -180,3 +180,7 @@ peek*
 tmp*
 
 experiments/vector*
+
+*.csv
+experiments/subgraph_mlp/
+

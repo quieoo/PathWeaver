@@ -63,7 +63,7 @@ class KBEncoder(nn.Module, FeatureExtractionMixin):
         # Define the KB encoder backbone
         self.encoder_spec = encoder_name
 
-        if encoder_name == "QWEN-EMBEDDING-0.6B" or encoder_name == "qwen-embedding-0.6B":
+        if encoder_name == "QWEN-EMBEDDING-0.6B" or encoder_name == "qwen-embedding-0.6B" or encoder_name == "bge":
             self.in_dim=1024
         else:
             if encoder_name in ["OAI", "BigOAI"]:

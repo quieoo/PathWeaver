@@ -1042,6 +1042,9 @@ class Trainer:
         # )
         test_kb_config = train_config
         
+        # # force to use stage-0 configuration
+        # test_kb_config.current_step=0
+
         results_pair_list, scale_factor_list = eval_main_process(
             self.test_dataset,
             self.tokenizer,
@@ -1055,7 +1058,7 @@ class Trainer:
             seed=seed,
             kb_size=self.test_kb_size,
             query_size=self.test_query_size,
-            enable_silver=False,
+            enable_silver=True,
         )
         results_pair=results_pair_list[0]
         scale_factor=scale_factor_list[0]
@@ -1384,6 +1387,8 @@ class Trainer:
                 if self.accelerator.is_main_process:
                     self.logger.info(f"step: {step} , loss: {avg_loss}")
                     num_candidates=0
+                    if avg_loss > 1.0:
+                        self.logger.info(f"    [Outlier] batch_indices: {batch_indices}")
                     wandb.log({'train_loss': np.mean(losses)})
                     train_losses.append(avg_loss)
                     pbar.update(task, advance=1, loss=avg_loss)
