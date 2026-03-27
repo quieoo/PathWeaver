@@ -312,3 +312,152 @@ nohup python build_knowledge_graph_v3.py \
   --supporting-only --compositional-only --answer-aware >> build_knowledge_graph_v3.log 2>&1 &
 
 ````
+
+# v4
+
+````bash
+export OPENAI_BASE_URL=https://api.ofox.ai/v1
+export OPENAI_API_KEY=sk-of-vKwFSPMrqYFFOrsrYNjvOgdqTgTidxmRocLlpBQurvCDoqIqaLJMtzxPcVxfUyAF
+
+# OfoxAI API endpoint. Get your API Key at https://app.ofox.ai
+curl https://api.ofox.ai/v1/chat/completions \
+  -H "Authorization: Bearer sk-of-vKwFSPMrqYFFOrsrYNjvOgdqTgTidxmRocLlpBQurvCDoqIqaLJMtzxPcVxfUyAF" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bailian/qwen3-235b-a22b:free",
+    "messages": [
+      {"role": "user", "content": "What is the meaning of life?"}
+    ]
+  }'
+
+
+mkdir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_v4_cached
+python build_knowledge_graph_v4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_tripled_v4.3.jsonl \
+  --model gpt-5.4 \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume --limit 200
+
+python build_knowledge_graph_v4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_tripled_v4.3.jsonl \
+  --model openai/gpt-5.4-mini \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume --limit 200
+
+
+# 本地模型
+conda activate vllm-13
+export CUDA_VISIBLE_DEVICES=0,1
+nohup python -m vllm.entrypoints.openai.api_server \
+  --model /home/sdu/zhu/models/qwen2.5-72B-4bit \
+  --served-model-name qwen_72b \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --tensor-parallel-size 2 \
+  --trust-remote-code \
+  --max-num-seqs 128 \
+  --gpu-memory-utilization 0.90 > qwen_72b.log 2>&1 &
+
+python build_knowledge_graph_v4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_tripled_v4.3.jsonl \
+  --api-base http://127.0.0.1:8001/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model qwen_72b \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --limit 4
+
+
+````
+
+# deepseek-v3的替代
+
+- Qwen/Qwen3-30B-A3B-Instruct-2507
+- Qwen/Qwen3.5-27B
+
+使用8u4090
+修改v4.1： 
+- 加入answer-aware参数，有一个专门的Prompt要求根据答案和问题生成具有完整证据链的三元组
+- 支持Musique数据集（没有支撑段落的样本直接跳过）
+- 统一输出格式：
+  ````
+  "context": [
+    {
+      "title": "...",
+      "sentences": ["...", "..."],
+      "triple_list": [...]
+    }
+  ]
+  ````
+
+
+结论：
+- A3B的输出质量太差
+- 3.5-27B质量挺好但是输出速度太慢，关闭Thinking之后好一点（2分钟）
+
+````bash
+
+conda activate triple
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen3.5-27B \
+  --served-model-name Qwen3.5-27B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 8 \
+  --max-model-len 65536  \
+  --gpu-memory-utilization 0.9 \
+  --reasoning-parser qwen3 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}'  \
+  --trust-remote-code > Qwen3.5-27B.log 2>&1 &
+
+
+curl http://10.102.34.67:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-27B",
+    "messages": [
+      {"role": "user", "content": "你好，简单介绍一下你自己"}
+    ],
+    "temperature": 0.7
+  }'
+
+
+python build_knowledge_graph_v4.1.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_tripled_build_graph_v4.1_qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --limit 4
+
+
+python build_knowledge_graph_v4.1.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --answer-aware \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.1-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --limit 4
+
+
+````

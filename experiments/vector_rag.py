@@ -27,7 +27,7 @@ except ImportError:
     from llama_index import Settings
 
 from vllm import LLM, SamplingParams
-from kblam.metrics_evaluator import full_evaluation
+from kblam.metrics_evaluator import full_evaluation, evaluate_model_outputs
 
 import faiss
 try:
@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument('--kb-size', type=int, default=10, help='知识库段落数量')
     parser.add_argument('--without-knowledge', action='store_true',
                         help='不使用知识库')
-
+    parser.add_argument('--dis_out_path', type=str, default=None, help='输出文件路径')
 
 
     return parser.parse_args()
@@ -550,8 +550,40 @@ def main():
     predictions, answers = run_vector_rag(args, llm, retriever, gold_contexts, dataset)
 
     clean_model(llm)
-    comparison_str, metrics = full_evaluation(predictions, answers)
-    print(metrics)
+    if args.dis_out_path is not None:
+        metrics, faith_01_scores = evaluate_model_outputs(predictions, answers)
+        num_scored = min(len(predictions), len(faith_01_scores))
+        if len(faith_01_scores) != len(predictions):
+            print(
+                f"Warning: got {len(faith_01_scores)} faithfulness scores for "
+                f"{len(predictions)} predictions; only scored samples will be exported."
+            )
+
+        #输出前五对 pred-answer 以及对应的 faith_01 分数
+        print("\n=== Sample Predictions & Faithfulness Scores ===")
+        for i in range(min(5, num_scored)):
+            print(f"Q: {dataset[i]['question']}")
+            print(f"A: {answers[i]}")
+            print(f"P: {predictions[i]}")
+            print(f"Faithfulness01 Score: {faith_01_scores[i]}")
+            print("-----------------------------------")
+
+        evaluated_samples_ids=[]
+        for i in range(num_scored):
+            sample_id=dataset[i].get('id', dataset[i].get('_id', ''))
+            if sample_id == '':
+                print(f"Warning: sample {i} has no id field, using index as id")
+                sample_id = str(i)
+            if faith_01_scores[i] == 0:
+                evaluated_samples_ids.append(sample_id)
+        with open(args.dis_out_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "evaluated_samples": evaluated_samples_ids,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"✅ Evaluation {len(evaluated_samples_ids)} results saved to {args.dis_out_path}")
+    else:
+        comparison_str, metrics = full_evaluation(predictions, answers)
+        print(metrics)
 
 
 if __name__ == "__main__":

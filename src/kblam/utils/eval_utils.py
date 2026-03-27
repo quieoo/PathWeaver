@@ -167,25 +167,86 @@ def answer_question(
     return pruned_output
 
 def format_output_for_synthetic(model_output: str) -> str:
+    text = str(model_output).strip()
+    if not text:
+        return ""
 
-    text = model_output
+    # Normalize common chat/template artifacts before extracting the answer.
+    for token in (
+        "<|begin_of_text|>",
+        "begin_of_text|>",
+        "<|end_of_text|>",
+        "<|eot_id|>",
+        "<|end|>",
+        "<|assistant|>",
+        "<|user|>",
+        "<|im_end|>",
+        "<|im_start|>assistant",
+        "<|im_start|>user",
+        "<|endoftext|>",
+    ):
+        text = text.replace(token, " ")
 
-    # 找出所有作为「单词」出现的 is / are / was / were
-    matches = list(re.finditer(r'\b(is|are|was|were)\b', text))
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
 
-    if matches:
-        # 如果有多个 is/are，就取最后一个；否则就取唯一的那个
-        if len(matches) >= 2:
-            cut_pos = matches[-1].end()
-        else:
-            cut_pos = matches[0].end()
+    def _clean_candidate(candidate: str) -> str:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        candidate = re.sub(
+            r"^(model output|output|answer|assistant|response)\s*:\s*",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        candidate = candidate.strip()
+        candidate = re.sub(r"^([\"'`])(.+)\1$", r"\2", candidate)
+        candidate = candidate.rstrip(" \t\n\r,;:.")
+        return candidate
 
-        # 从选定的 is/are 之后截取
-        model_output = text[cut_pos:].strip()
-        # 可选：去掉前导标点和空格，和末尾的句号等
-        model_output = model_output.lstrip(' ,.:;').rstrip(' .;')
+    def _looks_like_prompt_line(line: str) -> bool:
+        lowered = line.lower().strip()
+        if not lowered:
+            return True
+        return (
+            lowered.endswith("?")
+            or lowered.startswith("please answer")
+            or lowered.startswith("answer with")
+            or lowered.startswith("answer the question")
+            or lowered.startswith("question:")
+            or lowered.startswith("ground truth:")
+        )
 
-    return model_output
+    lines = [_clean_candidate(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    # Prefer the last line that looks like an answer instead of a prompt echo.
+    answer_like_lines = [line for line in lines if not _looks_like_prompt_line(line)]
+    if answer_like_lines:
+        text = answer_like_lines[-1]
+    elif lines:
+        text = lines[-1]
+    else:
+        text = _clean_candidate(text)
+
+    # If prompt text and answer still share one line, keep the tail span.
+    tail_parts = [
+        part.strip() for part in re.split(r"\n{2,}|(?<=\?)\s+", text) if part.strip()
+    ]
+    if tail_parts:
+        text = _clean_candidate(tail_parts[-1])
+
+    # Only strip the synthetic template when it is explicitly present.
+    template_matches = list(
+        re.finditer(
+            r"\bThe\s+.+?\s+of\s+.+?\s+(?:is|are|was|were)\s+(.+?)(?=(?:\s*;\s*The\s+.+?\s+of\s+.+?\s+(?:is|are|was|were)\s+)|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if template_matches:
+        text = template_matches[-1].group(1)
+
+    return _clean_candidate(text)
 
 
 # def answer_question_deterministic(
@@ -396,3 +457,14 @@ def answer_question_deterministic(
             outputs_text = model_prune_format_mapping[m](outputs_text)
 
     return outputs_text
+
+
+def output_dag_sample(sample):
+    # 逐个访问样本中的context，如果triple_list为空，则跳过这个context
+    filtered_context = []
+    for context in sample['context']:
+        if context['triple_list']:
+            filtered_context.append(context)
+    new_sample = sample.copy()
+    new_sample['context'] = filtered_context
+    return new_sample

@@ -184,3 +184,5 @@ experiments/vector*
 *.csv
 experiments/subgraph_mlp/
 
+docs/scripts/dag_svgs/
+docs/scripts/triple_gen/cache*

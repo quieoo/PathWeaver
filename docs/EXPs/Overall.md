@@ -9,7 +9,9 @@ export CUDA_VISIBLE_DEVICES=2
 
 nohup python ../../experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/  --n-samples 100  --similarity-top-k 16 --without-knowledge >> overall_wo_kb_2wiki_llama8b_bge.log 2>&1 &
 
-nohup python ../../experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/  --n-samples 100  --similarity-top-k 16 --without-knowledge > overall_wo_kb_hotpot_llama8b_bge.log 2>&1 &
+nohup python ../../experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_v1.json    --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/  --n-samples 100  --similarity-top-k 16 --without-knowledge > overall_wo_kb_hotpot_llama8b_bge.log 2>&1 &
+
+
 
 ````
 ### qwen2.5-72B-4bit
@@ -50,7 +52,7 @@ nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets
 
 
 nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/     --n-samples 100  --similarity-top-k 16 --index-path ../../experiments/vector_rag_index/hotpot_bge --embedding-device cuda >> overall_vector_rag_hotpot_llama8b_bge.log 2>&1 &
-nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/     --n-samples 100  --similarity-top-k 16 --index-path ../../experiments/vector_rag_index/hotpot_bge --embedding-device cpu >> overall_vector_rag_hotpot_llama8b_bge.log 2>&1 &
+nohup python ../../experiments/vector_rag.py     --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_v1.json    --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/     --n-samples 100  --similarity-top-k 16 --index-path ../../experiments/vector_rag_index/hotpot_bge --embedding-device cpu >> overall_vector_rag_hotpot_llama8b_bge.log 2>&1 &
 ````
 
 ### qwen-72B-int4 + bge-embedding
@@ -109,7 +111,7 @@ conda activate autoschemakg
 export CUDA_VISIBLE_DEVICES=3
 nohup python  ../../../AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
   --kg-path /mnt/n0/KBLAM/AutoSchemaKG/example/generated/hotpot_dev/ \
-  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_v1.json\
   --dataset-keyword hotpot_dev.json \
   --encoder-model /home/sdu/zhu/models/bge-en-v1.5/ \
   --llm-model llama_8b \
@@ -163,6 +165,20 @@ conda activate kblam_tf457
 
 nohup python ../../experiments/eval_generation.py generation     --kb_size=10     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec qwen-embedding-0.6B     --encoder_dir /home/sdu/zhu/kblam/train/atfb_2wiki_v3/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7800_encoder/encoder.pt     --model_dir /home/sdu/zhu/kblam/train/atfb_2wiki_v3/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7800     --kb_layer_frequency 3 --kb_scale_factor 1     --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples     --test_dataset AT2QA_2wiki_test_2hop_compositional_gold.json     --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy     --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy     --step 0 --t_step 8000     --dataset_type at2qa_2wiki --query_size 100 --seed 1 --path_attn >> overall_pathweaver_2wiki_llama8b_qwen.log 2>&1 &
 
+nohup python experiments/eval_generation.py generation \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir experiments/train/dag_kv_hotpot_v5.2.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_llama3_step_7300_encoder/encoder.pt \
+    --model_dir experiments/train/dag_kv_hotpot_v5.2.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_llama3_step_7300 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv \
+    --test_dataset hotpot_dev_dag_v5.2_cleaned_v1.json \
+    --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_value.npy \
+    --dataset_type dag --query_size 100 --seed 1 --path_attn > EXPs/overall_pathweaver_hotpot_llama8b_qwen.log 2>&1 &
+
 ````
 ### bge-embedding
 ````bash
@@ -177,5 +193,17 @@ python ../../experiments/eval_generation.py generation     --kb_size=10     --ll
 # 关闭path_attn
 
 nohup python ../../experiments/eval_generation.py generation     --kb_size=10     --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3     --encoder_spec qwen-embedding-0.6B     --encoder_dir /home/sdu/zhu/kblam/train/atfb_2wiki_v3/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7800_encoder/encoder.pt     --model_dir /home/sdu/zhu/kblam/train/atfb_2wiki_v3/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_at2qa_2wiki_llama3_step_7800     --kb_layer_frequency 3 --kb_scale_factor 1     --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples     --test_dataset AT2QA_2wiki_test_2hop_compositional_gold.json     --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_key.npy     --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/all_triples/AT2QA_2wiki_test_2hop_compositional_gold_qwen-embedding-0.6B_embd_value.npy     --step 0 --t_step 8000     --dataset_type at2qa_2wiki --query_size 100 --seed 1 >> overall_kblam_2wiki_llama8b_qwen.log 2>&1 &
-
+nohup python experiments/eval_generation.py generation \
+    --kb_size=10 \
+    --llm_base_dir /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+    --encoder_spec qwen-embedding-0.6B \
+    --encoder_dir experiments/train/dag_kv_hotpot_v5.2.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_llama3_step_7300_encoder/encoder.pt \
+    --model_dir experiments/train/dag_kv_hotpot_v5.2.2/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_llama3_step_7300 \
+    --kb_layer_frequency 3 --kb_scale_factor 1 \
+    --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv \
+    --test_dataset hotpot_dev_dag_v5.2_cleaned_v1.json \
+    --base_embeder_path /home/sdu/zhu/models/qwen-embedding-0.6B \
+    --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_key.npy \
+    --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_value.npy \
+    --dataset_type dag --query_size 100 --seed 1 > EXPs/overall_kblam_hotpot_llama8b_qwen.log 2>&1 &
 ````

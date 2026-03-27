@@ -39,14 +39,15 @@ from kblam.utils.eval_utils import (
     answer_question_deterministic,
     softmax,
     format_output_for_synthetic,
+    output_dag_sample,
 )
 from kblam.utils.train_utils import get_kb_embd
 from kblam.kb_retriever import KBRetriever, StageRetriever, get_question_type_sampled_T1, get_question_type_sampled_T2
-from kblam.metrics_evaluator import full_evaluation
+from kblam.metrics_evaluator import full_evaluation, simple_evaluation
 import time
 from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
 from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
-
+from kblam.dag_kv_retriever import DAGKVKBRetriever
 logging.set_verbosity_warning()
 
 def _prepare_models(
@@ -214,6 +215,7 @@ def _perform_eval_batched(
     enable_retrieval=False,
     verbose=False,
     enable_silver: bool = True,
+    output_first_samples: int = 0,
 ):
 
     # ---------- optional filter (2wiki) ----------
@@ -226,12 +228,20 @@ def _perform_eval_batched(
 
     query_size = len(query_idx)
     num_batches = (query_size + kb_size - 1) // kb_size
-
     all_model_outputs, all_answers = [], []
+    all_source_indices = []
 
     TTFTs, TPOTs = [], []
     retrieval_time = 0.003
     start_time = time.time()
+
+    if output_first_samples > 0:
+        print(f"Outputting the first {output_first_samples} samples:")
+        for i in range(min(output_first_samples, query_size)):
+            idx = query_idx[i]
+            print(f"{idx}: {output_dag_sample(dataset[idx])}")
+            print("-----")
+        print("----- End of samples -----")
 
     for batch_id in tqdm(range(num_batches)):
         start = batch_id * kb_size
@@ -282,7 +292,16 @@ def _perform_eval_batched(
                     #     total_steps=1,
                     #     hop_num=2,
                     # )
-
+                elif dataset_type=="dag":
+                    kb_keys, kb_vals, kb_adj = [], [], []
+                    for idx in batch_idx:
+                        k, v, a = kb_retriever.get_kb_embedding(
+                            idx,
+                            device=torch.device("cuda"),
+                        )
+                        kb_keys.append(k)
+                        kb_vals.append(v)
+                        kb_adj.append(a)
                 else:
                     kb_keys, kb_vals, kb_adj = kb_retriever.get_embeddings_with_adj_2wiki(
                         batch_indices=batch_idx,
@@ -299,7 +318,8 @@ def _perform_eval_batched(
                 Q = row[question_type]
                 A = row["A"]
             else:
-                Q, A = row["Q"], row["A"]
+                Q = row.get("Q", row.get("question", ""))
+                A = row.get("A", row.get("answer", ""))
 
             #判断kb_keys是否是列表
             if isinstance(kb_keys, list):
@@ -349,6 +369,7 @@ def _perform_eval_batched(
 
             all_model_outputs.append(model_out)
             all_answers.append(gt)
+            all_source_indices.append(batch_idx[i])
 
     end_time = time.time()
     if enable_retrieval:
@@ -358,7 +379,7 @@ def _perform_eval_batched(
     print(f"Avg TTFT: {np.mean(TTFTs)+retrieval_time:.4f}")
     print(f"Avg TPOT: {np.mean(TPOTs):.4f}")
 
-    return all_model_outputs, all_answers
+    return all_model_outputs, all_answers, all_source_indices
 
 
 def eval_main_process(
@@ -367,7 +388,7 @@ def eval_main_process(
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
     encoder: KBEncoder,
     kb_config: KBLaMConfig,
-    kb_retriever: KBRetriever | AutoSchemaKGKBRetriever,
+    kb_retriever: KBRetriever | AutoSchemaKGKBRetriever | DAGKVKBRetriever,
     kb_scale_factor_range: list[float] | None = None,
     kb_scale_factor: float | None = None,
     dataset_type: str = "synthetic",
@@ -376,6 +397,7 @@ def eval_main_process(
     query_size: int = -1,
     enable_retrieval: bool = False,
     enable_silver: bool = True,
+    output_first_samples: int = 0,
 ):
     if query_size > len(dataset):
         query_size = len(dataset)
@@ -401,7 +423,7 @@ def eval_main_process(
     results_pair_list=[]
     for sf in scale_factor_list:
         kb_config.kb_scale_factor = sf
-        if "2wiki" in dataset_type:
+        if "2wiki" in dataset_type or "dag" in dataset_type:
             # 2wiki， hotpot_2hop, musique_2hop等两跳数据集
             # def _2hop_filter(row):
             #     ans = format_output_for_synthetic(row["A"])
@@ -416,7 +438,7 @@ def eval_main_process(
             hop_num=None
             use_kb_adj=False
 
-        model_outputs, answers = _perform_eval_batched(
+        model_outputs, answers, source_indices = _perform_eval_batched(
             model=model,
             tokenizer=tokenizer,
             kb_retriever=kb_retriever,
@@ -430,15 +452,25 @@ def eval_main_process(
             filter_fn=filter_fn,
             enable_retrieval=enable_retrieval,
             enable_silver=enable_silver,
+            output_first_samples=output_first_samples,
         )
         
-        results_pair_list.append((model_outputs, answers))
+        results_pair_list.append((model_outputs, answers, source_indices))
     return results_pair_list, scale_factor_list
 
 
 
-def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retriever, enable_silver: bool = True):
-    
+def eval_generate(
+    args, 
+    dataset, 
+    tokenizer, 
+    encoder, 
+    model, 
+    kb_config, 
+    kb_retriever, 
+    enable_silver: bool = True
+):
+
     results_pair_list, scale_factor_list = eval_main_process(
         dataset,
         tokenizer,
@@ -455,23 +487,57 @@ def eval_generate(args, dataset, tokenizer, encoder, model, kb_config, kb_retrie
         kb_retriever.is_hnsw_ready(),
         enable_silver=enable_silver,
     )
-
-    for i in range(len(results_pair_list)):
-        model_outputs, answers = results_pair_list[i]
-        sf = scale_factor_list[i]
+    
+    save_dir = None
+    if args.save_dir is not None:
+        save_dir = Path(args.save_dir) / args.exp_config_name
+        save_dir.mkdir(exist_ok=True, parents=True)
+    
+    for idx, (results_pair, sf) in enumerate(zip(results_pair_list, scale_factor_list)):
+        model_outputs, answers, source_indices = results_pair
         
-        gen_results, score_results = full_evaluation(model_outputs, answers)
-        # mem_cost = torch.cuda.max_memory_reserved("cuda")
-        # score_results["mem_cost"] = mem_cost
-        # print(score_results)
-        # print(gen_results)
-        print(f"---- kb_scale_factor: {sf}, {score_results}")
-        if args.save_dir is not None:
-            (Path(args.save_dir) / args.exp_config_name).mkdir(exist_ok=True, parents=True)
-            write_to_json(score_results, Path(args.save_dir) / f"{args.exp_config_name}-{sf}.json")
-            text_file = open(os.path.join(args.save_dir, f"{args.exp_config_name}-{sf}.txt"), "w")
-            text_file.write(gen_results)
-
+        if args.full_eval:
+            gen_results, score_results, faith01 = full_evaluation(
+                model_outputs, answers, return_score=True
+            )
+        else:
+            gen_results, score_results = simple_evaluation(model_outputs, answers)
+            faith01 = None  # 统一变量作用域，避免后续引用报错
+        
+        # if torch.cuda.is_available():
+        #     mem_cost = torch.cuda.max_memory_reserved("cuda") / (1024**3)  # 转换为GB
+        #     score_results["mem_cost_gb"] = round(mem_cost, 2)
+        #     torch.cuda.reset_peak_memory_stats("cuda")  # 重置峰值统计
+        
+        print(f"---- [{idx+1}/{len(results_pair_list)}] kb_scale_factor: {sf}, {score_results}")
+        
+        if save_dir is not None:
+            try:
+                json_path = save_dir / f"{args.exp_config_name}-{sf}.json"
+                write_to_json(score_results, json_path)
+                
+                txt_path = save_dir / f"{args.exp_config_name}-{sf}.txt"
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(gen_results)
+                
+                if args.full_eval and faith01 is not None:
+                    wrong_idx = []
+                    for i in range(len(faith01)):
+                        if faith01[i] == 0:
+                            wrong_idx.append(i)
+                    if len(wrong_idx) > 0:
+                        wrong_path = save_dir / f"{args.exp_config_name}-{sf}-wrong.txt"
+                        with open(wrong_path, "w", encoding="utf-8") as f:
+                            for idx_w in wrong_idx:
+                                gt = answers[idx_w]
+                                pred = model_outputs[idx_w]
+                                sample = output_dag_sample(dataset[source_indices[idx_w]])
+                                f.write(f"GT: {gt}\tPRED: {pred}\nSAMPLE: {sample}\n\n")
+                
+                print(f"Results saved to {json_path} and {txt_path}")
+            
+            except Exception as e:
+                print(f"⚠️ Failed to save results for sf={sf}: {str(e)}")
 def debug_measure_retrieval_accuracy(kb_retriever: KBRetriever, dataset: list[dict], topk: int = 1):
     # topk=[1, 10, 100, 1000]
     # eval_policy=[1, 2, 3]
@@ -622,7 +688,12 @@ parent_parser.add_argument(
     default=1,
     help="total steps",
 )
-
+parent_parser.add_argument(
+    "--full_eval",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Whether to perform full evaluation"
+)
 
 
 # Create subparsers
@@ -695,6 +766,19 @@ def main():
             dataset,
             precomputed_embed_keys_path=args.precomputed_embed_keys_path,
             precomputed_embed_values_path=args.precomputed_embed_values_path,
+        )
+    elif args.dataset_type == "dag":
+        kb_retriever = DAGKVKBRetriever(
+            encoder,
+            dataset,
+            precomputed_embed_keys_path=args.precomputed_embed_keys_path,
+            precomputed_embed_values_path=args.precomputed_embed_values_path,
+            max_kv_per_sample=None,
+            use_multihop_adj=True,
+            max_hops=10,
+            # hop_decay=0.5,
+            hop_decay=1,
+            dynamic_hops_by_longest_path=True,
         )
     else:
         kb_retriever = KBRetriever(

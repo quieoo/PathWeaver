@@ -375,13 +375,66 @@ def compute_dde(num_nodes: int, out_adj: Dict[int, List[int]], in_adj: Dict[int,
     return np.stack(feats, axis=1).astype(np.float32)
 
 
-def weak_label_edge(sample: Dict[str, Any], e: KVEdge) -> int:
+def collect_answer_edge_ids(kvedges: Dict[int, KVEdge], answer: str) -> Set[int]:
+    answer = norm_text(answer)
+    if not answer:
+        return set()
+    return {
+        eid for eid, e in kvedges.items()
+        if value_matches_answer(e.value, answer)
+    }
+
+
+def collect_answer_support_sets(kvedges: Dict[int, KVEdge], answer: str) -> Tuple[Set[int], Set[int], Set[int]]:
+    """
+    Return:
+      - answer_edge_ids: edges whose value directly matches the gold answer
+      - answer_dst_nodes: destination nodes of direct answer edges
+      - answer_src_nodes: source nodes of direct answer edges
+    """
+    answer_edge_ids = collect_answer_edge_ids(kvedges, answer)
+    answer_dst_nodes = {kvedges[eid].dst for eid in answer_edge_ids}
+    answer_src_nodes = {kvedges[eid].src for eid in answer_edge_ids}
+    return answer_edge_ids, answer_dst_nodes, answer_src_nodes
+
+
+def weak_label_edge(
+    sample: Dict[str, Any],
+    e: KVEdge,
+    kvedges: Optional[Dict[int, KVEdge]] = None,
+    args: Optional[argparse.Namespace] = None,
+) -> float:
+    """
+    Edge supervision v6:
+      1.0  : direct answer edge (value matches answer)
+      0.65 : support-to-answer edge (dst is an answer destination node)
+      0.35 : one-hop predecessor edge (dst is a source node of a direct answer edge)
+      0.0  : otherwise
+
+    This is intentionally soft: we want the edge model to learn that
+    "supporting the answer sink" is better than generic negatives,
+    while still making direct answer edges the strongest positives.
+    """
     answer = norm_text(sample.get('answer', ''))
-    supporting_titles = {norm_text(t) for t, _ in (sample.get('supporting_facts', []) or []) if isinstance(t, str)}
-    pos = False
-    if answer and value_matches_answer(e.value, answer):
-        pos = True
-    return int(pos)
+    if not answer:
+        return 0.0
+
+    direct_label = float(getattr(args, 'edge_direct_label', 1.0)) if args is not None else 1.0
+    support_label = float(getattr(args, 'edge_support_label', 0.65)) if args is not None else 0.65
+    predecessor_label = float(getattr(args, 'edge_predecessor_label', 0.35)) if args is not None else 0.35
+
+    if value_matches_answer(e.value, answer):
+        return direct_label
+
+    if kvedges is None:
+        return 0.0
+
+    _, answer_dst_nodes, answer_src_nodes = collect_answer_support_sets(kvedges, answer)
+    if e.dst in answer_dst_nodes:
+        return support_label
+    if predecessor_label > 0.0 and e.dst in answer_src_nodes:
+        return predecessor_label
+    return 0.0
 
 def embed_texts_cached(
     embedder: SentenceTransformer,
@@ -842,10 +895,13 @@ def collect_training_examples(
         # edge examples
         # ---------------------------
         pos_ids, neg_ids = [], []
+        edge_labels: Dict[int, float] = {}
+        edge_pos_threshold = float(getattr(args, 'edge_pos_threshold', 0.5))
         for eid, e in kvedges.items():
-            y = weak_label_edge(sample, e)
+            y = float(weak_label_edge(sample, e, kvedges=kvedges, args=args))
+            edge_labels[eid] = y
             total_edges += 1
-            if y == 1:
+            if y >= edge_pos_threshold:
                 pos_edges += 1
                 pos_ids.append(eid)
             else:
@@ -862,10 +918,10 @@ def collect_training_examples(
 
         for eid in pos_ids:
             edge_xs.append(feat_dict[eid]['vector'])
-            edge_ys.append(1)
+            edge_ys.append(float(edge_labels[eid]))
         for eid in kept_neg_ids:
             edge_xs.append(feat_dict[eid]['vector'])
-            edge_ys.append(0)
+            edge_ys.append(float(edge_labels[eid]))
 
         # ---------------------------
         # node-ending examples
@@ -913,8 +969,8 @@ def collect_training_examples(
 
     meta = {
         'num_edge_examples': int(len(Y_edge)),
-        'num_edge_pos': int(Y_edge.sum()),
-        'num_edge_neg': int(len(Y_edge) - Y_edge.sum()),
+        'num_edge_pos': int((Y_edge >= float(getattr(args, 'edge_pos_threshold', 0.5))).sum()),
+        'num_edge_neg': int(len(Y_edge) - (Y_edge >= float(getattr(args, 'edge_pos_threshold', 0.5))).sum()),
         'num_node_examples': int(len(Y_node)),
         'num_node_pos': int(Y_node.sum()),
         'num_node_neg': int(len(Y_node) - Y_node.sum()),
@@ -1687,6 +1743,116 @@ def apply_two_stage_joint_scores(
         kvedges[eid].score = float(joint)
 
 
+def _node_answer_like_score(node_feat: Dict[str, Any], node_end_score: float) -> float:
+    scalar = node_feat.get('scalar')
+    if scalar is None or len(scalar) < 10:
+        return float(node_end_score)
+    sim_q = float(scalar[0])
+    lexical = float(scalar[3])
+    in_max_val_sim = float(scalar[6])
+    in_max_dst_sim = float(scalar[7])
+    out_deg = float(scalar[5])
+    return (
+        1.25 * float(node_end_score)
+        + 0.35 * in_max_val_sim
+        + 0.20 * in_max_dst_sim
+        + 0.15 * sim_q
+        + 0.10 * lexical
+        - 0.05 * out_deg
+    )
+
+
+def protected_inbound_attachment(
+    topic_nodes: List[int],
+    kept_nodes: Set[int],
+    kept_edges: Set[int],
+    kvedges: Dict[int, KVEdge],
+    node_feat_dict: Dict[int, Dict[str, Any]],
+    node_end_scores: Dict[int, float],
+    max_edges: int,
+    max_nodes: int,
+    top_k: int = 1,
+    min_score: float = 0.55,
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Try to prevent high endness nodes from becoming isolated sinks too early.
+    We only protect nodes already kept by the selector, and we only add at most
+    one inbound edge per protected node.
+    """
+    if not kept_nodes or not kvedges or top_k <= 0:
+        return kept_nodes, kept_edges
+
+    indeg = defaultdict(int)
+    for eid in kept_edges:
+        indeg[kvedges[eid].dst] += 1
+
+    candidate_nodes: List[Tuple[float, int]] = []
+    for nid in kept_nodes:
+        if indeg.get(nid, 0) > 0:
+            continue
+        node_end = float(node_end_scores.get(nid, 0.0))
+        score = _node_answer_like_score(node_feat_dict.get(nid, {}), node_end)
+        if score >= min_score:
+            candidate_nodes.append((score, nid))
+    candidate_nodes.sort(reverse=True)
+
+    protected_dsts: Set[int] = set()
+    topic_set = set(topic_nodes)
+
+    for _, nid in candidate_nodes[:top_k]:
+        cand_eids = []
+        for eid, e in kvedges.items():
+            if eid in kept_edges:
+                continue
+            if e.dst != nid:
+                continue
+            src_in_kept = 1 if e.src in kept_nodes else 0
+            cand_eids.append((src_in_kept, float(e.score), eid))
+        if not cand_eids:
+            continue
+        cand_eids.sort(reverse=True)
+
+        chosen_eid = None
+        for _, _, eid in cand_eids:
+            e = kvedges[eid]
+            new_nodes = int(e.src not in kept_nodes) + int(e.dst not in kept_nodes)
+            if len(kept_nodes) + new_nodes <= max_nodes:
+                chosen_eid = eid
+                break
+        if chosen_eid is None:
+            continue
+
+        e_new = kvedges[chosen_eid]
+        new_nodes = int(e_new.src not in kept_nodes) + int(e_new.dst not in kept_nodes)
+        if len(kept_edges) < max_edges:
+            kept_edges.add(chosen_eid)
+            kept_nodes.add(e_new.src)
+            kept_nodes.add(e_new.dst)
+            protected_dsts.add(nid)
+            continue
+
+        removable = [
+            eid for eid in kept_edges
+            if kvedges[eid].dst not in protected_dsts and kvedges[eid].dst not in topic_set
+        ]
+        if not removable:
+            removable = [eid for eid in kept_edges if kvedges[eid].dst not in protected_dsts]
+        if not removable:
+            continue
+
+        worst_eid = min(removable, key=lambda eid: float(kvedges[eid].score))
+        if float(kvedges[chosen_eid].score) <= float(kvedges[worst_eid].score):
+            continue
+
+        kept_edges.remove(worst_eid)
+        kept_edges.add(chosen_eid)
+        kept_nodes.add(e_new.src)
+        kept_nodes.add(e_new.dst)
+        protected_dsts.add(nid)
+
+    return kept_nodes, kept_edges
+
+
 def select_subgraph_edges(topic_nodes: List[int], kvedges: Dict[int, KVEdge], out_adj: Dict[int, List[int]], max_edges: int, max_nodes: int, per_src_cap: int, expansion_hops: int, seed_edge_topk: int) -> Tuple[Set[int], Set[int]]:
     selected_edges: Set[int] = set()
     selected_nodes: Set[int] = set(topic_nodes)
@@ -2337,6 +2503,7 @@ def create_dag_with_model(
             out_adj = ctx['out_adj']
             edge_scores = edge_scores_by_sample[i]
             node_end_scores = node_scores_by_sample[i]
+            node_feat_dict = ctx['node_feat_dict']
 
             apply_two_stage_joint_scores(
                 kvedges=kvedges,
@@ -2360,6 +2527,21 @@ def create_dag_with_model(
                 expansion_hops=args.expansion_hops,
                 seed_edge_topk=args.seed_edge_topk,
             )
+
+            if args.protected_inbound:
+                kept_nodes, kept_edges = protected_inbound_attachment(
+                    topic_nodes=topic_nodes,
+                    kept_nodes=kept_nodes,
+                    kept_edges=kept_edges,
+                    kvedges=kvedges,
+                    node_feat_dict=node_feat_dict,
+                    node_end_scores=node_end_scores,
+                    max_edges=args.max_edges,
+                    max_nodes=args.max_nodes,
+                    top_k=args.protected_inbound_topk,
+                    min_score=args.protected_inbound_min_score,
+                )
+
             kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
 
             if args.answer_aware:
@@ -2409,11 +2591,13 @@ def create_dag_with_model(
             )
             if any(item['is_answer_sink'] and item['has_inbound'] for item in sink_rank_stats['sink_scores']):
                 answer_supported_recall += 1
+
             if sink_hit:
                 answer_recall += 1
             else:
                 if args.answer_aware:
                     continue
+
             if any(value_matches_answer(kvedges[eid].value, answer) for eid in kept_edges):
                 none_sink_recall += 1
 
@@ -2507,6 +2691,11 @@ def main():
     ap.add_argument('--max_sinks', type=int, default=8)
     ap.add_argument('--answer_aware', action='store_true')
 
+    # v6: protected inbound attachment (optional)
+    ap.add_argument('--protected_inbound', action='store_true')
+    ap.add_argument('--protected_inbound_topk', type=int, default=1)
+    ap.add_argument('--protected_inbound_min_score', type=float, default=0.55)
+
     # training
     ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -2519,6 +2708,10 @@ def main():
     ap.add_argument('--threshold', type=float, default=0.5)
     ap.add_argument('--neg_pos_ratio', type=int, default=4)
     ap.add_argument('--min_negatives_per_sample', type=int, default=16)
+    ap.add_argument('--edge_direct_label', type=float, default=1.0)
+    ap.add_argument('--edge_support_label', type=float, default=0.65)
+    ap.add_argument('--edge_predecessor_label', type=float, default=0.35)
+    ap.add_argument('--edge_pos_threshold', type=float, default=0.5)
     ap.add_argument(
         "--train_cache_path",
         type=str,

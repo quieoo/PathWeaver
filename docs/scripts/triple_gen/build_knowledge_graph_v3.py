@@ -1003,7 +1003,7 @@ def main(args):
                 if not line:
                     continue
                 sample = json.loads(line)
-                written_samples[sample["_id"]] = sample
+                written_samples[sample.get("_id", sample.get("id", ""))] = sample
         print(f"Output file already has {len(written_samples)} samples")
         
 
@@ -1015,7 +1015,7 @@ def main(args):
             samples = samples[: args.limit]
 
     # 过滤出不在written_samples中的样本
-    samples = [s for s in samples if s["_id"] not in written_samples]
+    samples = [s for s in samples if s.get("_id", s.get("id", "")) not in written_samples]
     print(f"After filtering, {len(samples)} samples to process")
 
     # clear output file

@@ -43,7 +43,7 @@ from kblam.utils.data_utils import augment_row, generate_multi_entity_qa, get_i_
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd, setup_scheduler_and_optimizer, setup_scheduler_and_optimizer_with_warmup
 from kblam.kb_retriever import KBRetriever, get_question_type_sampled_T1, get_question_type_sampled_T2
 from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
-
+from kblam.dag_kv_retriever import DAGKVKBRetriever
 
 # from eval import eval_main_process
 from eval_generation import eval_main_process
@@ -122,6 +122,7 @@ parser.add_argument("--outlier_num", type=int, default=1, help="Introduce questi
 parser.add_argument("--multi_entities", type=int, default=None, help="Introduce questions involving multiple entities")
 parser.add_argument("--use_extended_qa", action="store_true", help="Introduce QA with extended open-ended parts")
 parser.add_argument("--kb_token_layer_frequency", type=int, default=3, help="Introduce QA with extended open-ended parts")
+parser.add_argument("--kb_scale_factor", type=float, default=None, help="The scale factor of the KB set size")
 parser.add_argument("--gradient_accm_step", type=int, default=20, help="Introduce QA with extended open-ended parts")
 parser.add_argument("--verbose", action="store_true", help="Set logging to debug")
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
@@ -360,8 +361,12 @@ def get_batch(
                 [dataset[i]["description"] for i in idx],
             )
         else:
-            Q = augment_row(dataset[idx]) if use_data_aug else dataset[idx]["Q"]
-            A = get_i_dont_know_ans() if include_outlier else dataset[idx]["A"]
+            Q=dataset[idx].get("Q", dataset[idx].get("question", ""))
+            A=dataset[idx].get("A", dataset[idx].get("answer", ""))
+            if use_data_aug:
+                Q=augment_row(dataset[idx])
+            if include_outlier:
+                A = get_i_dont_know_ans()
         return Q, A
 
     # 遍历采样索引，获取有效的问答对并应用格式化函数生成input string
@@ -879,8 +884,8 @@ def _get_llama3_query_head_parameters(
 class Trainer:
     def __init__(
         self,
-        llm_model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
-        kbretriever: KBRetriever | AutoSchemaKGKBRetriever,
+        llm_model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM ,
+        kbretriever: KBRetriever | AutoSchemaKGKBRetriever | DAGKVKBRetriever,
         tokenizer: transformers.PreTrainedTokenizer,
         kb_token_layer_frequency: int,
         num_steps: int,
@@ -935,7 +940,7 @@ class Trainer:
         elif isinstance(llm_model, KblamLlamaForCausalLM):  # llama
             format_func = format_QA_llama if not format_short else format_QA_llama_short
 
-            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad" or dataset_format == "autoschemakg_2wiki":
+            if dataset_format == "synthetic" or dataset_format == "2wiki" or dataset_format == "squad" or dataset_format == "autoschemakg_2wiki" or dataset_format == "dag":
                 self._get_batch = partial(get_batch, format_func, _create_labels_for_llama_enhanced)
             elif dataset_format == "at2qa_2wiki":
                 self._get_batch = partial(get_batch_at2qa, format_func, _create_labels_for_llama_enhanced)
@@ -1026,6 +1031,19 @@ class Trainer:
                 precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
                 precomputed_embed_values_path=self.precomputed_test_embed_values_path,
             )
+        elif self.dataset_format == "dag":
+            test_kb_retriever = DAGKVKBRetriever(
+                encoder=self.kbretriever.encoder,
+                dataset=self.test_dataset,
+                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
+                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
+                max_kv_per_sample=self.kbretriever.max_kv_per_sample,
+                use_multihop_adj=self.kbretriever.use_multihop_adj,
+                max_hops=self.kbretriever.max_hops,
+                hop_decay=self.kbretriever.hop_decay,
+                dynamic_hops_by_longest_path=self.kbretriever.dynamic_hops_by_longest_path,
+                device=self.kbretriever.device,
+            )
         else:
             test_kb_retriever = KBRetriever(
                 self.kbretriever.encoder,
@@ -1059,13 +1077,14 @@ class Trainer:
             kb_size=self.test_kb_size,
             query_size=self.test_query_size,
             enable_silver=True,
+            output_first_samples=5 if test_kb_config.current_step<105 else 0,  # 只在第一轮评估输出样例，避免刷屏
         )
         results_pair=results_pair_list[0]
         scale_factor=scale_factor_list[0]
 
 
-        model_outputs, answers = results_pair
-        simple_score_dict=simple_evaluation(model_outputs, answers)
+        model_outputs, answers = results_pair[:2]
+        _, simple_score_dict=simple_evaluation(model_outputs, answers)
         self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
         # 输出前5个样本的结果
         for idx in range(5):
@@ -1246,6 +1265,9 @@ class Trainer:
                             hop_num=2,
                         )
                         kb_embedding=(key_embd, value_embd)
+                    elif self.dataset_format == "dag":
+                        kb_keys, kb_vals, kb_adj = self.kbretriever.get_kb_embedding_s(batch_indices, device=self.device)
+                        kb_embedding=(kb_keys, kb_vals)
                     else:
                         raise ValueError(f"Unknown data set format: {self.dataset_format}")
                     
@@ -1733,6 +1755,7 @@ def main():
             sep_query_head=sep_query_head,
             kb_layer_frequency=kb_token_layer_frequency,
             path_attn=args.path_attn,
+            kb_scale_factor=args.kb_scale_factor,
         )
     
     kb_config.base_embeder_path = args.base_embeder_path    
@@ -1748,6 +1771,19 @@ def main():
             training_set,
             key_embds=key_embds,  # type: ignore
             value_embds=value_embds,  # type: ignore
+        )
+    elif "dag" in dataset_type:
+        kbretriever = DAGKVKBRetriever(
+            encoder=encoder,
+            dataset=training_set,
+            key_embds=key_embds, 
+            value_embds=value_embds,
+            max_kv_per_sample=None,
+            use_multihop_adj=True,
+            max_hops=10,
+            # hop_decay=0.5,
+            hop_decay=1,
+            dynamic_hops_by_longest_path=True,
         )
     else:
         kbretriever = KBRetriever(

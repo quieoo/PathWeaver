@@ -17,6 +17,239 @@ from sentence_transformers import SentenceTransformer
 import pickle
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+
+
+def collect_answer_node_ids(
+    sample: Dict[str, Any],
+    node_names: List[str],
+) -> List[int]:
+    """
+    找出图中与 gold answer 匹配的所有节点 id。
+    """
+    answer = norm_text(sample.get("answer", ""))
+    if not answer:
+        return []
+
+    ans_ids = []
+    for nid, name in enumerate(node_names):
+        if value_matches_answer(name, answer):
+            ans_ids.append(nid)
+    return ans_ids
+
+
+def bfs_dist_from_sources(
+    num_nodes: int,
+    out_adj: Dict[int, List[int]],
+    kvedges: Dict[int, "KVEdge"],
+    sources: List[int],
+) -> List[int]:
+    """
+    从多个 source 出发做 BFS，返回每个节点的最短距离（边数）。
+    不可达为 -1。
+    """
+    dist = [-1] * num_nodes
+    q = deque()
+
+    for s in sources:
+        if 0 <= s < num_nodes and dist[s] == -1:
+            dist[s] = 0
+            q.append(s)
+
+    while q:
+        u = q.popleft()
+        for eid in out_adj.get(u, []):
+            e = kvedges[eid]
+            v = e.dst
+            if dist[v] == -1:
+                dist[v] = dist[u] + 1
+                q.append(v)
+
+    return dist
+
+
+def reverse_bfs_dist_from_targets(
+    num_nodes: int,
+    in_adj: Dict[int, List[int]],
+    kvedges: Dict[int, "KVEdge"],
+    targets: List[int],
+) -> List[int]:
+    """
+    从多个 target 在反图上做 BFS，返回每个节点到最近 target 的最短距离（边数）。
+    不可达为 -1。
+    """
+    dist = [-1] * num_nodes
+    q = deque()
+
+    for t in targets:
+        if 0 <= t < num_nodes and dist[t] == -1:
+            dist[t] = 0
+            q.append(t)
+
+    while q:
+        v = q.popleft()
+        for eid in in_adj.get(v, []):
+            e = kvedges[eid]
+            u = e.src
+            if dist[u] == -1:
+                dist[u] = dist[v] + 1
+                q.append(u)
+
+    return dist
+
+
+def collect_all_shortest_path_edge_ids(
+    topic_node_ids: List[int],
+    answer_node_ids: List[int],
+    num_nodes: int,
+    out_adj: Dict[int, List[int]],
+    in_adj: Dict[int, List[int]],
+    kvedges: Dict[int, "KVEdge"],
+) -> Set[int]:
+    """
+    收集所有 topic -> answer 的最短路径上的边（并集）。
+
+    对每个 (topic, answer) 对分别求最短距离，而不是使用全局最短距离。
+    """
+    if not topic_node_ids or not answer_node_ids:
+        return set()
+
+    gold_eids = set()
+
+    # 预先缓存每个 answer 的反向距离
+    answer_rev_dists = {}
+    for a in answer_node_ids:
+        answer_rev_dists[a] = reverse_bfs_dist_from_targets(
+            num_nodes=num_nodes,
+            in_adj=in_adj,
+            kvedges=kvedges,
+            targets=[a],
+        )
+
+    for t in topic_node_ids:
+        dist_from_t = bfs_dist_from_sources(
+            num_nodes=num_nodes,
+            out_adj=out_adj,
+            kvedges=kvedges,
+            sources=[t],
+        )
+
+        for a in answer_node_ids:
+            pair_best_dist = dist_from_t[a]
+            if pair_best_dist < 0:
+                continue
+
+            dist_to_a = answer_rev_dists[a]
+
+            for eid, e in kvedges.items():
+                u, v = e.src, e.dst
+                du = dist_from_t[u]
+                dv = dist_to_a[v]
+                if du >= 0 and dv >= 0 and (du + 1 + dv == pair_best_dist):
+                    gold_eids.add(eid)
+
+    return gold_eids
+
+
+def collect_inbound_to_answer_edge_ids(
+    answer_node_ids: List[int],
+    in_adj: Dict[int, List[int]],
+) -> Set[int]:
+    """
+    收集所有直接指向答案节点的入边。
+    """
+    gold_eids = set()
+    for a in answer_node_ids:
+        for eid in in_adj.get(a, []):
+            gold_eids.add(eid)
+    return gold_eids
+
+
+def edge_ids_to_node_ids(
+    edge_ids: Set[int],
+    kvedges: Dict[int, "KVEdge"],
+) -> Set[int]:
+    """
+    由边集合反推出子图中的节点集合。
+    """
+    node_ids = set()
+    for eid in edge_ids:
+        e = kvedges[eid]
+        node_ids.add(e.src)
+        node_ids.add(e.dst)
+    return node_ids
+
+
+def find_gold_support_subgraph_for_sample(
+    sample: Dict[str, Any],
+    node_names: List[str],
+    # node_emb: Optional["np.ndarray"],
+    kvedges: Dict[int, "KVEdge"],
+    out_adj: Dict[int, List[int]],
+    in_adj: Dict[int, List[int]],
+    # q_emb: "np.ndarray",
+    # mention_bonus: float = 0.2,
+    # topic_top_k: int = 6,
+    topic_node_ids: List[int],
+) -> Dict[str, Any]:
+    """
+    为单个训练样本构造方案A的 gold support subgraph:
+      - 所有 topic -> answer 的最短路径上的边
+      - 所有直接指向 answer node 的边
+
+    返回:
+      {
+        "gold_edge_ids": set(...),
+        "gold_node_ids": set(...),
+        "answer_node_ids": list(...),
+        "topic_node_ids": list(...),
+      }
+    """
+    num_nodes = len(node_names)
+
+    # # 1) 找 topic nodes（沿用你当前的 topic entity 识别逻辑）
+    # if node_emb is None:
+    #     raise ValueError("node_emb must not be None when finding gold support subgraph")
+
+    # topic_node_ids = identify_topic_entities(
+    #     question=norm_text(sample.get("question", "")),
+    #     node_names=node_names,
+    #     node_emb=node_emb,
+    #     q_emb=q_emb,
+    #     top_k=topic_top_k,
+    #     mention_bonus=mention_bonus,
+    # )
+
+    # 2) 找 answer nodes
+    answer_node_ids = collect_answer_node_ids(sample, node_names)
+
+    # 3) topic -> answer 最短路径边
+    path_edge_ids = collect_all_shortest_path_edge_ids(
+        topic_node_ids=topic_node_ids,
+        answer_node_ids=answer_node_ids,
+        num_nodes=num_nodes,
+        out_adj=out_adj,
+        in_adj=in_adj,
+        kvedges=kvedges,
+    )
+
+    # 4) 所有直接指向 answer 的边
+    inbound_answer_edge_ids = collect_inbound_to_answer_edge_ids(
+        answer_node_ids=answer_node_ids,
+        in_adj=in_adj,
+    )
+
+    gold_edge_ids = set(path_edge_ids) | set(inbound_answer_edge_ids)
+    gold_node_ids = edge_ids_to_node_ids(gold_edge_ids, kvedges)
+    gold_node_ids.update(topic_node_ids)
+    gold_node_ids.update(answer_node_ids)
+
+    return {
+        "gold_edge_ids": gold_edge_ids,
+        "gold_node_ids": gold_node_ids,
+        "answer_node_ids": answer_node_ids,
+        "topic_node_ids": topic_node_ids,
+    }
+
 # ============================================================
 # 0) IO
 # ============================================================
@@ -263,7 +496,7 @@ def infer_kv_direction(s: str, o: str, key: str, value: str) -> str:
     return 'forward'
 
 
-def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[List[str], Dict[int, KVEdge], Dict[int, List[int]], Dict[int, List[int]]]:
+def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool, skip_alias_attr: bool = False) -> Tuple[List[str], Dict[int, KVEdge], Dict[int, List[int]], Dict[int, List[int]]]:
     node_map: Dict[str, int] = {}
     node_names: List[str] = []
     kvedges: Dict[int, KVEdge] = {}
@@ -282,6 +515,9 @@ def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[L
 
         kvs = tri.get('kv_lists', []) or []
         for kv_idx, kv in enumerate(kvs):
+            if skip_alias_attr and kv_idx >=2:
+                continue
+
             key = norm_text(kv.get('key_string', ''))
             value = norm_text(kv.get('value_string', ''))
             if not key or not value:
@@ -291,11 +527,17 @@ def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[L
                 continue
             seen.add(sig)
 
-            direction = infer_kv_direction(s, o, key, value)
-            if direction == 'backward':
-                src_name, dst_name = o, s
-            else:
+            # direction = infer_kv_direction(s, o, key, value)
+            # if direction == 'backward':
+            #     src_name, dst_name = o, s
+            # else:
+            #     src_name, dst_name = s, o
+            
+            # 第一条forward，第二条backward, 依次类推
+            if kv_idx % 2 == 0:
                 src_name, dst_name = s, o
+            else:
+                src_name, dst_name = o, s
 
             src = get_or_add_node(src_name, node_map, node_names)
             dst = get_or_add_node(dst_name, node_map, node_names)
@@ -738,6 +980,46 @@ class NodeEndScorer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
 
+
+def print_kvedge_graph(
+    kvedges: Dict[int, KVEdge],
+    out_adj: Dict[int, List[int]],
+    in_adj: Dict[int, List[int]],
+    show_edges_ids: List[int]= None,
+) -> None:
+    if not kvedges:
+        print('[Graph] empty kvedge graph')
+        return
+
+    node_names: Dict[int, str] = {}
+    for e in kvedges.values():
+        node_names[e.src] = e.src_name
+        node_names[e.dst] = e.dst_name
+
+    print(f'[Graph] nodes={len(node_names)} edges={len(kvedges)}')
+    print('[Graph] edge list:')
+    for eid in sorted(kvedges.keys()):
+        e = kvedges[eid]
+        if show_edges_ids is None or eid in show_edges_ids:
+            print(
+                f'  eid={eid} src={e.src}("{e.src_name}") -> dst={e.dst}("{e.dst_name}") '
+                f'key="{e.key}" value="{e.value}" score={e.score:.4f}'
+            )
+
+    print('[Graph] node adjacency:')
+    for nid in sorted(node_names.keys()):
+        out_eids = sorted(out_adj.get(nid, []))
+        in_eids = sorted(in_adj.get(nid, []))
+        print(f'  nid={nid} name="{node_names[nid]}"')
+        print(f'    in_eids={in_eids}')
+        for eid in in_eids:
+            e = kvedges[eid]
+            print(f'      <- eid={eid} from {e.src}("{e.src_name}") key="{e.key}" value="{e.value}"')
+        print(f'    out_eids={out_eids}')
+        for eid in out_eids:
+            e = kvedges[eid]
+            print(f'      -> eid={eid} to {e.dst}("{e.dst_name}") key="{e.key}" value="{e.value}"')
+
 def collect_training_examples(
     args,
     samples: List[Dict[str, Any]],
@@ -838,12 +1120,36 @@ def collect_training_examples(
             val_emb=val_emb,
         )
 
+        gold_subgraph = find_gold_support_subgraph_for_sample(
+            sample=sample,
+            node_names=node_names,
+            # node_emb=node_emb,
+            kvedges=kvedges,
+            out_adj=out_adj,
+            in_adj=in_adj,
+            # q_emb=q_emb,
+            # mention_bonus=args.mention_bonus,
+            # topic_top_k=args.topic_top_k,
+            topic_node_ids=topic_nodes,
+        )
+        if args.verbose:
+            print(f'Question: {question}')
+            print(f"Answer: {sample.get('answer', '')}")
+            print("=======graph=======")
+            print_kvedge_graph(kvedges, out_adj, in_adj, show_edges_ids=gold_subgraph['gold_edge_ids'])
+            print("===================")
+        if args.verbose:
+            print("========gold subgraph========")
+            print(gold_subgraph)
+            print("============================")
+
+        gold_edge_ids = gold_subgraph['gold_edge_ids']
         # ---------------------------
         # edge examples
         # ---------------------------
         pos_ids, neg_ids = [], []
         for eid, e in kvedges.items():
-            y = weak_label_edge(sample, e)
+            y = 1 if eid in gold_edge_ids else 0
             total_edges += 1
             if y == 1:
                 pos_edges += 1
@@ -1410,6 +1716,9 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     cache_path = args.train_cache_path.strip()
+
+    if args.verbose:
+        samples = samples[:5]
     
     # 加载或构建训练数据
     if cache_path and os.path.exists(cache_path) and not args.rebuild_train_cache:
@@ -2190,9 +2499,9 @@ def create_dag_with_model(
     args,
     samples: List[Dict[str, Any]],
     embedder: SentenceTransformer,
-    edge_model: MLPScorer,
-    node_model: NodeEndScorer,
-    ckpt: Dict[str, Any],
+    edge_model: Optional[MLPScorer],
+    node_model: Optional[NodeEndScorer],
+    ckpt: Optional[Dict[str, Any]],
     device: torch.device,
     verbose: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -2200,7 +2509,12 @@ def create_dag_with_model(
         samples = samples[:args.limit]
 
     if verbose:
-        samples = [samples[2]]
+        target_sample=10
+        # for s in samples:
+        #     if s.get('answer') == "Rome":
+        #         target_sample = s
+        #         break
+        samples = [samples[target_sample]]
 
     out_samples: List[Dict[str, Any]] = []
     answer_recall = 0
@@ -2209,7 +2523,7 @@ def create_dag_with_model(
     answer_supported_recall = 0
     sink_rank_buckets: Dict[int, Dict[str, Any]] = {}
 
-    is_joint = ckpt.get('is_joint', False)
+    is_joint = ckpt.get('is_joint', False) if ckpt is not None else False
     infer_batch_size = max(1, int(args.infer_batch_size))
     for batch_start in tqdm(
         range(0, len(samples), infer_batch_size),
@@ -2222,6 +2536,9 @@ def create_dag_with_model(
         for sample in sample_batch:
             question = norm_text(sample.get('question', ''))
             answer = norm_text(sample.get('answer', ''))
+            if verbose:
+                print(f"\nQuestion: {question}")
+                print(f"Answer: {answer}")
 
             node_names, kvedges, out_adj, in_adj = build_kvedge_graph(sample, supporting_only=args.supporting_only)
             if not kvedges:
@@ -2287,47 +2604,50 @@ def create_dag_with_model(
         edge_scores_by_sample: List[Dict[int, float]] = [dict() for _ in prepared]
         node_scores_by_sample: List[Dict[int, float]] = [dict() for _ in prepared]
 
-        edge_blocks: List[np.ndarray] = []
-        edge_meta: List[Tuple[int, List[int], int, int]] = []
-        cursor = 0
-        for i, ctx in enumerate(prepared):
-            eids = sorted(ctx['feat_dict'].keys())
-            if not eids:
-                continue
-            x = np.stack([ctx['feat_dict'][eid]['vector'] for eid in eids]).astype(np.float32)
-            edge_blocks.append(x)
-            edge_meta.append((i, eids, cursor, x.shape[0]))
-            cursor += x.shape[0]
-        if edge_blocks:
-            edge_X = np.concatenate(edge_blocks, axis=0)
-            edge_forward = edge_model.forward_edge if is_joint else None
-            edge_scores_all = _batched_sigmoid_scores(
-                edge_model, device, edge_X, infer_batch_size, forward_fn=edge_forward
-            )
-            for i, eids, start, length in edge_meta:
-                part = edge_scores_all[start:start + length]
-                edge_scores_by_sample[i] = {eid: float(part[j]) for j, eid in enumerate(eids)}
+        if not args.output_gold:
+            edge_blocks: List[np.ndarray] = []
+            edge_meta: List[Tuple[int, List[int], int, int]] = []
+            cursor = 0
+            for i, ctx in enumerate(prepared):
+                eids = sorted(ctx['feat_dict'].keys())
+                if not eids:
+                    continue
+                x = np.stack([ctx['feat_dict'][eid]['vector'] for eid in eids]).astype(np.float32)
+                edge_blocks.append(x)
+                edge_meta.append((i, eids, cursor, x.shape[0]))
+                cursor += x.shape[0]
+            if edge_blocks:
+                assert edge_model is not None
+                edge_X = np.concatenate(edge_blocks, axis=0)
+                edge_forward = edge_model.forward_edge if is_joint else None
+                edge_scores_all = _batched_sigmoid_scores(
+                    edge_model, device, edge_X, infer_batch_size, forward_fn=edge_forward
+                )
+                for i, eids, start, length in edge_meta:
+                    part = edge_scores_all[start:start + length]
+                    edge_scores_by_sample[i] = {eid: float(part[j]) for j, eid in enumerate(eids)}
 
-        node_blocks: List[np.ndarray] = []
-        node_meta: List[Tuple[int, List[int], int, int]] = []
-        cursor = 0
-        for i, ctx in enumerate(prepared):
-            nids = sorted(ctx['node_feat_dict'].keys())
-            if not nids:
-                continue
-            x = np.stack([ctx['node_feat_dict'][nid]['vector'] for nid in nids]).astype(np.float32)
-            node_blocks.append(x)
-            node_meta.append((i, nids, cursor, x.shape[0]))
-            cursor += x.shape[0]
-        if node_blocks:
-            node_X = np.concatenate(node_blocks, axis=0)
-            node_forward = node_model.forward_node if is_joint else None
-            node_scores_all = _batched_sigmoid_scores(
-                node_model, device, node_X, infer_batch_size, forward_fn=node_forward
-            )
-            for i, nids, start, length in node_meta:
-                part = node_scores_all[start:start + length]
-                node_scores_by_sample[i] = {nid: float(part[j]) for j, nid in enumerate(nids)}
+            node_blocks: List[np.ndarray] = []
+            node_meta: List[Tuple[int, List[int], int, int]] = []
+            cursor = 0
+            for i, ctx in enumerate(prepared):
+                nids = sorted(ctx['node_feat_dict'].keys())
+                if not nids:
+                    continue
+                x = np.stack([ctx['node_feat_dict'][nid]['vector'] for nid in nids]).astype(np.float32)
+                node_blocks.append(x)
+                node_meta.append((i, nids, cursor, x.shape[0]))
+                cursor += x.shape[0]
+            if node_blocks:
+                assert node_model is not None
+                node_X = np.concatenate(node_blocks, axis=0)
+                node_forward = node_model.forward_node if is_joint else None
+                node_scores_all = _batched_sigmoid_scores(
+                    node_model, device, node_X, infer_batch_size, forward_fn=node_forward
+                )
+                for i, nids, start, length in node_meta:
+                    part = node_scores_all[start:start + length]
+                    node_scores_by_sample[i] = {nid: float(part[j]) for j, nid in enumerate(nids)}
 
         for i, ctx in enumerate(prepared):
             sample = ctx['sample']
@@ -2338,31 +2658,61 @@ def create_dag_with_model(
             edge_scores = edge_scores_by_sample[i]
             node_end_scores = node_scores_by_sample[i]
 
-            apply_two_stage_joint_scores(
-                kvedges=kvedges,
-                edge_scores=edge_scores,
-                node_end_scores=node_end_scores,
-                alpha=args.end_alpha,
-                beta=args.end_beta,
-                gamma=args.end_gamma,
-            )
+            if args.output_gold:
+                gold_subgraph = find_gold_support_subgraph_for_sample(
+                    sample=sample,
+                    node_names=ctx['node_names'],
+                    kvedges=kvedges,
+                    out_adj=ctx['out_adj'],
+                    in_adj=ctx['in_adj'],
+                    topic_node_ids=topic_nodes,
+                )
+                kept_nodes = set(gold_subgraph['gold_node_ids'])
+                kept_edges = set(gold_subgraph['gold_edge_ids'])
+                for eid, e in kvedges.items():
+                    e.score = 1.0 if eid in kept_edges else 0.0
+            else:
+                if verbose:
+                    print(f"edge_scores: {edge_scores}")
+                    print(f"node_end_scores: {node_end_scores}")
+
+                apply_two_stage_joint_scores(
+                    kvedges=kvedges,
+                    edge_scores=edge_scores,
+                    node_end_scores=node_end_scores,
+                    alpha=args.end_alpha,
+                    beta=args.end_beta,
+                    gamma=args.end_gamma,
+                )
+
+            if verbose:
+                print_kvedge_graph(kvedges, out_adj, in_adj)
 
             if any(value_matches_answer(e.value, answer) for e in kvedges.values()):
                 graph_recall += 1
 
-            kept_nodes, kept_edges = select_subgraph_edges(
-                topic_nodes=topic_nodes,
-                kvedges=kvedges,
-                out_adj=out_adj,
-                max_edges=args.max_edges,
-                max_nodes=args.max_nodes,
-                per_src_cap=args.per_src_cap,
-                expansion_hops=args.expansion_hops,
-                seed_edge_topk=args.seed_edge_topk,
-            )
+            if not args.output_gold:
+                kept_nodes, kept_edges = select_subgraph_edges(
+                    topic_nodes=topic_nodes,
+                    kvedges=kvedges,
+                    out_adj=out_adj,
+                    max_edges=args.max_edges,
+                    max_nodes=args.max_nodes,
+                    per_src_cap=args.per_src_cap,
+                    expansion_hops=args.expansion_hops,
+                    seed_edge_topk=args.seed_edge_topk,
+                )
+            if verbose:
+                print(f"kept nodes after subgraph selection: {kept_nodes}")
+                print(f"kept edges after subgraph selection: {kept_edges}")
+
             kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
 
-            if args.answer_aware:
+            if verbose:
+                print(f"kept nodes after cycle breaking: {kept_nodes}")
+                print(f"kept edges after cycle breaking: {kept_edges}")
+
+            if args.answer_aware and not args.output_gold:
                 kept_nodes, kept_edges = answer_terminalization(
                     topic_nodes=topic_nodes,
                     max_sinks=args.max_sinks,
@@ -2372,6 +2722,7 @@ def create_dag_with_model(
                     kvedges=kvedges,
                 )
 
+            
             kept_nodes, kept_edges = enforce_max_sinks(topic_nodes, args.max_sinks, kept_nodes, kept_edges, kvedges)
             kept_nodes, kept_edges = enforce_max_terminal_kv_nodes(
                 topic_nodes=topic_nodes,
@@ -2381,6 +2732,10 @@ def create_dag_with_model(
                 kept_edges=kept_edges,
                 kvedges=kvedges,
             )
+            if verbose:
+                print(f"kept nodes after sink enforcement: {kept_nodes}")
+                print(f"kept edges after sink enforcement: {kept_edges}")
+
 
             if not kept_edges:
                 sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'empty_after_prune'}}
@@ -2424,6 +2779,10 @@ def create_dag_with_model(
             )
 
             kv_nodes, adj = export_kv_nodes_and_adj(kept_edges, kvedges, keep_score=args.keep_score)
+            if verbose:
+                print(f"Exported KV nodes: {kv_nodes}")
+                print(f"Exported adjacency matrix: {adj}")
+
             goal_ids: List[int] = []
             if answer:
                 for j, kv in enumerate(kv_nodes):
@@ -2439,7 +2798,7 @@ def create_dag_with_model(
                     'num_kv_nodes': int(len(kv_nodes)),
                     'goal_ids': goal_ids,
                     'topic_entity_ids': [int(x) for x in topic_nodes],
-                    'scorer': 'trainable_subgraphrag_mlp_two_stage_node_ending',
+                    'scorer': 'gold_support_subgraph' if args.output_gold else 'trainable_subgraphrag_mlp_two_stage_node_ending',
                 },
             }
             out_samples.append(sample)
@@ -2494,7 +2853,7 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
 
     # topic + structural features
-    ap.add_argument('--topic_top_k', type=int, default=6)
+    ap.add_argument('--topic_top_k', type=int, default=3)
     ap.add_argument('--dde_hops', type=int, default=3)
     ap.add_argument('--mention_bonus', type=float, default=0.20)
 
@@ -2551,6 +2910,11 @@ def main():
 
     ap.add_argument('--answerable_only', action='store_true',
                     help='Only include answerable samples in training')
+
+    ap.add_argument('--dedup_edges', action='store_true',
+                    help='for multiple edges with the same (src, dst), keep only the one with the highest score')
+    ap.add_argument('--output_gold', action='store_true',
+                    help='in infer mode, directly build DAG from find_gold_support_subgraph_for_sample')
     args = ap.parse_args()
 
     print(args)
@@ -2565,11 +2929,16 @@ def main():
         train_model(args, samples, embedder)
         return
 
-    if not args.model_ckpt or not os.path.exists(args.model_ckpt):
-        raise FileNotFoundError(f'For --mode infer, model checkpoint is required: {args.model_ckpt}')
+    if args.output_gold:
+        edge_model, node_model, ckpt = None, None, None
+        device = torch.device('cpu')
+        print('Infer with gold support subgraph mode; skip loading model checkpoint')
+    else:
+        if not args.model_ckpt or not os.path.exists(args.model_ckpt):
+            raise FileNotFoundError(f'For --mode infer, model checkpoint is required: {args.model_ckpt}')
 
-    edge_model, node_model, ckpt, device = load_model(args.model_ckpt, cpu=args.cpu)
-    print(f'Loaded scorer from {args.model_ckpt}')
+        edge_model, node_model, ckpt, device = load_model(args.model_ckpt, cpu=args.cpu)
+        print(f'Loaded scorer from {args.model_ckpt}')
     out = create_dag_with_model(
             args,
             samples,

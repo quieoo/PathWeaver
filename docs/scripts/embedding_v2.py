@@ -24,6 +24,7 @@ def parser_args():
     parser.add_argument("--log_mem_every", type=int, default=0,
                     help="每 N 个批次打印一次显存占用（0 表示不打印）")
 
+
     return parser.parse_args()
 
 
@@ -153,6 +154,12 @@ if __name__ == "__main__":
             for triple in sample["triple_lists"]:
                 key_strings.append(triple["key_string"])
                 value_strings.append(triple["description"])
+    elif args.dataset_type == "dag":
+        for sample in dataset:
+            dag=sample.get("dag",{})
+            for kv in dag.get("kv_nodes",[]):
+                key_strings.append(str(kv.get("key", "")))
+                value_strings.append(str(kv.get("value", "")))
     elif args.dataset_type == "at2qa_2wiki":
         # at2qa数据集中每个样本内的negative path数量是可变
         # 拼接方式：

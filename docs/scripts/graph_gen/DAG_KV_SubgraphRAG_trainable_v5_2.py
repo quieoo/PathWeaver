@@ -225,10 +225,16 @@ def iter_triples(sample: Dict[str, Any], supporting_only: bool) -> Iterable[Tupl
         supporting_titles = {t for t, _ in sf if isinstance(t, str)}
 
     for para in ctx:
-        title = norm_text(para.get('title', ''))
+        if isinstance(para, dict):
+            title = norm_text(para.get('title', ''))
+            tri_list = para.get('triple_list', []) or []
+        elif isinstance(para, list):
+            title = norm_text(para[0]) if para else ''
+            tri_list = para[2] if len(para) >= 3 else []
+
         if supporting_titles is not None and title not in supporting_titles:
             continue
-        for tri in (para.get('triple_list', []) or []):
+        for tri in tri_list:
             yield title, tri
 
 
@@ -291,11 +297,18 @@ def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[L
                 continue
             seen.add(sig)
 
-            direction = infer_kv_direction(s, o, key, value)
-            if direction == 'backward':
-                src_name, dst_name = o, s
-            else:
+            # direction = infer_kv_direction(s, o, key, value)
+            # if direction == 'backward':
+            #     src_name, dst_name = o, s
+            # else:
+            #     src_name, dst_name = s, o
+            
+            # 第一条forward，第二条backward, 依次类推
+            if kv_idx % 2 == 0:
                 src_name, dst_name = s, o
+            else:
+                src_name, dst_name = o, s
+
 
             src = get_or_add_node(src_name, node_map, node_names)
             dst = get_or_add_node(dst_name, node_map, node_names)
@@ -322,6 +335,45 @@ def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[L
             kid += 1
 
     return node_names, kvedges, dict(out_adj), dict(in_adj)
+
+
+
+def print_kvedge_graph(
+    kvedges: Dict[int, KVEdge],
+    out_adj: Dict[int, List[int]],
+    in_adj: Dict[int, List[int]],
+) -> None:
+    if not kvedges:
+        print('[Graph] empty kvedge graph')
+        return
+
+    node_names: Dict[int, str] = {}
+    for e in kvedges.values():
+        node_names[e.src] = e.src_name
+        node_names[e.dst] = e.dst_name
+
+    print(f'[Graph] nodes={len(node_names)} edges={len(kvedges)}')
+    print('[Graph] edge list:')
+    for eid in sorted(kvedges.keys()):
+        e = kvedges[eid]
+        print(
+            f'  eid={eid} src={e.src}("{e.src_name}") -> dst={e.dst}("{e.dst_name}") '
+            f'key="{e.key}" value="{e.value}" score={e.score:.4f}'
+        )
+
+    print('[Graph] node adjacency:')
+    for nid in sorted(node_names.keys()):
+        out_eids = sorted(out_adj.get(nid, []))
+        in_eids = sorted(in_adj.get(nid, []))
+        print(f'  nid={nid} name="{node_names[nid]}"')
+        print(f'    in_eids={in_eids}')
+        for eid in in_eids:
+            e = kvedges[eid]
+            print(f'      <- eid={eid} from {e.src}("{e.src_name}") key="{e.key}" value="{e.value}"')
+        print(f'    out_eids={out_eids}')
+        for eid in out_eids:
+            e = kvedges[eid]
+            print(f'      -> eid={eid} to {e.dst}("{e.dst_name}") key="{e.key}" value="{e.value}"')
 
 
 # ============================================================
@@ -1755,6 +1807,97 @@ def select_subgraph_edges(topic_nodes: List[int], kvedges: Dict[int, KVEdge], ou
     return selected_nodes, selected_edges
 
 
+def reverse_beam_expand_from_sink_edges(
+    selected_nodes: Set[int],
+    selected_edges: Set[int],
+    kvedges: Dict[int, KVEdge],
+    in_adj: Dict[int, List[int]],
+    max_edges: int,
+    max_nodes: int,
+    sink_edge_topk: int,
+    reverse_hops: int,
+    beam_width: int,
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Starting from top sink edges in the current DAG, search backwards on the edge graph:
+    prev_edge -> cur_edge iff prev_edge.dst == cur_edge.src.
+
+    Newly added edges are skipped if they exceed the graph budget or would create a cycle
+    in the current selected subgraph.
+    """
+    if sink_edge_topk <= 0 or reverse_hops <= 0 or beam_width <= 0 or not selected_edges:
+        return selected_nodes, selected_edges
+
+    entity_outdeg: Dict[int, int] = defaultdict(int)
+    for eid in selected_edges:
+        entity_outdeg[kvedges[eid].src] += 1
+
+    sink_edges = [
+        eid for eid in selected_edges
+        if entity_outdeg.get(kvedges[eid].dst, 0) == 0
+    ]
+    if not sink_edges:
+        return selected_nodes, selected_edges
+
+    ranked_sink_edges = sorted(
+        sink_edges,
+        key=lambda eid: (kvedges[eid].score, eid),
+        reverse=True,
+    )[:sink_edge_topk]
+
+    kept_out: Dict[int, Set[int]] = defaultdict(set)
+    for eid in selected_edges:
+        e = kvedges[eid]
+        kept_out[e.src].add(e.dst)
+
+    for sink_eid in ranked_sink_edges:
+        frontier: List[Tuple[int, float]] = [(sink_eid, float(kvedges[sink_eid].score))]
+        visited_eids: Set[int] = {sink_eid}
+
+        for _ in range(reverse_hops):
+            if not frontier or len(selected_edges) >= max_edges:
+                break
+
+            candidates: List[Tuple[float, int]] = []
+            for cur_eid, path_score in frontier:
+                cur_edge = kvedges[cur_eid]
+                for prev_eid in in_adj.get(cur_edge.src, []):
+                    if prev_eid in visited_eids:
+                        continue
+                    visited_eids.add(prev_eid)
+                    prev_edge = kvedges[prev_eid]
+                    candidates.append((path_score + float(prev_edge.score), prev_eid))
+
+            if not candidates:
+                break
+
+            candidates.sort(key=lambda x: (x[0], kvedges[x[1]].score, -x[1]), reverse=True)
+            next_frontier: List[Tuple[int, float]] = []
+
+            for cand_score, cand_eid in candidates[:beam_width]:
+                cand_edge = kvedges[cand_eid]
+
+                if cand_eid not in selected_edges:
+                    if len(selected_edges) >= max_edges:
+                        break
+                    new_nodes = int(cand_edge.src not in selected_nodes) + int(cand_edge.dst not in selected_nodes)
+                    if len(selected_nodes) + new_nodes > max_nodes:
+                        continue
+                    if _would_create_cycle(cand_edge.src, cand_edge.dst, kept_out):
+                        continue
+
+                    selected_edges.add(cand_eid)
+                    selected_nodes.add(cand_edge.src)
+                    selected_nodes.add(cand_edge.dst)
+                    kept_out[cand_edge.src].add(cand_edge.dst)
+
+                next_frontier.append((cand_eid, cand_score))
+
+            frontier = next_frontier
+
+    return selected_nodes, selected_edges
+
+
 def _would_create_cycle(src: int, dst: int, kept_out: Dict[int, Set[int]]) -> bool:
     if src == dst:
         return True
@@ -2200,14 +2343,22 @@ def create_dag_with_model(
         samples = samples[:args.limit]
 
     if verbose:
-        samples = [samples[2]]
-
+        target_sample=0
+        for s in samples:
+            if s.get('answer') == "Rome":
+                target_sample = s
+                break
+        samples = [target_sample]
+        print(samples)
     out_samples: List[Dict[str, Any]] = []
     answer_recall = 0
     graph_recall = 0
     none_sink_recall = 0
     answer_supported_recall = 0
     sink_rank_buckets: Dict[int, Dict[str, Any]] = {}
+    
+    answer_unsupported_sample_ids: List[int] = []
+    answer_supported_sample_ids: List[int] = []
 
     is_joint = ckpt.get('is_joint', False)
     infer_batch_size = max(1, int(args.infer_batch_size))
@@ -2222,6 +2373,9 @@ def create_dag_with_model(
         for sample in sample_batch:
             question = norm_text(sample.get('question', ''))
             answer = norm_text(sample.get('answer', ''))
+            if verbose:
+                print(f"\nQuestion: {question}")
+                print(f"Answer: {answer}")
 
             node_names, kvedges, out_adj, in_adj = build_kvedge_graph(sample, supporting_only=args.supporting_only)
             if not kvedges:
@@ -2335,9 +2489,13 @@ def create_dag_with_model(
             topic_nodes = ctx['topic_nodes']
             kvedges = ctx['kvedges']
             out_adj = ctx['out_adj']
+            in_adj = ctx['in_adj']
             edge_scores = edge_scores_by_sample[i]
             node_end_scores = node_scores_by_sample[i]
 
+            if verbose:
+                print(f"edge_scores: {edge_scores}")
+                print(f"node_end_scores: {node_end_scores}")
             apply_two_stage_joint_scores(
                 kvedges=kvedges,
                 edge_scores=edge_scores,
@@ -2346,6 +2504,8 @@ def create_dag_with_model(
                 beta=args.end_beta,
                 gamma=args.end_gamma,
             )
+            if verbose:
+                print_kvedge_graph(kvedges, out_adj, in_adj)
 
             if any(value_matches_answer(e.value, answer) for e in kvedges.values()):
                 graph_recall += 1
@@ -2360,7 +2520,16 @@ def create_dag_with_model(
                 expansion_hops=args.expansion_hops,
                 seed_edge_topk=args.seed_edge_topk,
             )
+
+            if verbose:
+                print(f"kept nodes after subgraph selection: {kept_nodes}")
+                print(f"kept edges after subgraph selection: {kept_edges}")
+
             kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
+            if verbose:
+                print(f"kept nodes after cycle breaking: {kept_nodes}")
+                print(f"kept edges after cycle breaking: {kept_edges}")
+                
 
             if args.answer_aware:
                 kept_nodes, kept_edges = answer_terminalization(
@@ -2381,6 +2550,20 @@ def create_dag_with_model(
                 kept_edges=kept_edges,
                 kvedges=kvedges,
             )
+            if verbose:
+                print(f"kept nodes after sink enforcement: {kept_nodes}")
+                print(f"kept edges after sink enforcement: {kept_edges}")
+            kept_nodes, kept_edges = reverse_beam_expand_from_sink_edges(
+                selected_nodes=kept_nodes,
+                selected_edges=kept_edges,
+                kvedges=kvedges,
+                in_adj=in_adj,
+                max_edges=args.max_edges,
+                max_nodes=args.max_nodes,
+                sink_edge_topk=args.reverse_sink_edge_topk,
+                reverse_hops=args.reverse_sink_hops,
+                beam_width=args.reverse_sink_beam_width,
+            )
 
             if not kept_edges:
                 sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'empty_after_prune'}}
@@ -2400,7 +2583,11 @@ def create_dag_with_model(
                         break
                 if sink_hit:
                     break
-
+            if sink_hit:
+                answer_recall += 1
+            else:
+                if args.answer_aware:
+                    continue
             sink_rank_stats = compute_sink_relevance_stats(
                 kept_edges=kept_edges,
                 kvedges=kvedges,
@@ -2409,11 +2596,11 @@ def create_dag_with_model(
             )
             if any(item['is_answer_sink'] and item['has_inbound'] for item in sink_rank_stats['sink_scores']):
                 answer_supported_recall += 1
-            if sink_hit:
-                answer_recall += 1
+                answer_supported_sample_ids.append(sample.get('id', sample.get('_id', f'sample_{batch_start + i}')))
             else:
-                if args.answer_aware:
-                    continue
+                if sink_hit:
+                    answer_unsupported_sample_ids.append(sample.get('id',sample.get('_id', f'sample_{batch_start + i}')))
+
             if any(value_matches_answer(kvedges[eid].value, answer) for eid in kept_edges):
                 none_sink_recall += 1
 
@@ -2424,6 +2611,9 @@ def create_dag_with_model(
             )
 
             kv_nodes, adj = export_kv_nodes_and_adj(kept_edges, kvedges, keep_score=args.keep_score)
+            if verbose:
+                print(f"Exported KV nodes: {kv_nodes}")
+                print(f"Exported adjacency matrix: {adj}")
             goal_ids: List[int] = []
             if answer:
                 for j, kv in enumerate(kv_nodes):
@@ -2462,7 +2652,7 @@ def create_dag_with_model(
                 + ' '.join(topk_probs)
             )
 
-    return out_samples
+    return out_samples, answer_unsupported_sample_ids, answer_supported_sample_ids
 
 
 def drop_empty_kv_samples(samples: List[Dict[str, Any]], answerable_only: bool) -> List[Dict[str, Any]]:
@@ -2502,6 +2692,9 @@ def main():
     ap.add_argument('--seed_edge_topk', type=int, default=18)
     ap.add_argument('--expansion_hops', type=int, default=2)
     ap.add_argument('--per_src_cap', type=int, default=3)
+    ap.add_argument('--reverse_sink_edge_topk', type=int, default=3)
+    ap.add_argument('--reverse_sink_hops', type=int, default=2)
+    ap.add_argument('--reverse_sink_beam_width', type=int, default=4)
     ap.add_argument('--max_nodes', type=int, default=30)
     ap.add_argument('--max_edges', type=int, default=40)
     ap.add_argument('--max_sinks', type=int, default=8)
@@ -2551,6 +2744,9 @@ def main():
 
     ap.add_argument('--answerable_only', action='store_true',
                     help='Only include answerable samples in training')
+
+    ap.add_argument('--dis_out_path', default=None)
+
     args = ap.parse_args()
 
     print(args)
@@ -2558,6 +2754,12 @@ def main():
     samples = read_json_or_jsonl(args.input)
     if args.limit:
         samples = samples[:args.limit]
+    
+    new_samples=[]
+    for s in samples:
+        if s.get('type')=="bridge":
+            new_samples.append(s)
+    samples=new_samples
 
     print(f'Load {len(samples)} samples from {args.input}')
 
@@ -2570,7 +2772,7 @@ def main():
 
     edge_model, node_model, ckpt, device = load_model(args.model_ckpt, cpu=args.cpu)
     print(f'Loaded scorer from {args.model_ckpt}')
-    out = create_dag_with_model(
+    out, answer_unsupported_sample_ids, answer_supported_sample_ids = create_dag_with_model(
             args,
             samples,
             embedder,
@@ -2581,6 +2783,24 @@ def main():
             verbose=args.verbose,
         )
     out = drop_empty_kv_samples(out, answerable_only=args.answerable_only)
+
+    if args.dis_out_path and out:
+        if "islet" in args.dis_out_path:
+            evaluated_samples_ids=[]
+            # 取out中样本的id，如果不在answer_unsupported_sample_ids中，则加入evaluated_samples_ids
+            for s in out:
+                sid = s.get('id', s.get('_id', None))
+                if sid is not None and sid not in answer_unsupported_sample_ids:
+                    evaluated_samples_ids.append(sid)
+        elif "supported" in args.dis_out_path:
+            evaluated_samples_ids=answer_supported_sample_ids
+
+        print(f"Saving {len(evaluated_samples_ids)} evaluated sample IDs to {args.dis_out_path}")
+        with open(args.dis_out_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "evaluated_samples": evaluated_samples_ids,
+            }, f, ensure_ascii=False, indent=2)
+
     if not args.output:
         raise ValueError('--output is required for --mode infer')
     if args.output.endswith('.jsonl'):

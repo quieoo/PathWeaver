@@ -379,6 +379,8 @@ def weak_label_edge(sample: Dict[str, Any], e: KVEdge) -> int:
     answer = norm_text(sample.get('answer', ''))
     supporting_titles = {norm_text(t) for t, _ in (sample.get('supporting_facts', []) or []) if isinstance(t, str)}
     pos = False
+    # if supporting_titles and norm_text(e.title) in supporting_titles:
+    #     pos = True
     if answer and value_matches_answer(e.value, answer):
         pos = True
     return int(pos)
@@ -1947,6 +1949,35 @@ def compute_sink_relevance_stats(
     }
 
 
+def collect_answer_inbound_edge_ids(kvedges: Dict[int, KVEdge], answer: str) -> Set[int]:
+    """
+    Find original-graph inbound support edges for answer-bearing destination nodes.
+
+    Step 1:
+      find all edges whose value matches the gold answer.
+      Their destination nodes are treated as answer dst nodes.
+
+    Step 2:
+      collect all edges whose dst is one of those answer dst nodes.
+      This is more aligned with existing answer recall / sink_hit definitions,
+      which are based on value_matches_answer(e.value, answer).
+    """
+    if not answer:
+        return set()
+
+    answer_dst_nodes: Set[int] = {
+        e.dst for e in kvedges.values()
+        if value_matches_answer(e.value, answer)
+    }
+    if not answer_dst_nodes:
+        return set()
+
+    return {
+        eid for eid, e in kvedges.items()
+        if e.dst in answer_dst_nodes
+    }
+
+
 def update_sink_rank_buckets(
     rank_buckets: Dict[int, Dict[str, Any]],
     num_sinks: int,
@@ -2207,7 +2238,19 @@ def create_dag_with_model(
     graph_recall = 0
     none_sink_recall = 0
     answer_supported_recall = 0
+    answer_inbound_edge_total = 0
+    answer_inbound_edge_kept_pre_cycle = 0
+    answer_inbound_edge_kept_post_cycle = 0
+    answer_inbound_edge_kept_post_terminal_kv = 0
     sink_rank_buckets: Dict[int, Dict[str, Any]] = {}
+
+    # sample-level buckets for diagnosing where answer support is lost
+    samples_with_answer_inbound_in_graph = 0
+    samples_with_answer_inbound_after_selection = 0
+    samples_with_answer_inbound_after_cycle = 0
+    samples_with_answer_inbound_after_terminal_kv = 0
+    samples_answer_sink_but_no_inbound = 0
+    samples_answer_sink_with_inbound = 0
 
     is_joint = ckpt.get('is_joint', False)
     infer_batch_size = max(1, int(args.infer_batch_size))
@@ -2350,6 +2393,11 @@ def create_dag_with_model(
             if any(value_matches_answer(e.value, answer) for e in kvedges.values()):
                 graph_recall += 1
 
+            answer_inbound_edge_ids = collect_answer_inbound_edge_ids(kvedges, answer)
+            answer_inbound_edge_total += len(answer_inbound_edge_ids)
+            if answer_inbound_edge_ids:
+                samples_with_answer_inbound_in_graph += 1
+
             kept_nodes, kept_edges = select_subgraph_edges(
                 topic_nodes=topic_nodes,
                 kvedges=kvedges,
@@ -2360,7 +2408,19 @@ def create_dag_with_model(
                 expansion_hops=args.expansion_hops,
                 seed_edge_topk=args.seed_edge_topk,
             )
-            kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
+            kept_answer_inbound_pre_cycle = answer_inbound_edge_ids & kept_edges
+            answer_inbound_edge_kept_pre_cycle += len(kept_answer_inbound_pre_cycle)
+            if kept_answer_inbound_pre_cycle:
+                samples_with_answer_inbound_after_selection += 1
+
+            kept_edges_after_cycle = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
+            
+            kept_answer_inbound_post_cycle = answer_inbound_edge_ids & kept_edges_after_cycle
+            answer_inbound_edge_kept_post_cycle += len(kept_answer_inbound_post_cycle)
+            if kept_answer_inbound_post_cycle:
+                samples_with_answer_inbound_after_cycle += 1
+
+            kept_edges = kept_edges_after_cycle
 
             if args.answer_aware:
                 kept_nodes, kept_edges = answer_terminalization(
@@ -2381,6 +2441,10 @@ def create_dag_with_model(
                 kept_edges=kept_edges,
                 kvedges=kvedges,
             )
+            kept_answer_inbound_post_terminal_kv = answer_inbound_edge_ids & kept_edges
+            answer_inbound_edge_kept_post_terminal_kv += len(kept_answer_inbound_post_terminal_kv)
+            if kept_answer_inbound_post_terminal_kv:
+                samples_with_answer_inbound_after_terminal_kv += 1
 
             if not kept_edges:
                 sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'empty_after_prune'}}
@@ -2400,6 +2464,12 @@ def create_dag_with_model(
                         break
                 if sink_hit:
                     break
+            if sink_hit:
+                has_answer_inbound_final = len(kept_answer_inbound_post_terminal_kv) > 0
+                if has_answer_inbound_final:
+                    samples_answer_sink_with_inbound += 1
+                else:
+                    samples_answer_sink_but_no_inbound += 1
 
             sink_rank_stats = compute_sink_relevance_stats(
                 kept_edges=kept_edges,
@@ -2409,11 +2479,13 @@ def create_dag_with_model(
             )
             if any(item['is_answer_sink'] and item['has_inbound'] for item in sink_rank_stats['sink_scores']):
                 answer_supported_recall += 1
+
             if sink_hit:
                 answer_recall += 1
             else:
                 if args.answer_aware:
                     continue
+
             if any(value_matches_answer(kvedges[eid].value, answer) for eid in kept_edges):
                 none_sink_recall += 1
 
@@ -2449,6 +2521,63 @@ def create_dag_with_model(
         print(f'Graph  recall: {graph_recall / len(samples):.4f}')
         print(f'None-sink recall: {none_sink_recall / len(samples):.4f}')
         print(f'Answer + supported sink ratio: {answer_supported_recall / len(samples):.4f}')
+        if answer_inbound_edge_total > 0:
+            cycle_removed_answer_inbound_edges = (
+                answer_inbound_edge_kept_pre_cycle - answer_inbound_edge_kept_post_cycle
+            )
+            print(
+                'Pre-selection answer inbound edge recall: '
+                f'{answer_inbound_edge_kept_pre_cycle / answer_inbound_edge_total:.4f} '
+                f'({answer_inbound_edge_kept_pre_cycle}/{answer_inbound_edge_total})'
+            )
+            print(
+                'Post-cycle answer inbound edge recall: '
+                f'{answer_inbound_edge_kept_post_cycle / answer_inbound_edge_total:.4f} '
+                f'({answer_inbound_edge_kept_post_cycle}/{answer_inbound_edge_total})'
+            )
+            print(
+                'Post-terminal-KV answer inbound edge recall: '
+                f'{answer_inbound_edge_kept_post_terminal_kv / answer_inbound_edge_total:.4f} '
+                f'({answer_inbound_edge_kept_post_terminal_kv}/{answer_inbound_edge_total})'
+            )
+            print(
+                'Answer inbound edges removed by cycle breaking: '
+                f'{cycle_removed_answer_inbound_edges} '
+                f'({cycle_removed_answer_inbound_edges / answer_inbound_edge_kept_pre_cycle:.4f} of pre-selected)'
+                if answer_inbound_edge_kept_pre_cycle > 0
+                else f'{cycle_removed_answer_inbound_edges} (0.0000 of pre-selected)'
+            )
+            print(
+                'Sample-level answer inbound presence in graph: '
+                f'{samples_with_answer_inbound_in_graph / len(samples):.4f} '
+                f'({samples_with_answer_inbound_in_graph}/{len(samples)})'
+            )
+            print(
+                'Sample-level answer inbound presence after selection: '
+                f'{samples_with_answer_inbound_after_selection / len(samples):.4f} '
+                f'({samples_with_answer_inbound_after_selection}/{len(samples)})'
+            )
+            print(
+                'Sample-level answer inbound presence after cycle: '
+                f'{samples_with_answer_inbound_after_cycle / len(samples):.4f} '
+                f'({samples_with_answer_inbound_after_cycle}/{len(samples)})'
+            )
+            print(
+                'Sample-level answer inbound presence after terminal-KV: '
+                f'{samples_with_answer_inbound_after_terminal_kv / len(samples):.4f} '
+                f'({samples_with_answer_inbound_after_terminal_kv}/{len(samples)})'
+            )
+            print(
+                'Answer sink but no inbound support: '
+                f'{samples_answer_sink_but_no_inbound / len(samples):.4f} '
+                f'({samples_answer_sink_but_no_inbound}/{len(samples)})'
+            )
+            print(
+                'Answer sink with inbound support: '
+                f'{samples_answer_sink_with_inbound / len(samples):.4f} '
+                f'({samples_answer_sink_with_inbound}/{len(samples)})'
+            )
+
         if sink_rank_buckets:
             merged_sink_rank_stats = merge_sink_rank_buckets(sink_rank_buckets)
             topk_probs = [
