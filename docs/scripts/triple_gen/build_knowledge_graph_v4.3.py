@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-build_knowledge_graph_v4.py
+build_knowledge_graph_v4.3.py
 
-Two-stage KG extraction pipeline for QA datasets using OpenAI-compatible APIs.
+Three-stage graph-first KG extraction pipeline for QA datasets using OpenAI-compatible APIs.
 
 Stage 1:
-    Extract an evidence-grounded semantic fact layer from supporting pages.
+    Build an evidence-grounded graph skeleton from supporting pages: nodes + triples.
 Stage 2:
-    Normalize stage-1 facts into dataset-compatible triple_list JSON.
+    Convert stage-1 triples into dataset-compatible triple_list JSON with forward KV only.
+Stage 3:
+    Generate reverse KV only.
 
 Key features:
 - Async concurrent requests with asyncio + urllib
 - Structured Outputs via Responses API or chat.completions JSON schema
-- Resume/caching for both stages
+- Resume from output jsonl only; no per-stage cache
 - Local validation + deduplication
 - Incremental JSONL writing
 
@@ -35,14 +37,13 @@ Environment:
     export OPENAI_BASE_URL=https://api.ofox.ai/v1
 
 Example:
-    python3 build_knowledge_graph_v4.py \
+    python3 build_knowledge_graph_v4.3.py \
         --input hotpot_train.jsonl \
         --output hotpot_train_triples.jsonl \
         --model openai/gpt-5.2 \
         --api-mode chat \
         --concurrency 8 \
-        --stage1-cache-dir ./cache_stage1 \
-        --stage2-cache-dir ./cache_stage2
+        --answer-aware
 """
 
 from __future__ import annotations
@@ -166,17 +167,17 @@ STAGE1_SCHEMA: Dict[str, Any] = {
                 "required": ["entity_id", "name", "aliases"],
             },
         },
-        "facts": {
+        "triples": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    "fact_id": {"type": "string"},
-                    "subject": {"type": "string"},
-                    "predicate": {"type": "string"},
-                    "object": {"type": "string"},
-                    "object_kind": {"type": "string", "enum": ["entity", "literal"]},
+                    "triple_id": {"type": "string"},
+                    "head": {"type": "string"},
+                    "relation": {"type": "string"},
+                    "tail": {"type": "string"},
+                    "tail_kind": {"type": "string", "enum": ["entity", "literal"]},
                     "evidence": {
                         "type": "array",
                         "items": {
@@ -191,116 +192,58 @@ STAGE1_SCHEMA: Dict[str, Any] = {
                     },
                 },
                 "required": [
-                    "fact_id",
-                    "subject",
-                    "predicate",
-                    "object",
-                    "object_kind",
+                    "triple_id",
+                    "head",
+                    "relation",
+                    "tail",
+                    "tail_kind",
                     "evidence",
                 ],
             },
         },
     },
-    "required": ["_id", "entities", "facts"],
+    "required": ["_id", "entities", "triples"],
 }
-
-STAGE2_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "_id": {"type": "string"},
-        "context": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "title": {"type": "string"},
-                    "sentences": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "triple_list": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "type": {"type": "string", "enum": ["ATTRIBUTE", "RELATION"]},
-                                "name": {"type": "string"},
-                                "description_type": {"type": "string"},
-                                "description": {"type": "string"},
-                                "kv_lists": {
-                                    "type": "array",
-                                    "minItems": 2,
-                                    "items": {
-                                        "type": "object",
-                                        "additionalProperties": False,
-                                        "properties": {
-                                            "key_string": {"type": "string"},
-                                            "value_string": {"type": "string"},
-                                        },
-                                        "required": ["key_string", "value_string"],
-                                    },
-                                },
-                            },
-                            "required": [
-                                "type",
-                                "name",
-                                "description_type",
-                                "description",
-                                "kv_lists",
-                            ],
-                        },
-                    },
-                },
-                "required": ["title", "sentences", "triple_list"],
-            },
-        },
-    },
-    "required": ["_id", "context"],
-}
-
 
 # ============================================================
 # Prompts
 # ============================================================
 
-STAGE1_SYSTEM_PROMPT = """You are a knowledge graph fact extraction engine.
+STAGE1_SYSTEM_PROMPT = """You are a knowledge graph construction engine.
 
-Your task is to extract a complete, faithful, evidence-grounded semantic fact layer from the provided QA sample.
+Your task is to construct a complete, faithful, evidence-grounded graph skeleton from the provided context.
 
 Primary goal:
-1. Cover all supporting facts completely.
-2. Preserve all bridge facts needed to connect supporting facts into one knowledge graph.
-3. Extract only facts explicitly stated in the provided text.
-4. Do not hallucinate.
+1. Identify all minimal reusable nodes needed to represent the explicit facts in context.
+2. Identify all explicit edges among those nodes.
+3. Output a complete triple list that preserves graph connectivity for downstream multi-hop reasoning.
+4. Do not hallucinate or infer unstated facts.
 
-Important:
-- Do NOT generate triple_list.
-- Do NOT generate kv_lists.
-- Do NOT classify into ATTRIBUTE or RELATION yet.
-- Instead, extract a semantic fact layer with entities, facts, object_kind, and evidence.
+Node rules:
+- A node must be a stable, reusable semantic unit.
+- Prefer keeping canonical names, titles, organizations, places, works, species, dates, years, quantities, categories, and short literal values as nodes or literal tails.
+- Do not split fixed names or official titles into smaller pieces.
+- Do not create standalone nodes for clause fragments or long descriptive spans that are not reusable.
+- Event-like items may be kept only when they are explicitly named or clearly function as a reusable node in the text.
 
-Extraction rules:
-- Focus first on supporting fact sentences.
-- Also include other explicitly stated bridge facts from the same supporting pages if they help graph connectivity.
-- Split multi-fact sentences into multiple facts.
-- If one subject links to multiple objects, create multiple facts.
-- Use short, stable predicate phrases.
-- Keep entities canonical and retrieval-friendly.
-- Add aliases when they are explicitly stated or directly obvious within the page wording (e.g. surname reference like 'Corelli' for 'Franco Corelli').
-- Every fact must have evidence.
+Triple rules:
+- Extract only explicit triples supported by the provided context.
+- Split multi-fact sentences into multiple triples.
+- If one head links to multiple tails, emit multiple triples.
+- Use short, stable relation phrases.
+- Prefer preserving bridge nodes and bridge edges needed for graph connectivity.
+- Keep the graph as complete as possible over the provided pages, not only the final answer-bearing fact.
+- Every triple must have evidence.
 - evidence.title must be the page title.
 - evidence.sentence_id must be the integer sentence index in that page.
 
-object_kind rules:
-- Use object_kind='entity' for person, organization, work, place, event, group, or other concrete graph node.
-- Use object_kind='literal' for date, year, profession label, category, nickname, feature, quantity, short descriptive value, or other attribute-like value.
+Tail typing rules:
+- Use tail_kind='entity' for person, place, organization, work, event-like named node, species, group, concept-like named node, or other reusable graph node.
+- Use tail_kind='literal' for date, year, number, profession label, category, nickname, boolean-like value, short descriptive value, or other attribute-like value.
 
 Deduplication rules:
-- Do not output exact duplicate facts.
-- If the same fact appears in multiple sentences, keep one fact and attach all evidence items.
+- Do not output exact duplicate triples.
+- If the same triple appears in multiple sentences, keep one triple and attach all evidence items.
 
 Output rules:
 - Return valid JSON only.
@@ -309,45 +252,70 @@ Output rules:
 - Do not include markdown.
 """
 
-STAGE1_SYSTEM_PROMPT_ANSWER_AWARE = """You are a knowledge graph fact extraction engine optimized for MAXIMUM RECALL with ANSWER AWARENESS.
+STAGE1_SYSTEM_PROMPT_ANSWER_AWARE = """You are a knowledge graph construction engine.
 
-Your task is to extract a complete, faithful, evidence-grounded semantic fact layer from the provided QA sample.
+Your task is to construct a complete, faithful, evidence-grounded knowledge graph from the provided context.
 
 Primary goal:
-1. Cover all supporting facts completely.
-2. Preserve all bridge facts needed to connect supporting facts into one knowledge graph.
-3. If an answer field is provided, ensure that the answer and every supporting fact that directly or indirectly leads to that answer are captured.
-4. Extract only facts explicitly stated in the provided text.
-5. Do not hallucinate.
+1. Extract all explicit, evidence-grounded graph nodes and triples stated in the provided context.
+2. Preserve graph connectivity and bridge relations that may be useful for multi-hop question answering.
+3. Read the question and answer carefully, identify entity-like mentions in them, and ensure that any such mention that is grounded in the provided context is preserved in the knowledge graph.
+4. Give special priority to question-side bridge entities and bridge relations that help connect the question target to the answer-bearing facts.
+5. Do not hallucinate, infer unstated facts, or invent missing links just to make the graph answer the question.
 
-Important:
-- Do NOT generate triple_list.
-- Do NOT generate kv_lists.
-- Do NOT classify into ATTRIBUTE or RELATION yet.
-- Instead, extract a semantic fact layer with entities, facts, object_kind, and evidence.
-- Treat the provided answer as a high-priority coverage target, not as permission to invent missing facts.
+Definition of grounded mention:
+- A mention from the question or answer is grounded if it is explicitly present in the provided context, or can be matched to an explicit entity, alias, title, date, language, location, organization, work, event, concept, or value clearly stated in the context.
+- If a mention from the question or answer is not supported by the provided context, do not create a node or triple for it.
+- In particular, do not fabricate edges for question constraints that are not explicitly grounded in the context.
 
-Extraction rules:
-- Focus first on supporting fact sentences.
-- Also include other explicitly stated bridge facts from the same supporting pages if they help graph connectivity.
-- Do not miss facts that identify, describe, or connect to the answer.
-- When a sentence contributes to the answer through a bridge entity, keep both the bridge fact and the answer-facing fact.
-- Split multi-fact sentences into multiple facts.
-- If one subject links to multiple objects, create multiple facts.
-- Use short, stable predicate phrases.
-- Keep entities canonical and retrieval-friendly.
-- Add aliases when they are explicitly stated or directly obvious within the page wording (e.g. surname reference like 'Corelli' for 'Franco Corelli').
-- Every fact must have evidence.
+Node extraction rules:
+- First identify reusable graph nodes from the context.
+- A node should be the smallest reusable semantic unit that can function as a stable graph node.
+- Prefer nodes such as person, place, organization, work, publication, species, object, named event, named concept, language, date, year, number, title, or other canonical value.
+- Keep nodes canonical, specific, and retrieval-friendly.
+- When names are ambiguous or overlapping, prefer the more specific canonical surface form.
+- Do not split fixed names, official titles, named works, named organizations, species names, canonical locations, or canonical dates into smaller pieces.
+- Do not create nodes from loose clause fragments, full sentence fragments, or long event descriptions unless they clearly function as stable named entities in the text.
+
+Triple extraction rules:
+- Extract triples only from the provided context.
+- Each triple must represent one explicit fact supported by the context.
+- Split multi-fact sentences into multiple triples.
+- If one head links to multiple tails, create multiple triples.
+- Use short, stable relation phrases.
+- Prefer relation wording that stays close to the explicit statement in the context.
+- Avoid over-generalized or interpretive relations if a more literal relation can be extracted.
+- Every triple must have evidence.
 - evidence.title must be the page title.
 - evidence.sentence_id must be the integer sentence index in that page.
 
-object_kind rules:
-- Use object_kind='entity' for person, organization, work, place, event, group, or other concrete graph node.
-- Use object_kind='literal' for date, year, profession label, category, nickname, feature, quantity, short descriptive value, or other attribute-like value.
+Question-answer coverage rules:
+- Read the question and answer before deciding what is important.
+- Identify entity-like mentions in the question and answer, including named entities, titles, places, times, languages, publications, organizations, events, concepts, and canonical values.
+- If such a mention is grounded in the context, include it as an entity or as part of a triple, even if it seems less central than the final answer.
+- Pay special attention to question-side bridge mentions that help identify the target entity being asked about.
+- If the answer is grounded in the context, ensure the answer-bearing node or value is preserved.
+- If the context contains explicit relations that connect grounded question-side mentions to grounded answer-side mentions, preserve those relations.
+- Do not invent intermediate links that are not explicitly supported by the context.
+- Do not convert ungrounded question wording into fabricated graph facts.
+
+Alias and normalization rules:
+- Preserve aliases and alternative names when explicitly stated.
+- If the text says one entity is also known as another name, preserve that information either in aliases and/or as explicit triples if supported by your schema usage.
+- Normalize dates, names, and titles conservatively without changing their meaning.
+
+Tail kind rules:
+- Use tail_kind='entity' for reusable graph nodes such as person, organization, work, publication, place, event, group, species, object, language, or other concrete node-like items.
+- Use tail_kind='literal' for date, year, quantity, boolean-like status, short descriptive value, or other attribute-like values that should not be treated as reusable graph nodes.
 
 Deduplication rules:
-- Do not output exact duplicate facts.
-- If the same fact appears in multiple sentences, keep one fact and attach all evidence items.
+- Do not output exact duplicate triples.
+- If the same triple appears in multiple sentences, keep one triple and attach all evidence items.
+
+Quality priority:
+- Prioritize completeness of explicit graph structure over aggressive compression.
+- It is better to keep an explicit bridge entity or bridge triple than to omit it.
+- It is better to stay literal than to rewrite a relation into a more abstract but less faithful form.
 
 Output rules:
 - Return valid JSON only.
@@ -366,133 +334,6 @@ def get_stage1_system_prompt(*, answer_aware: bool, include_answer: bool, sample
         if not answer:
             return STAGE1_SYSTEM_PROMPT
     return STAGE1_SYSTEM_PROMPT_ANSWER_AWARE
-
-
-STAGE2_SYSTEM_PROMPT = """You are a normalization engine for DAG-KV / KBLaM triple construction.
-
-Your task is to convert the provided stage-1 semantic facts into the final triple_list JSON used by the dataset.
-
-Primary goals:
-1. Preserve all valid facts from stage 1.
-2. Convert each fact into exactly one triple.
-3. Classify each triple as ATTRIBUTE or RELATION.
-4. Generate bidirectional KV pairs whose key_string is a natural semantic query and whose value_string is only the target phrase.
-5. Keep the output fully compatible with the required schema.
-
-============================================================
-I. TRIPLE SCHEMA
-============================================================
-
-Each triple must follow this schema:
-{
-  "type": "ATTRIBUTE" or "RELATION",
-  "name": "<subject entity>",
-  "description_type": "<relation or attribute label>",
-  "description": "<object entity or literal value>",
-  "kv_lists": [
-    {"key_string": "...", "value_string": "..."},
-    {"key_string": "...", "value_string": "..."},
-  ]
-}
-
-============================================================
-II. ATTRIBUTE VS RELATION
-============================================================
-
-- Use ATTRIBUTE when the object is literal-like:
-  date, year, category, profession label, nickname, time span, quantity, short descriptive phrase, etc.
-- Use RELATION when the object is entity-like:
-  person, place, organization, work, event, species, group, or another graph node.
-- Use stage1.object_kind as the primary signal, but keep compatibility with the dataset style.
-
-============================================================
-III. NAMING RULES
-============================================================
-
-- Keep name exactly as the subject entity surface form.
-- Keep description exactly as the target object/value surface form.
-- Prefer short stable description_type values such as:
-  birth date, death date, release year, production location, nickname, occupation, nationality,
-  starring, directed by, based on, composed by, partnered with, located in, voice type, type.
-
-============================================================
-IV. KV GENERATION RULES
-============================================================
-
-For EACH triple, generate exactly TWO KV pairs:
-1. one forward KV
-2. one reverse KV
-
-Use the following semantic rule:
-
-A. Forward KV
-- key_string = natural_forward_string(name, description_type)
-- value_string = description
-
-B. Reverse KV
-- key_string = natural_reverse_string(description, description_type)
-- value_string = name
-
-============================================================
-V. WHAT natural_forward_string / natural_reverse_string MEAN
-============================================================
-
-natural_forward_string MUST:
-- be a natural semantic query or statement fragment that points from the subject toward the target
-- preserve the subject anchor (the name, or a faithful surface form of it)
-- preserve the meaning of description_type
-- be semantically complete enough that the missing answer phrase is clear
-
-natural_reverse_string MUST:
-- be a natural semantic query or statement fragment that points from the object/value toward the subject
-- preserve the object/value anchor (the description, or a faithful surface form of it)
-- preserve the meaning of description_type
-- be semantically complete enough that the missing answer phrase is clear
-
-Both directions MUST:
-- be logically equivalent restatements of the SAME fact
-- remain concise, stable, and retrieval-friendly
-- not invent information
-- not introduce type information that is not in the fact
-
-============================================================
-VI. PRIORITY FOR KEY QUALITY
-============================================================
-
-CRITICAL HARD CONSTRAINT:
-- kv_lists[0] MUST be forward:
-  - key_string anchored on name
-  - value_string MUST equal description
-- kv_lists[1] MUST be reverse:
-  - key_string anchored on description
-  - value_string MUST equal name
-
-BAD EXAMPLE:
-name="Norway", description_type="population date", description="August 2018"
-[
-  {"key_string": "the population date of Norway is", "value_string": "August 2018"},
-  {"key_string": "the date for the population of Norway is", "value_string": "August 2018"}
-]
-This is wrong because the second KV is not reverse.
-
-GOOD EXAMPLE:
-[
-  {"key_string": "the population date of Norway is", "value_string": "August 2018"},
-  {"key_string": "the country whose population date is August 2018 is", "value_string": "Norway"}
-]
-
-============================================================
-VII. OUTPUT RULES
-============================================================
-
-- Return valid JSON only.
-- Follow the supplied schema exactly.
-- Do not include explanations.
-- Do not include markdown.
-- Do not drop facts.
-- Do not merge different facts.
-- The triple fields and both KV pairs must describe the SAME fact.
-"""
 
 
 # ============================================================
@@ -889,12 +730,12 @@ def build_stage2_input(
         if title in supporting_titles:
             title_to_sentences[title] = [norm_text(x) for x in (para.get("sentences", []) or [])]
 
-    facts_by_title: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for fact in stage1.get("facts", []) or []:
-        for ev in fact.get("evidence", []) or []:
+    triples_by_title: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for tri in stage1.get("triples", []) or []:
+        for ev in tri.get("evidence", []) or []:
             title = norm_text(ev.get("title", ""))
             if title in title_to_sentences:
-                facts_by_title[title].append(fact)
+                triples_by_title[title].append(tri)
 
     pages: List[Dict[str, Any]] = []
     for title, sentences in title_to_sentences.items():
@@ -902,7 +743,7 @@ def build_stage2_input(
             {
                 "title": title,
                 "sentences": sentences,
-                "facts": dedupe_stage2_input_facts(facts_by_title.get(title, [])),
+                "triples": dedupe_stage2_input_triples(triples_by_title.get(title, [])),
             }
         )
 
@@ -936,11 +777,32 @@ def build_stage2_input(
 # ============================================================
 
 
+def _iter_stage1_raw_triples(stage1: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if isinstance(stage1.get("triples"), list):
+        return list(stage1.get("triples", []) or [])
+    # backward compatibility with older cached / intermediate formats
+    if isinstance(stage1.get("facts"), list):
+        converted = []
+        for fact in stage1.get("facts", []) or []:
+            converted.append(
+                {
+                    "triple_id": norm_text(fact.get("fact_id", "")),
+                    "head": norm_text(fact.get("subject", "")),
+                    "relation": norm_text(fact.get("predicate", "")),
+                    "tail": norm_text(fact.get("object", "")),
+                    "tail_kind": norm_text(fact.get("object_kind", "")),
+                    "evidence": fact.get("evidence", []) or [],
+                }
+            )
+        return converted
+    return []
+
+
 def dedupe_stage1(stage1: Dict[str, Any]) -> Dict[str, Any]:
     out = {
         "_id": norm_text(stage1.get("_id", "")),
         "entities": [],
-        "facts": [],
+        "triples": [],
     }
 
     entity_seen = set()
@@ -955,18 +817,18 @@ def dedupe_stage1(stage1: Dict[str, Any]) -> Dict[str, Any]:
             out["entities"].append(e)
             entity_seen.add(sig)
 
-    fact_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-    for fact in stage1.get("facts", []) or []:
-        subject = norm_text(fact.get("subject", ""))
-        predicate = norm_text(fact.get("predicate", ""))
-        obj = norm_text(fact.get("object", ""))
-        kind = norm_text(fact.get("object_kind", ""))
-        if not (subject and predicate and obj and kind in {"entity", "literal"}):
+    triple_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    for tri in _iter_stage1_raw_triples(stage1):
+        head = norm_text(tri.get("head", ""))
+        relation = norm_text(tri.get("relation", ""))
+        tail = norm_text(tri.get("tail", ""))
+        kind = norm_text(tri.get("tail_kind", ""))
+        if not (head and relation and tail and kind in {"entity", "literal"}):
             continue
-        sig = (subject, predicate, obj, kind)
+        sig = (head, relation, tail, kind)
         evs = []
         ev_seen = set()
-        for ev in fact.get("evidence", []) or []:
+        for ev in tri.get("evidence", []) or []:
             title = norm_text(ev.get("title", ""))
             try:
                 sid = int(ev.get("sentence_id", -1))
@@ -979,46 +841,46 @@ def dedupe_stage1(stage1: Dict[str, Any]) -> Dict[str, Any]:
                 evs.append({"title": title, "sentence_id": sid})
                 ev_seen.add(esig)
 
-        if sig not in fact_map:
-            fact_map[sig] = {
-                "fact_id": norm_text(fact.get("fact_id", "")) or f"F{len(fact_map) + 1}",
-                "subject": subject,
-                "predicate": predicate,
-                "object": obj,
-                "object_kind": kind,
+        if sig not in triple_map:
+            triple_map[sig] = {
+                "triple_id": norm_text(tri.get("triple_id", "")) or f"G{len(triple_map) + 1}",
+                "head": head,
+                "relation": relation,
+                "tail": tail,
+                "tail_kind": kind,
                 "evidence": evs,
             }
         else:
-            existing_seen = {(x["title"], x["sentence_id"]) for x in fact_map[sig]["evidence"]}
+            existing_seen = {(x["title"], x["sentence_id"]) for x in triple_map[sig]["evidence"]}
             for ev in evs:
                 esig = (ev["title"], ev["sentence_id"])
                 if esig not in existing_seen:
-                    fact_map[sig]["evidence"].append(ev)
+                    triple_map[sig]["evidence"].append(ev)
                     existing_seen.add(esig)
 
-    out["facts"] = list(fact_map.values())
+    out["triples"] = list(triple_map.values())
     return out
 
 
-def dedupe_stage2_input_facts(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def dedupe_stage2_input_triples(triples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out = []
-    for fact in facts:
+    for tri in triples:
         sig = (
-            norm_text(fact.get("subject", "")),
-            norm_text(fact.get("predicate", "")),
-            norm_text(fact.get("object", "")),
-            norm_text(fact.get("object_kind", "")),
+            norm_text(tri.get("head", "")),
+            norm_text(tri.get("relation", "")),
+            norm_text(tri.get("tail", "")),
+            norm_text(tri.get("tail_kind", "")),
         )
         if sig not in seen:
             out.append(
                 {
-                    "fact_id": norm_text(fact.get("fact_id", "")),
-                    "subject": sig[0],
-                    "predicate": sig[1],
-                    "object": sig[2],
-                    "object_kind": sig[3],
-                    "evidence": fact.get("evidence", []) or [],
+                    "triple_id": norm_text(tri.get("triple_id", "")),
+                    "head": sig[0],
+                    "relation": sig[1],
+                    "tail": sig[2],
+                    "tail_kind": sig[3],
+                    "evidence": tri.get("evidence", []) or [],
                 }
             )
             seen.add(sig)
@@ -1032,8 +894,8 @@ def validate_stage1(stage1: Dict[str, Any]) -> None:
         raise ValueError("stage1._id missing or invalid")
     if not isinstance(stage1.get("entities"), list):
         raise ValueError("stage1.entities missing or invalid")
-    if not isinstance(stage1.get("facts"), list):
-        raise ValueError("stage1.facts missing or invalid")
+    if not isinstance(stage1.get("triples"), list):
+        raise ValueError("stage1.triples missing or invalid")
     for ent in stage1["entities"]:
         if not isinstance(ent, dict):
             raise ValueError("stage1 entity must be object")
@@ -1043,47 +905,23 @@ def validate_stage1(stage1: Dict[str, Any]) -> None:
             raise ValueError("stage1 entity name missing")
         if not isinstance(ent.get("aliases"), list):
             raise ValueError("stage1 aliases missing")
-    for fact in stage1["facts"]:
-        if not isinstance(fact, dict):
-            raise ValueError("stage1 fact must be object")
-        for k in ["fact_id", "subject", "predicate", "object"]:
-            if not isinstance(fact.get(k), str) or not fact[k].strip():
-                raise ValueError(f"stage1 fact {k} missing")
-        if fact.get("object_kind") not in {"entity", "literal"}:
-            raise ValueError("stage1 fact object_kind invalid")
-        if not isinstance(fact.get("evidence"), list) or not fact["evidence"]:
-            raise ValueError("stage1 fact evidence missing")
-        for ev in fact["evidence"]:
+    for tri in stage1["triples"]:
+        if not isinstance(tri, dict):
+            raise ValueError("stage1 triple must be object")
+        for k in ["triple_id", "head", "relation", "tail"]:
+            if not isinstance(tri.get(k), str) or not tri[k].strip():
+                raise ValueError(f"stage1 triple {k} missing")
+        if tri.get("tail_kind") not in {"entity", "literal"}:
+            raise ValueError("stage1 triple tail_kind invalid")
+        if not isinstance(tri.get("evidence"), list) or not tri["evidence"]:
+            raise ValueError("stage1 triple evidence missing")
+        for ev in tri["evidence"]:
             if not isinstance(ev, dict):
                 raise ValueError("stage1 evidence must be object")
             if not isinstance(ev.get("title"), str) or not ev["title"].strip():
                 raise ValueError("stage1 evidence.title missing")
             if not isinstance(ev.get("sentence_id"), int):
                 raise ValueError("stage1 evidence.sentence_id invalid")
-
-
-def validate_stage2(stage2: Dict[str, Any], verbose: bool = False) -> None:
-    if verbose:
-        return
-    if not isinstance(stage2, dict):
-        raise ValueError("stage2 must be a dict")
-    if not isinstance(stage2.get("_id"), str):
-        raise ValueError("stage2._id missing or invalid")
-    if not isinstance(stage2.get("context"), list):
-        raise ValueError("stage2.context missing or invalid")
-
-    for para in stage2["context"]:
-        if not isinstance(para, dict):
-            raise ValueError("stage2 context item must be object")
-        if not isinstance(para.get("title"), str):
-            raise ValueError("stage2 context.title invalid")
-        if not isinstance(para.get("sentences"), list):
-            raise ValueError("stage2 context.sentences invalid")
-        if not isinstance(para.get("triple_list"), list):
-            raise ValueError("stage2 context.triple_list invalid")
-        for tri in para["triple_list"]:
-            validate_triple(tri)
-            validate_kv_anchor_and_value(tri)
 
 
 def validate_triple(tri: Dict[str, Any]) -> None:
@@ -1297,50 +1135,6 @@ def validate_kv_anchor_and_value(tri: Dict[str, Any]) -> None:
                 f"kv.value_string must equal either description or name: value={value_string!r}, name={name!r}, description={description!r}"
             )
 
-def normalize_stage2(stage2: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
-    out = {"_id": norm_text(stage2.get("_id", "")), "context": []}
-    for para in stage2.get("context", []) or []:
-        triples = []
-        seen = set()
-        for tri in para.get("triple_list", []) or []:
-            tri2 = {
-                "type": norm_text(tri.get("type", "")),
-                "name": norm_text(tri.get("name", "")),
-                "description_type": norm_text(tri.get("description_type", "")),
-                "description": norm_text(tri.get("description", "")),
-                "kv_lists": [],
-            }
-            for kv in tri.get("kv_lists", []) or []:
-                key_string = norm_text(kv.get("key_string", ""))
-                value_string = norm_text(kv.get("value_string", ""))
-                if key_string and value_string:
-                    tri2["kv_lists"].append({
-                        "key_string": key_string,
-                        "value_string": value_string,
-                    })
-            sig = (
-                tri2["type"],
-                tri2["name"],
-                tri2["description_type"],
-                tri2["description"],
-            )
-            if sig in seen:
-                continue
-            seen.add(sig)
-            if verbose:
-                print(tri2)
-            # tri2 = postprocess_triple_kv_lists(tri2)
-            triples.append(tri2)
-        out["context"].append(
-            {
-                "title": norm_text(para.get("title", "")),
-                "sentences": [norm_text(x) for x in (para.get("sentences", []) or [])],
-                "triple_list": triples,
-            }
-        )
-    return out
-
-
 def check_supporting_sentence_coverage(sample: Dict[str, Any], stage1: Dict[str, Any]) -> Tuple[bool, List[Tuple[str, int]]]:
     required = []
     for item in sample.get("supporting_facts", []) or []:
@@ -1353,8 +1147,8 @@ def check_supporting_sentence_coverage(sample: Dict[str, Any], stage1: Dict[str,
             required.append((title, sid))
 
     covered = set()
-    for fact in stage1.get("facts", []) or []:
-        for ev in fact.get("evidence", []) or []:
+    for tri in stage1.get("triples", []) or []:
+        for ev in tri.get("evidence", []) or []:
             title = norm_text(ev.get("title", ""))
             sid = ev.get("sentence_id")
             if isinstance(sid, int):
@@ -1365,31 +1159,8 @@ def check_supporting_sentence_coverage(sample: Dict[str, Any], stage1: Dict[str,
 
 
 # ============================================================
-# Cache helpers
+# Output resume helpers
 # ============================================================
-
-
-def cache_path(cache_dir: Optional[str], sample_id: str, suffix: str) -> Optional[str]:
-    if not cache_dir:
-        return None
-    return os.path.join(cache_dir, f"{sample_id}.{suffix}.json")
-
-
-def load_cached_json(path: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not path or not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_cached_json(path: Optional[str], obj: Dict[str, Any]) -> None:
-    if not path:
-        return
-    ensure_dir(os.path.dirname(path))
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
 
 
 def load_existing_output_ids(path: str) -> set[str]:
@@ -1469,24 +1240,6 @@ def normalize_final_sample_output(sample: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-# ============================================================
-# Worker
-# ============================================================
-
-
-@dataclass
-class WorkerConfig:
-    include_question: bool
-    include_answer: bool
-    answer_aware: bool
-    supporting_pages_only: bool
-    stage1_cache_dir: Optional[str]
-    stage2_cache_dir: Optional[str]
-    verify_supporting_coverage: bool
-    overwrite: bool
-    verbose: bool = False
-
-
 class SampleProcessingError(RuntimeError):
     def __init__(self, stage: str, sample_id: str, cause: Exception):
         self.stage = stage
@@ -1507,112 +1260,6 @@ def classify_error_location(exc: Exception) -> str:
         frame = tb_entries[-1]
         return f"{os.path.basename(frame.filename)}:{frame.name}:{frame.lineno}"
     return target.__class__.__name__
-
-
-async def process_one_sample(
-    *,
-    idx: int,
-    sample: Dict[str, Any],
-    client: OpenAIResponsesClient,
-    cfg: WorkerConfig,
-    verbose: bool = False,
-) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    sample_id = safe_sample_id(sample, idx)
-    sample["_id"] = sample_id
-
-    stage1_path = cache_path(cfg.stage1_cache_dir, sample_id, "stage1")
-    stage2_path = cache_path(cfg.stage2_cache_dir, sample_id, "stage2")
-
-    # ---------------- stage 1 ----------------
-    try:
-        stage1 = None if cfg.overwrite else load_cached_json(stage1_path)
-        if stage1 is None:
-            stage1_input = build_stage1_input(
-                sample,
-                include_question=cfg.include_question,
-                include_answer=cfg.include_answer,
-                supporting_pages_only=cfg.supporting_pages_only,
-            )
-            stage1_system_prompt = get_stage1_system_prompt(
-                answer_aware=cfg.answer_aware,
-                include_answer=cfg.include_answer,
-                sample=sample,
-            )
-            try:
-                stage1 = await client.create_structured_response(
-                    system_prompt=stage1_system_prompt,
-                    user_payload=stage1_input,
-                    schema_name="stage1_semantic_facts",
-                    schema=STAGE1_SCHEMA,
-                    request_id=make_request_id("stage1", sample_id),
-                )
-            except Exception as e:
-                raise SampleProcessingError("stage1_api", sample_id, e) from e
-            try:
-                stage1 = dedupe_stage1(stage1)
-                validate_stage1(stage1)
-                if cfg.verify_supporting_coverage:
-                    ok, missing = check_supporting_sentence_coverage(sample, stage1)
-                    if not ok:
-                        raise ValueError(
-                            f"Stage1 coverage check failed for {sample_id}, missing supporting sentences: {missing}"
-                        )
-            except Exception as e:
-                raise SampleProcessingError("stage1_validation", sample_id, e) from e
-            save_cached_json(stage1_path, stage1)
-        else:
-            try:
-                stage1 = dedupe_stage1(stage1)
-                validate_stage1(stage1)
-            except Exception as e:
-                raise SampleProcessingError("stage1_validation", sample_id, e) from e
-    except SampleProcessingError:
-        raise
-
-    # ---------------- stage 2 ----------------
-    try:
-        stage2 = None if cfg.overwrite else load_cached_json(stage2_path)
-        if stage2 is None:
-            stage2_input = build_stage2_input(
-                sample,
-                stage1,
-            )
-            try:
-                stage2 = await client.create_structured_response(
-                    system_prompt=STAGE2_SYSTEM_PROMPT,
-                    user_payload=stage2_input,
-                    schema_name="stage2_triple_list",
-                    schema=STAGE2_SCHEMA,
-                    request_id=make_request_id("stage2", sample_id),
-                )
-            except Exception as e:
-                raise SampleProcessingError("stage2_api", sample_id, e) from e
-            try:
-                stage2 = normalize_stage2(stage2, verbose=verbose)
-                validate_stage2(stage2, verbose=verbose)
-            except Exception as e:
-                raise SampleProcessingError("stage2_validation", sample_id, e) from e
-            save_cached_json(stage2_path, stage2)
-        else:
-            try:
-                stage2 = normalize_stage2(stage2, verbose=verbose)
-                validate_stage2(stage2, verbose=verbose)
-            except Exception as e:
-                raise SampleProcessingError("stage2_validation", sample_id, e) from e
-
-        try:
-            final_sample = merge_stage2_into_sample(sample, stage2)
-            final_sample = normalize_final_sample_output(final_sample)
-        except Exception as e:
-            raise SampleProcessingError("finalization", sample_id, e) from e
-    except SampleProcessingError:
-        raise
-    return sample_id, final_sample, {"stage1": stage1, "stage2": stage2}
-
-
-# ============================================================
-# Runner
-# ============================================================
 
 
 @dataclass
@@ -1698,6 +1345,754 @@ async def queue_worker(
             queue.task_done()
 
 
+# ============================================================
+# V4.2 overrides: three-stage workflow
+# Stage 1: semantic fact extraction
+# Stage 2: triple normalization + forward KV only
+# Stage 3: reverse KV only
+# ============================================================
+
+STAGE2_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "_id": {"type": "string"},
+        "context": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "sentences": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "triple_list": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "type": {"type": "string", "enum": ["ATTRIBUTE", "RELATION"]},
+                                "name": {"type": "string"},
+                                "description_type": {"type": "string"},
+                                "description": {"type": "string"},
+                                "kv_lists": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "key_string": {"type": "string"},
+                                            "value_string": {"type": "string"},
+                                        },
+                                        "required": ["key_string", "value_string"],
+                                    },
+                                },
+                            },
+                            "required": [
+                                "type",
+                                "name",
+                                "description_type",
+                                "description",
+                                "kv_lists",
+                            ],
+                        },
+                    },
+                },
+                "required": ["title", "sentences", "triple_list"],
+            },
+        },
+    },
+    "required": ["_id", "context"],
+}
+
+STAGE3_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "_id": {"type": "string"},
+        "context": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "reverse_list": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "triple_id": {"type": "string"},
+                                "key_string": {"type": "string"},
+                                "value_string": {"type": "string"},
+                            },
+                            "required": ["triple_id", "key_string", "value_string"],
+                        },
+                    },
+                },
+                "required": ["title", "reverse_list"],
+            },
+        },
+    },
+    "required": ["_id", "context"],
+}
+
+STAGE2_SYSTEM_PROMPT = """You are a normalization engine for DAG-KV / KBLaM triple construction.
+
+Your task is to convert the provided stage-1 graph triples into dataset-compatible triples and generate ONLY the FORWARD KV for each triple.
+
+Primary goals:
+1. Preserve all valid stage-1 triples.
+2. Convert each stage-1 triple into exactly one dataset triple.
+3. Classify each triple as ATTRIBUTE or RELATION.
+4. Generate exactly one FORWARD KV per triple.
+
+============================================================
+I. TRIPLE SCHEMA
+============================================================
+
+Each triple must follow this schema:
+{
+  "type": "ATTRIBUTE" or "RELATION",
+  "name": "<subject entity>",
+  "description_type": "<relation or attribute label>",
+  "description": "<object entity or literal value>",
+  "kv_lists": [
+    {"key_string": "...", "value_string": "..."}
+  ]
+}
+
+============================================================
+II. ATTRIBUTE VS RELATION
+============================================================
+
+- Use ATTRIBUTE when the object is literal-like:
+  date, year, category, profession label, nickname, time span, quantity, short descriptive phrase, etc.
+- Use RELATION when the object is entity-like:
+  person, place, organization, work, event, species, group, or another graph node.
+- Use stage1.object_kind as the primary signal, but keep compatibility with the dataset style.
+
+============================================================
+III. NAMING RULES
+============================================================
+
+- Keep name exactly as the subject entity surface form.
+- Keep description exactly as the target object/value surface form.
+- Prefer short stable description_type values such as:
+  birth date, death date, release year, production location, nickname, occupation, nationality,
+  starring, directed by, based on, composed by, partnered with, located in, voice type, type.
+
+============================================================
+IV. FORWARD KV RULES
+============================================================
+
+For EACH triple, generate exactly ONE KV pair:
+- key_string = a natural semantic query or statement fragment anchored on name
+- value_string = description
+
+The forward key_string MUST:
+- preserve the subject anchor (the name, or a faithful surface form of it)
+- preserve the meaning of description_type
+- point from the subject toward the missing target phrase
+- be concise, stable, and retrieval-friendly
+- not invent information
+- not contain the full target phrase when avoidable
+
+GOOD EXAMPLE:
+name="Norway", description_type="population date", description="August 2018"
+[
+  {"key_string": "the population date of Norway is", "value_string": "August 2018"}
+]
+
+============================================================
+V. OUTPUT RULES
+============================================================
+
+- Return valid JSON only.
+- Follow the supplied schema exactly.
+- Do not include explanations.
+- Do not include markdown.
+- Do not drop stage-1 triples.
+- Do not merge different stage-1 triples.
+- Do not generate reverse KV in this stage.
+"""
+
+STAGE3_SYSTEM_PROMPT = """You are a reverse-KV generation engine for DAG-KV / KBLaM triple construction.
+
+Your task is to generate ONLY the REVERSE KV for each provided triple.
+
+You are given:
+- triple_id
+- type
+- name
+- description_type
+- description
+- the already generated forward KV
+
+Your output must contain exactly one reverse KV per input triple.
+
+============================================================
+I. OUTPUT FORMAT
+============================================================
+
+For each page, output:
+{
+  "title": "<page title>",
+  "reverse_list": [
+    {
+      "triple_id": "<copy exactly from input>",
+      "key_string": "...",
+      "value_string": "..."
+    }
+  ]
+}
+
+============================================================
+II. REVERSE KV RULES
+============================================================
+
+For each triple:
+- key_string MUST be a natural semantic query or statement fragment anchored on description
+- value_string MUST equal name exactly
+
+The reverse key_string MUST:
+- preserve the object/value anchor (the description, or a faithful surface form of it)
+- preserve the meaning of description_type
+- point from the object/value toward the missing subject phrase
+- be logically equivalent to the provided triple
+- be concise, stable, and retrieval-friendly
+- not invent information
+- not contain the full subject phrase when avoidable
+
+CRITICAL HARD CONSTRAINTS:
+- Copy triple_id exactly.
+- value_string MUST equal name exactly.
+- Generate reverse KV only. Do not output forward KV.
+
+BAD EXAMPLE:
+name="Norway", description_type="population date", description="August 2018"
+{"triple_id": "T00001", "key_string": "the population date of Norway is", "value_string": "August 2018"}
+This is wrong because it is forward.
+
+GOOD EXAMPLE:
+{"triple_id": "T00001", "key_string": "the country whose population date is August 2018 is", "value_string": "Norway"}
+
+============================================================
+III. OUTPUT RULES
+============================================================
+
+- Return valid JSON only.
+- Follow the supplied schema exactly.
+- Do not include explanations.
+- Do not include markdown.
+- Do not drop items.
+- Do not reorder or change triple_id.
+"""
+
+
+def _triple_sig(tri: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    return (
+        norm_text(tri.get("type", "")),
+        norm_text(tri.get("name", "")),
+        norm_text(tri.get("description_type", "")),
+        norm_text(tri.get("description", "")),
+    )
+
+
+def _repair_single_kv(tri: Dict[str, Any], kv: Dict[str, str]) -> Dict[str, str]:
+    tmp = {
+        "name": norm_text(tri.get("name", "")),
+        "description": norm_text(tri.get("description", "")),
+        "kv_lists": [
+            {
+                "key_string": norm_text(kv.get("key_string", "")),
+                "value_string": norm_text(kv.get("value_string", "")),
+            }
+        ],
+    }
+    tmp = postprocess_triple_kv_lists(tmp)
+    if tmp.get("kv_lists"):
+        return tmp["kv_lists"][0]
+    return {
+        "key_string": norm_text(kv.get("key_string", "")),
+        "value_string": norm_text(kv.get("value_string", "")),
+    }
+
+
+def _choose_forward_kv(
+    *,
+    tri: Dict[str, Any],
+    kvs: List[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    description = norm_text(tri.get("description", ""))
+    name = norm_text(tri.get("name", ""))
+    cleaned = []
+    for kv in kvs:
+        key_string = norm_text(kv.get("key_string", ""))
+        value_string = norm_text(kv.get("value_string", ""))
+        if key_string and value_string:
+            cleaned.append({"key_string": key_string, "value_string": value_string})
+    if not cleaned:
+        return None
+
+    preferred = [kv for kv in cleaned if kv["value_string"] == description and has_anchor_in_key(kv["key_string"], name)]
+    if preferred:
+        return _repair_single_kv(tri, preferred[0])
+
+    preferred = [kv for kv in cleaned if kv["value_string"] == description]
+    if preferred:
+        return _repair_single_kv(tri, preferred[0])
+
+    return _repair_single_kv(tri, cleaned[0])
+
+
+def normalize_stage2_forward(stage2: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
+    out = {"_id": norm_text(stage2.get("_id", "")), "context": []}
+    triple_counter = 1
+
+    for para in stage2.get("context", []) or []:
+        triples = []
+        seen = set()
+        for tri in para.get("triple_list", []) or []:
+            tri2 = {
+                "triple_id": "",
+                "type": norm_text(tri.get("type", "")),
+                "name": norm_text(tri.get("name", "")),
+                "description_type": norm_text(tri.get("description_type", "")),
+                "description": norm_text(tri.get("description", "")),
+                "kv_lists": [],
+            }
+
+            candidate_kvs = []
+            for kv in tri.get("kv_lists", []) or []:
+                key_string = norm_text(kv.get("key_string", ""))
+                value_string = norm_text(kv.get("value_string", ""))
+                if key_string and value_string:
+                    candidate_kvs.append({
+                        "key_string": key_string,
+                        "value_string": value_string,
+                    })
+
+            chosen_forward = _choose_forward_kv(tri=tri2, kvs=candidate_kvs)
+            if chosen_forward is not None:
+                tri2["kv_lists"] = [chosen_forward]
+
+            sig = _triple_sig(tri2)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            tri2["triple_id"] = norm_text(tri.get("triple_id", "")) or f"T{triple_counter:05d}"
+            triple_counter += 1
+            if verbose:
+                print(f"[stage2] {tri2}")
+            triples.append(tri2)
+
+        out["context"].append(
+            {
+                "title": norm_text(para.get("title", "")),
+                "sentences": [norm_text(x) for x in (para.get("sentences", []) or [])],
+                "triple_list": triples,
+            }
+        )
+    return out
+
+
+def build_stage3_input(stage2: Dict[str, Any]) -> Dict[str, Any]:
+    pages: List[Dict[str, Any]] = []
+    for para in stage2.get("context", []) or []:
+        triples = []
+        for tri in para.get("triple_list", []) or []:
+            kvs = tri.get("kv_lists", []) or []
+            forward_kv = kvs[0] if kvs else {"key_string": "", "value_string": ""}
+            triples.append(
+                {
+                    "triple_id": norm_text(tri.get("triple_id", "")),
+                    "type": norm_text(tri.get("type", "")),
+                    "name": norm_text(tri.get("name", "")),
+                    "description_type": norm_text(tri.get("description_type", "")),
+                    "description": norm_text(tri.get("description", "")),
+                    "forward_kv": {
+                        "key_string": norm_text(forward_kv.get("key_string", "")),
+                        "value_string": norm_text(forward_kv.get("value_string", "")),
+                    },
+                }
+            )
+        pages.append(
+            {
+                "title": norm_text(para.get("title", "")),
+                "sentences": [norm_text(x) for x in (para.get("sentences", []) or [])],
+                "triples": triples,
+            }
+        )
+    return {
+        "_id": norm_text(stage2.get("_id", "")),
+        "pages": pages,
+    }
+
+
+def build_empty_stage3_from_stage2(stage2: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "_id": norm_text(stage2.get("_id", "")),
+        "context": [
+            {
+                "title": norm_text(para.get("title", "")),
+                "reverse_list": [],
+            }
+            for para in (stage2.get("context", []) or [])
+        ],
+    }
+
+
+def normalize_stage3_reverse(stage3: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
+    out = {"_id": norm_text(stage3.get("_id", "")), "context": []}
+    for para in stage3.get("context", []) or []:
+        reverse_list = []
+        seen_ids = set()
+        for item in para.get("reverse_list", []) or []:
+            triple_id = norm_text(item.get("triple_id", ""))
+            key_string = norm_text(item.get("key_string", ""))
+            value_string = norm_text(item.get("value_string", ""))
+            if not triple_id or not key_string or not value_string:
+                continue
+            if triple_id in seen_ids:
+                continue
+            seen_ids.add(triple_id)
+            reverse_item = {
+                "triple_id": triple_id,
+                "key_string": key_string,
+                "value_string": value_string,
+            }
+            if verbose:
+                print(f"[stage3] {reverse_item}")
+            reverse_list.append(reverse_item)
+        out["context"].append(
+            {
+                "title": norm_text(para.get("title", "")),
+                "reverse_list": reverse_list,
+            }
+        )
+    return out
+
+
+def validate_triple_core(tri: Dict[str, Any]) -> None:
+    if not isinstance(tri, dict):
+        raise ValueError("triple must be object")
+    if tri.get("type") not in {"ATTRIBUTE", "RELATION"}:
+        raise ValueError("triple.type invalid")
+    for k in ["name", "description_type", "description"]:
+        if not isinstance(tri.get(k), str) or not tri[k].strip():
+            raise ValueError(f"triple.{k} invalid")
+
+
+def validate_forward_kv_only(tri: Dict[str, Any]) -> None:
+    validate_triple_core(tri)
+    kvs = tri.get("kv_lists")
+    if not isinstance(kvs, list) or len(kvs) != 1:
+        raise ValueError("forward triple.kv_lists must contain exactly 1 item")
+    kv = kvs[0]
+    key_string = norm_text(kv.get("key_string", ""))
+    value_string = norm_text(kv.get("value_string", ""))
+    name = norm_text(tri.get("name", ""))
+    description = norm_text(tri.get("description", ""))
+    if not key_string or not value_string:
+        raise ValueError("forward kv missing key/value")
+    if value_string != description:
+        raise ValueError(
+            f"forward kv value_string must equal description: expected={description!r} got={value_string!r}"
+        )
+    if not has_anchor_in_key(key_string, name):
+        raise ValueError(
+            f"forward key_string missing subject anchor: key={key_string!r}, name={name!r}, description={description!r}"
+        )
+    if normalize_anchor_text(name) != normalize_anchor_text(description) and has_full_anchor_leak(key_string, description):
+        raise ValueError(
+            f"forward key_string leaks target description into key: key={key_string!r}, name={name!r}, description={description!r}"
+        )
+
+
+def validate_reverse_item_against_triple(item: Dict[str, Any], tri: Dict[str, Any]) -> None:
+    triple_id = norm_text(item.get("triple_id", ""))
+    key_string = norm_text(item.get("key_string", ""))
+    value_string = norm_text(item.get("value_string", ""))
+    name = norm_text(tri.get("name", ""))
+    description = norm_text(tri.get("description", ""))
+    if not triple_id:
+        raise ValueError("reverse item triple_id invalid")
+    if not key_string or not value_string:
+        raise ValueError("reverse item key/value invalid")
+    if value_string != name:
+        raise ValueError(
+            f"reverse kv value_string must equal name: triple_id={triple_id} expected={name!r} got={value_string!r}"
+        )
+    if not has_anchor_in_key(key_string, description):
+        raise ValueError(
+            f"reverse key_string missing object/value anchor: key={key_string!r}, name={name!r}, description={description!r}"
+        )
+    if normalize_anchor_text(name) != normalize_anchor_text(description) and has_full_anchor_leak(key_string, name):
+        raise ValueError(
+            f"reverse key_string leaks target name into key: key={key_string!r}, name={name!r}, description={description!r}"
+        )
+
+
+def validate_stage2(stage2: Dict[str, Any], verbose: bool = False) -> None:
+    if not isinstance(stage2, dict):
+        raise ValueError("stage2 must be a dict")
+    if not isinstance(stage2.get("_id"), str):
+        raise ValueError("stage2._id missing or invalid")
+    if not isinstance(stage2.get("context"), list):
+        raise ValueError("stage2.context missing or invalid")
+
+    seen_triple_ids = set()
+    for para in stage2["context"]:
+        if not isinstance(para, dict):
+            raise ValueError("stage2 context item must be object")
+        if not isinstance(para.get("title"), str):
+            raise ValueError("stage2 context.title invalid")
+        if not isinstance(para.get("sentences"), list):
+            raise ValueError("stage2 context.sentences invalid")
+        if not isinstance(para.get("triple_list"), list):
+            raise ValueError("stage2 context.triple_list invalid")
+        for tri in para["triple_list"]:
+            triple_id = norm_text(tri.get("triple_id", ""))
+            if not triple_id:
+                raise ValueError("stage2 triple_id invalid")
+            if triple_id in seen_triple_ids:
+                raise ValueError(f"duplicate stage2 triple_id: {triple_id}")
+            seen_triple_ids.add(triple_id)
+            validate_forward_kv_only(tri)
+
+
+def validate_stage3(stage2: Dict[str, Any], stage3: Dict[str, Any], verbose: bool = False) -> None:
+    if not isinstance(stage3, dict):
+        raise ValueError("stage3 must be a dict")
+    if norm_text(stage3.get("_id", "")) != norm_text(stage2.get("_id", "")):
+        raise ValueError("stage3._id does not match stage2._id")
+    if not isinstance(stage3.get("context"), list):
+        raise ValueError("stage3.context missing or invalid")
+
+    stage2_by_title = {norm_text(p.get("title", "")): p for p in (stage2.get("context", []) or [])}
+    stage3_by_title = {norm_text(p.get("title", "")): p for p in (stage3.get("context", []) or [])}
+
+    if set(stage3_by_title.keys()) != set(stage2_by_title.keys()):
+        raise ValueError(
+            f"stage3 titles do not match stage2 titles: stage2={sorted(stage2_by_title)} stage3={sorted(stage3_by_title)}"
+        )
+
+    for title, para2 in stage2_by_title.items():
+        para3 = stage3_by_title[title]
+        reverse_items = para3.get("reverse_list")
+        if not isinstance(reverse_items, list):
+            raise ValueError(f"stage3 reverse_list invalid for title={title!r}")
+        reverse_by_id = {}
+        for item in reverse_items:
+            if not isinstance(item, dict):
+                raise ValueError("stage3 reverse item must be object")
+            triple_id = norm_text(item.get("triple_id", ""))
+            if not triple_id:
+                raise ValueError("stage3 reverse triple_id invalid")
+            if triple_id in reverse_by_id:
+                raise ValueError(f"duplicate stage3 triple_id in title={title!r}: {triple_id}")
+            reverse_by_id[triple_id] = item
+
+        expected_ids = [norm_text(t.get("triple_id", "")) for t in (para2.get("triple_list", []) or [])]
+        if set(reverse_by_id.keys()) != set(expected_ids):
+            raise ValueError(
+                f"stage3 reverse triple_id set mismatch for title={title!r}: expected={sorted(expected_ids)} got={sorted(reverse_by_id)}"
+            )
+        for tri in para2.get("triple_list", []) or []:
+            validate_reverse_item_against_triple(reverse_by_id[tri["triple_id"]], tri)
+
+
+def validate_final_stage(stage_final: Dict[str, Any], verbose: bool = False) -> None:
+    if verbose:
+        return
+    if not isinstance(stage_final, dict):
+        raise ValueError("final stage must be a dict")
+    if not isinstance(stage_final.get("_id"), str):
+        raise ValueError("final._id missing or invalid")
+    if not isinstance(stage_final.get("context"), list):
+        raise ValueError("final.context missing or invalid")
+    for para in stage_final["context"]:
+        if not isinstance(para, dict):
+            raise ValueError("final context item must be object")
+        if not isinstance(para.get("title"), str):
+            raise ValueError("final context.title invalid")
+        if not isinstance(para.get("sentences"), list):
+            raise ValueError("final context.sentences invalid")
+        if not isinstance(para.get("triple_list"), list):
+            raise ValueError("final context.triple_list invalid")
+        for tri in para["triple_list"]:
+            validate_triple(tri)
+            validate_kv_anchor_and_value(tri)
+
+
+def merge_stage2_and_stage3(stage2: Dict[str, Any], stage3: Dict[str, Any]) -> Dict[str, Any]:
+    stage3_by_title = {
+        norm_text(para.get("title", "")): {
+            norm_text(item.get("triple_id", "")): item
+            for item in (para.get("reverse_list", []) or [])
+        }
+        for para in (stage3.get("context", []) or [])
+    }
+
+    out = {"_id": norm_text(stage2.get("_id", "")), "context": []}
+    for para in stage2.get("context", []) or []:
+        title = norm_text(para.get("title", ""))
+        reverse_by_id = stage3_by_title.get(title, {})
+        final_triples = []
+        for tri in para.get("triple_list", []) or []:
+            forward_kv = (tri.get("kv_lists", []) or [{}])[0]
+            reverse_item = reverse_by_id.get(norm_text(tri.get("triple_id", "")), {})
+            reverse_kv = _repair_single_kv(
+                tri,
+                {
+                    "key_string": norm_text(reverse_item.get("key_string", "")),
+                    "value_string": norm_text(reverse_item.get("value_string", "")),
+                },
+            )
+            final_triples.append(
+                {
+                    "type": norm_text(tri.get("type", "")),
+                    "name": norm_text(tri.get("name", "")),
+                    "description_type": norm_text(tri.get("description_type", "")),
+                    "description": norm_text(tri.get("description", "")),
+                    "kv_lists": [
+                        {
+                            "key_string": norm_text(forward_kv.get("key_string", "")),
+                            "value_string": norm_text(forward_kv.get("value_string", "")),
+                        },
+                        reverse_kv,
+                    ],
+                }
+            )
+        out["context"].append(
+            {
+                "title": title,
+                "sentences": [norm_text(x) for x in (para.get("sentences", []) or [])],
+                "triple_list": final_triples,
+            }
+        )
+    return out
+
+
+@dataclass
+class WorkerConfig:
+    include_question: bool
+    include_answer: bool
+    answer_aware: bool
+    supporting_pages_only: bool
+    verify_supporting_coverage: bool
+    overwrite: bool
+    verbose: bool = False
+
+
+async def process_one_sample(
+    *,
+    idx: int,
+    sample: Dict[str, Any],
+    client: OpenAIResponsesClient,
+    cfg: WorkerConfig,
+    verbose: bool = False,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    sample_id = safe_sample_id(sample, idx)
+    sample["_id"] = sample_id
+    # if verbose:
+    #     print(f"[sample] {sample}")
+
+    # ---------------- stage 1 ----------------
+    stage1_input = build_stage1_input(
+        sample,
+        include_question=cfg.include_question,
+        include_answer=cfg.include_answer,
+        supporting_pages_only=cfg.supporting_pages_only,
+    )
+    if verbose:
+        print(f"[stage1_input] {stage1_input}")
+    stage1_system_prompt = get_stage1_system_prompt(
+        answer_aware=cfg.answer_aware,
+        include_answer=cfg.include_answer,
+        sample=sample,
+    )
+    try:
+        stage1 = await client.create_structured_response(
+            system_prompt=stage1_system_prompt,
+            user_payload=stage1_input,
+            schema_name="stage1_graph_triples",
+            schema=STAGE1_SCHEMA,
+            request_id=make_request_id("stage1", sample_id),
+        )
+    except Exception as e:
+        raise SampleProcessingError("stage1_api", sample_id, e) from e
+    try:
+        stage1 = dedupe_stage1(stage1)
+        if verbose:
+            print(f"[stage1] {stage1}")
+        validate_stage1(stage1)
+        if cfg.verify_supporting_coverage:
+            ok, missing = check_supporting_sentence_coverage(sample, stage1)
+            if not ok:
+                raise ValueError(
+                    f"Stage1 coverage check failed for {sample_id}, missing supporting sentences: {missing}"
+                )
+    except Exception as e:
+        raise SampleProcessingError("stage1_validation", sample_id, e) from e
+
+    # ---------------- stage 2: forward only ----------------
+    stage2_input = build_stage2_input(sample, stage1)
+    try:
+        stage2 = await client.create_structured_response(
+            system_prompt=STAGE2_SYSTEM_PROMPT,
+            user_payload=stage2_input,
+            schema_name="stage2_forward_triple_list",
+            schema=STAGE2_SCHEMA,
+            request_id=make_request_id("stage2", sample_id),
+        )
+    except Exception as e:
+        raise SampleProcessingError("stage2_api", sample_id, e) from e
+    try:
+        stage2 = normalize_stage2_forward(stage2, verbose=verbose)
+        validate_stage2(stage2, verbose=verbose)
+    except Exception as e:
+        raise SampleProcessingError("stage2_validation", sample_id, e) from e
+
+    # ---------------- stage 3: reverse only ----------------
+    if sum(len(p.get("triple_list", []) or []) for p in (stage2.get("context", []) or [])) == 0:
+        stage3 = build_empty_stage3_from_stage2(stage2)
+    else:
+        stage3_input = build_stage3_input(stage2)
+        try:
+            stage3 = await client.create_structured_response(
+                system_prompt=STAGE3_SYSTEM_PROMPT,
+                user_payload=stage3_input,
+                schema_name="stage3_reverse_kv_list",
+                schema=STAGE3_SCHEMA,
+                request_id=make_request_id("stage3", sample_id),
+            )
+        except Exception as e:
+            raise SampleProcessingError("stage3_api", sample_id, e) from e
+    try:
+        stage3 = normalize_stage3_reverse(stage3, verbose=verbose)
+        validate_stage3(stage2, stage3, verbose=verbose)
+    except Exception as e:
+        raise SampleProcessingError("stage3_validation", sample_id, e) from e
+
+    try:
+        stage_final = merge_stage2_and_stage3(stage2, stage3)
+        validate_final_stage(stage_final, verbose=verbose)
+        final_sample = merge_stage2_into_sample(sample, stage_final)
+        final_sample = normalize_final_sample_output(final_sample)
+    except Exception as e:
+        raise SampleProcessingError("finalization", sample_id, e) from e
+
+    return sample_id, final_sample, {"stage1": stage1, "stage2": stage2, "stage3": stage3}
+
+
 async def main_async(args: argparse.Namespace) -> None:
     api_key = os.environ.get(args.api_key_env, "").strip()
     if not api_key and args.api_key_env != "OFOXAI_API_KEY":
@@ -1708,26 +2103,29 @@ async def main_async(args: argparse.Namespace) -> None:
             " Set it directly, or export OFOXAI_API_KEY for OfoxAI."
         )
 
-    ensure_dir(args.stage1_cache_dir)
-    ensure_dir(args.stage2_cache_dir)
     ensure_dir(os.path.dirname(args.output) or ".")
     if args.error_log:
         ensure_dir(os.path.dirname(args.error_log) or ".")
 
     samples = read_json_or_jsonl(args.input)
+    print(f"Load {len(samples)} samples from {args.input}")
+    # 过滤掉无法answer的样本
+    samples = [s for s in samples if s.get("answerable", True) is not False]
+    print(f"Filter {len(samples)} samples after answerable check")
+
+    # 过滤掉comparison样本
+    if args.skip_comparison:
+        samples = [s for s in samples if s.get("type", "") != "comparison"]
+        print(f"Filter {len(samples)} samples after comparison check")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        random.shuffle(samples)
+
     if args.limit is not None and args.limit > 0:
         samples = samples[: args.limit]
+    print(f"Process {len(samples)} samples")
 
-    if args.skip_comparison:
-        new_samples = []
-        for s in samples:
-            if s.get("type")=="comparison":
-                continue
-            else:
-                new_samples.append(s)
-        samples = new_samples
-
-    print(f"Process loaded {len(samples)} samples from {args.input}")
     existing_ids = set()
     if args.resume and not args.overwrite:
         existing_ids = load_existing_output_ids(args.output)
@@ -1749,8 +2147,6 @@ async def main_async(args: argparse.Namespace) -> None:
         include_answer=not args.no_answer,
         answer_aware=args.answer_aware,
         supporting_pages_only=not args.use_all_context_pages,
-        stage1_cache_dir=args.stage1_cache_dir,
-        stage2_cache_dir=args.stage2_cache_dir,
         verify_supporting_coverage=not args.skip_supporting_coverage_check,
         overwrite=args.overwrite,
         verbose=args.verbose,
@@ -1774,13 +2170,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 skipped_no_support += 1
                 continue
             total += 1
-            await queue.put(
-                QueueItem(
-                    idx=idx,
-                    sample=sample,
-                    sample_id=sample_id,
-                )
-            )
+            await queue.put(QueueItem(idx=idx, sample=sample, sample_id=sample_id))
 
         print(
             f"[{now_ts()}] Loaded {len(samples)} samples; pending={total}; "
@@ -1825,21 +2215,14 @@ async def main_async(args: argparse.Namespace) -> None:
 
         print(
             f"[{now_ts()}] DONE total={total} ok={stats['ok']} err={stats['err']} "
-            f"retried={stats['retried']} dropped={stats['dropped']} "
-            f"skipped_existing={skipped_existing} skipped_no_support={skipped_no_support} "
-            f"failures={dict(sorted(failure_stats.items()))}"
+            f"retried={stats['retried']} dropped={stats['dropped']} failures={dict(sorted(failure_stats.items()))}"
         )
     finally:
         await client.aclose()
 
 
-# ============================================================
-# CLI
-# ============================================================
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Two-stage async KG extraction with OpenAI-compatible APIs")
+    ap = argparse.ArgumentParser(description="Three-stage graph-first KG extraction with OpenAI-compatible APIs")
     ap.add_argument("--input", type=str, required=True, help="Input .json or .jsonl file")
     ap.add_argument("--output", type=str, required=True, help="Output .jsonl file")
     ap.add_argument("--model", type=str, default="openai/gpt-5.2", help="Model id, e.g. openai/gpt-5.2 or anthropic/claude-sonnet-4")
@@ -1877,8 +2260,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbosity", type=str, default="low", choices=["low", "medium", "high"])
     ap.add_argument("--no-store", action="store_true", help="Set store=false on Responses API")
 
-    ap.add_argument("--stage1-cache-dir", type=str, default="./cache_stage1")
-    ap.add_argument("--stage2-cache-dir", type=str, default="./cache_stage2")
     ap.add_argument("--resume", action="store_true", help="Skip samples already present in output jsonl")
     ap.add_argument("--overwrite", action="store_true", help="Ignore caches and recompute")
     ap.add_argument("--error-log", type=str, default="./kg_extract_errors.log")
@@ -1892,6 +2273,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip-supporting-coverage-check", action="store_true", help="Skip local check that each supporting sentence is covered by stage1 evidence")
     ap.add_argument("--skip-comparison", action="store_true", help="Add SKTP comparison description type to stage2 style hints")
     ap.add_argument("--verbose", action="store_true", help="Print verbose output")
+    ap.add_argument("--seed", type=int, default=None, help="Random seed for shuffling samples")
 
     return ap
 

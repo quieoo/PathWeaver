@@ -4388,7 +4388,7 @@ python experiments/eval_generation.py generation \
 
 2. 重新生成三元组-DAGRetriever-dag图
 
-## 调整kb_scale_factor重新训练(5.2.4)
+## 调整kb_scale_factor重新训练(5.2.4✅️)
 
 - 增加训练时候的kb_scale_factor到5
 - 验证也到5
@@ -4420,5 +4420,36 @@ nohup python experiments/train.py \
   --eval_step 100 \
   --total_steps 8000 --N 9999999 \
   --model_save_dir experiments/train/dag_kv_hotpot_v5.2.4 --save_period 100 --keep_top_k_ckpt 5  > experiments/train/dag_kv_hotpot_v5.2.4/training_log.txt  2>&1 &
+
+````
+
+## 关闭seperate_query_head (5.2.5)
+
+````bash
+export CUDA_VISIBLE_DEVICES=2
+nohup python experiments/train.py \
+  --seed 1 --B 3  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --kb_scale_factor 5 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_polished1.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_polished1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_polished1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /home/sdu/zhu/models/llama3_8B_instruct/ --llm_type llama3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 5 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_hotpot_v5.2.5 --save_period 100 --keep_top_k_ckpt 5  > experiments/train/dag_kv_hotpot_v5.2.5/training_log.txt  2>&1 &
 
 ````

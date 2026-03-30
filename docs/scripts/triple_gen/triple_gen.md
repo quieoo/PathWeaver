@@ -419,6 +419,24 @@ nohup vllm serve models/qwen3.5-27B \
   --default-chat-template-kwargs '{"enable_thinking": false}'  \
   --trust-remote-code > Qwen3.5-27B.log 2>&1 &
 
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B \
+  --served-model-name Qwen2.5-72B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B.log 2>&1 &
+
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 vllm serve models/qwen2.5-72B \
+  --served-model-name Qwen2.5-72B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code
 
 curl http://10.102.34.67:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -457,7 +475,128 @@ python build_knowledge_graph_v4.1.py \
   --skip-comparison \
   --resume \
   --overwrite \
-  --limit 4
+  --sample-retries 0 \
+  --limit 2
 
+python build_knowledge_graph_v4.2.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --answer-aware \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.2-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --limit 1 --verbose --seed 42
+
+
+python build_knowledge_graph_v4.3.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.3-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 42
+
+````
+
+## 多阶段生成（v4.4）
+更弱的模型，更复杂的数据集
+4阶段：
+- 1. 尽可能全的抽取实体和三元组
+- 2. 根据问题和答案修正（answer-aware）
+- 3. 抽取正向KV
+- 4. 抽取反向KV
+
+````bash
+python build_knowledge_graph_v4.4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 42
+
+python build_knowledge_graph_v4.4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 42
+
+
+python build_knowledge_graph_v4.4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 8 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 42
+
+# production
+
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen3.5-27B \
+  --served-model-name Qwen3.5-27B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 8 \
+  --max-model-len 16384  \
+  --gpu-memory-utilization 0.9 \
+  --max-num-seqs 2048 \
+  --disable-log-stats \
+  --kv-cache-dtype auto \
+  --reasoning-parser qwen3 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}'  \
+  --trust-remote-code > Qwen3.5-27B.log 2>&1 &
+
+nohup python build_knowledge_graph_v4.4.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen3.5_27B.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 2 \
+  --answer-aware > build_knowledge_graph_v4.4.log 2>&1 &
 
 ````

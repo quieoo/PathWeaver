@@ -1,0 +1,335 @@
+{
+    "id": "3hop1__288125_233976_24199",
+    "question": "What kind of route do buses use for service in the neighboring place of Al Herman's place of birth?",
+    "question_decomposition": [
+        {
+            "id": 288125,
+            "question": "Al Herman >> place of death",
+            "answer": "West Haven",
+            "paragraph_support_idx": 12
+        },
+        {
+            "id": 233976,
+            "question": "#1 >> shares border with",
+            "answer": "New Haven",
+            "paragraph_support_idx": 4
+        },
+        {
+            "id": 24199,
+            "question": "Buses in #2 uses what kind of route for their service?",
+            "answer": "trolley",
+            "paragraph_support_idx": 13
+        }
+    ],
+    "answer": "trolley",
+    "answer_aliases": [
+        "Trolley"
+    ],
+    "answerable": true,
+    "_id": "3hop1__288125_233976_24199",
+    "context": [
+        {
+            "title": "Arizona State Route 189",
+            "sentences": [
+                "State Route 189 (SR 189) is a highway in Santa Cruz County, Arizona that runs from its junction with Interstate 19 to the US-Mexico Border. It is a north–south route for its entirety."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Cork (city)",
+            "sentences": [
+                "Public bus services within the city are provided by the national bus operator Bus Éireann. City routes are numbered from 201 through to 219 and connect the city centre to the principal suburbs, colleges, shopping centres and places of interest. Two of these bus routes provide orbital services across the Northern and Southern districts of the city respectively. Buses to the outer suburbs, such as Ballincollig, Glanmire, Midleton and Carrigaline are provided from the city's bus terminal at Parnell Place in the city centre. Suburban services also include shuttles to Cork Airport, and a park and ride facility in the south suburbs only."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Salzwedel station",
+            "sentences": [
+                "Salzwedel station was built in 1870 during the construction of the Stendal–Uelzen railway (part of the America Line from Berlin to Bremen and Bremerhaven) by the Magdeburg-Halberstadt Railway Company. Railways formerly ran in seven directions from Salzwedel station or Salzwedel Neustadt station (which lay to the immediate east), as the table below shows. A locomotive depot (Bahnbetriebswerk) was built directly next to it in order to service these routes. During the Second World War, the station area was destroyed in an air raid on 22 February 1945, which caused about 300 deaths. Of the seven lines, only the Stendal–Uelzen railway remain. During the division of Germany the line was cut at the border, but continuous operations were restored on 19 December 1999. It has been extensively modernised since reunification and electrified so that it can be used an alternative route for Intercity-Express train from Berlin to Hamburg."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Year of the Cat (song)",
+            "sentences": [
+                "``Year of the Cat ''Single by Al Stewart from the album Year of the Cat B - side`` Broadway Hotel'' Released July 1976 (1976 - 07) (UK) October 1976 (US) Recorded Abbey Road Studios, London, England, January 1976 Genre Soft rock progressive pop Length 6: 40 (album) 4: 38 (single) Label RCA (UK) Janus (US) Songwriter (s) Al Stewart, Peter Wood Producer (s) Alan Parsons Al Stewart singles chronology ``Carol ''(1975)`` Year of the Cat'' (1976) ``On the Border ''(1977)`` Carol'' (1975) ``Year of the Cat ''(1976)`` On the Border'' (1977) Audio sample file help"
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Notre Dame High School (West Haven, Connecticut)",
+            "sentences": [
+                "Notre Dame High School (NDWH) is a private, Roman Catholic, all-male college preparatory school located in West Haven, Connecticut, a coastal suburb of New Haven, Connecticut."
+            ],
+            "triple_list": [
+                {
+                    "type": "RELATION",
+                    "name": "Notre Dame High School (West Haven, Connecticut)",
+                    "description_type": "located in",
+                    "description": "West Haven, Connecticut",
+                    "kv_lists": [
+                        {
+                            "key_string": "Notre Dame High School (West Haven, Connecticut) is located in",
+                            "value_string": "West Haven, Connecticut"
+                        },
+                        {
+                            "key_string": "the private, Roman Catholic, all-male college preparatory school located in West Haven, Connecticut is",
+                            "value_string": "Notre Dame High School (West Haven, Connecticut)"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "West Haven, Connecticut",
+                    "description_type": "suburb of",
+                    "description": "New Haven, Connecticut",
+                    "kv_lists": [
+                        {
+                            "key_string": "West Haven, Connecticut is a suburb of",
+                            "value_string": "New Haven, Connecticut"
+                        },
+                        {
+                            "key_string": "the coastal suburb of New Haven, Connecticut is",
+                            "value_string": "West Haven, Connecticut"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Ilm (Arabic)",
+            "sentences": [
+                "In the Qur'an the word 'alim has occurred in 140 places, while al -' ilm in 27. In all, the total number of verses in which 'ilm or its derivatives and associated words are used is 704. The aids of knowledge such as book, pen, ink etc. amount to almost the same number. Qalam occurs in two places, al - kitab in 230 verses, among which al - kitab for al - Qur'an occurs in 81 verses. Other words associated with writing occur in 319 verses."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Umm Al Sheif",
+            "sentences": [
+                "Umm Al Sheif () is a locality in Dubai, United Arab Emirates (UAE). Umm Al Sheif is a small, residential locality in western Dubai. It is bordered to the north by Umm Suqeim, the northeast by Al Manara, the south by Al Barsha and Al Quoz and the west by Al Sufouh. It is bounded to the north by route D 92 (Al Wasl Road) and to the south by route E 11 (Sheikh Zayed Road). A local road (Al Thaniya Road) separates Umm Al Sheif from Al Manara."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Ummah",
+            "sentences": [
+                "It is a synonym for ummat al - Islamiyah (Arabic: الأمة الإسلامية ‎) (the Islamic Community), and it is commonly used to mean the collective community of Islamic peoples. In the Quran the ummah typically refers to a single group that shares common religious beliefs, specifically those that are the objects of a divine plan of salvation. In the context of Pan-Islamism and politics, the word Ummah can be used to mean the concept of a Commonwealth of the Believers (أمة المؤمنين ummat al - mu'minīn)."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "United Arab Emirates",
+            "sentences": [
+                "The United Arab Emirates (UAE; Arabic: دولة الإمارات العربية المتحدة ‎ Dawlat al - Imārāt al - 'Arabīyah al - Muttaḥidah), sometimes simply called the Emirates (Arabic: الإمارات ‎ al - Imārāt), is a federal sovereign absolute monarchy in Western Asia at the southeast end of the Arabian Peninsula on the Persian Gulf, bordering Oman to the east and Saudi Arabia to the south, as well as sharing maritime borders with Qatar to the west and Iran to the north. The country is a federation of seven emirates consisting of Abu Dhabi (which serves as the capital), Ajman, Dubai, Fujairah, Ras al - Khaimah, Sharjah and Umm al - Quwain. Each emirate is governed by a Ruler; together, they jointly form the Federal Supreme Council. One of the rulers serves as the President of the United Arab Emirates. In 2013, the UAE's population was 9.2 million, of which 1.4 million are Emirati citizens and 7.8 million are expatriates."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Dwight D. Eisenhower",
+            "sentences": [
+                "That evening, Eisenhower's body was placed onto a train en route to Abilene, Kansas, the last time a funeral train has been used as part of funeral proceedings of an American president. His body arrived on April 2, and was interred later that day in a small chapel on the grounds of the Eisenhower Presidential Library. The president's body was buried as a General of the Army. The family used an $80 standard soldier's casket, and dressed Eisenhower's body in his famous short green jacket. His only medals worn were: the Army Distinguished Service Medal with three oak leaf clusters, the Navy Distinguished Service Medal, and the Legion of Merit. Eisenhower is buried alongside his son Doud, who died at age 3 in 1921. His wife Mamie was buried next to him after her death in 1979."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Brickett Place",
+            "sentences": [
+                "The Brickett Place is a historic farmstead in rural Oxford County, Maine, United States. It is located in the White Mountain National Forest on Maine State Route 113, in the small town of Stow. Built from 1812 to 1816 by John Brickett out of handmade bricks, it is an idiosyncratic expression of Federal architecture in an unusually remote setting, and is the oldest building in the United States Forest Service's Eastern Region. It was listed on the National Register of Historic Places in 1982. It is currently used by the United States Forest Service as a seasonal visitors center, with interpretive displays about the area's history."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Mingaladon Township",
+            "sentences": [
+                "Mingaladon Township ( ) is located in the northernmost part of Yangon, Myanmar. The township comprises 31 wards, and shares borders with Hmawbi Township in the north, North Okkalapa Township in the east, Insein Township and Shwepyitha Township in the west, and Mayangon Township in the south. Mingaladon is still relatively undeveloped and lacks basic municipal services."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Al Herman",
+            "sentences": [
+                "Born in Topton, Pennsylvania, Herman died in West Haven, Connecticut as a result of injuries sustained in a midget car crash at the West Haven Speedway. Herman was involved in a multi-car crash on the first lap of the feature race and his car rolled. He drove in the American Automobile Association (AAA) and United States Automobile Club (USAC) Championship Car series, racing in the 1955-1957 and 1959-1960 seasons with 11 starts, including the Indianapolis 500 races in each of those years. He finished in the top ten 3 times, with his best finish in 7th position, in the 1955 Indianapolis 500, earning him Rookie of the Year."
+            ],
+            "triple_list": [
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "born in",
+                    "description": "Topton, Pennsylvania",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman was born in",
+                            "value_string": "Topton, Pennsylvania"
+                        },
+                        {
+                            "key_string": "the person born in Topton, Pennsylvania is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "died in",
+                    "description": "West Haven, Connecticut",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman died in",
+                            "value_string": "West Haven, Connecticut"
+                        },
+                        {
+                            "key_string": "the person who died in West Haven, Connecticut as a result of injuries sustained in a midget car crash is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "died as a result of injuries sustained in a crash at",
+                    "description": "West Haven Speedway",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman died as a result of injuries sustained in a crash at",
+                            "value_string": "West Haven Speedway"
+                        },
+                        {
+                            "key_string": "the person who died as a result of injuries sustained in a crash at West Haven Speedway is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "drove in",
+                    "description": "American Automobile Association (AAA)",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman drove in",
+                            "value_string": "American Automobile Association (AAA)"
+                        },
+                        {
+                            "key_string": "the person who drove in American Automobile Association (AAA) is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "drove in",
+                    "description": "United States Automobile Club (USAC)",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman drove in",
+                            "value_string": "United States Automobile Club (USAC)"
+                        },
+                        {
+                            "key_string": "the person who drove in United States Automobile Club (USAC) is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "Al Herman",
+                    "description_type": "raced in",
+                    "description": "Indianapolis 500",
+                    "kv_lists": [
+                        {
+                            "key_string": "Al Herman raced in",
+                            "value_string": "Indianapolis 500"
+                        },
+                        {
+                            "key_string": "the person who raced in Indianapolis 500 is",
+                            "value_string": "Al Herman"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "New Haven, Connecticut",
+            "sentences": [
+                "The New Haven Division buses follow routes that had originally been covered by trolley service. Horse-drawn steetcars began operating in New Haven in the 1860s, and by the mid-1890s all the lines had become electric. In the 1920s and 1930s, some of the trolley lines began to be replaced by bus lines, with the last trolley route converted to bus in 1948. The City of New Haven is in the very early stages of considering the restoration of streetcar (light-rail) service, which has been absent since the postwar period."
+            ],
+            "triple_list": [
+                {
+                    "type": "ATTRIBUTE",
+                    "name": "New Haven Division buses",
+                    "description_type": "follow routes originally covered by",
+                    "description": "trolley service",
+                    "kv_lists": [
+                        {
+                            "key_string": "New Haven Division buses follow routes originally covered by",
+                            "value_string": "trolley service"
+                        },
+                        {
+                            "key_string": "the buses that follow routes originally covered by trolley service are",
+                            "value_string": "New Haven Division buses"
+                        }
+                    ]
+                },
+                {
+                    "type": "RELATION",
+                    "name": "New Haven Division buses",
+                    "description_type": "located in",
+                    "description": "New Haven, Connecticut",
+                    "kv_lists": [
+                        {
+                            "key_string": "New Haven Division buses are located in",
+                            "value_string": "New Haven, Connecticut"
+                        },
+                        {
+                            "key_string": "the buses located in New Haven, Connecticut are",
+                            "value_string": "New Haven Division buses"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "title": "Iraqi Air Force",
+            "sentences": [
+                "The Iraqi Air Force (IQAF or IrAF; Arabic: القوات الجوية العراقية, \"Al Quwwat al Jawwiya al Iraqiya\") is the aerial warfare service branch of the Iraqi Armed Forces, responsible for the policing of international borders and surveillance of national assets. The IQAF also acts as a support force for the Iraqi Navy and the Iraqi Army and it allows Iraq to rapidly deploy its developing Army."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Aegean Speed Lines",
+            "sentences": [
+                "Aegean Speed Lines were formed in 2005 as a joint venture between Sea Containers and the Eugenides Group. Aegean Speed Lines were the first ferry company in Greece to use a European Union flag vessel on a domestic route following deregulation of ferry services in Greece. Sea Containers sold its share in 2006 leaving the Eugenides Group as the major shareholder."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Melbourne",
+            "sentences": [
+                "Melbourne has the largest tram network in the world which had its origins in the city's 1880s land boom. In 2013–2014, 176.9 million passenger trips were made by tram. Melbourne's is Australia's only tram network to comprise more than a single line and consists of 250 km (155.3 mi) of track, 487 trams, 25 routes, and 1,763 tram stops. Around 80 per cent of Melbourne's tram network shares road space with other vehicles, while the rest of the network is separated or are light rail routes. Melbourne's trams are recognised as iconic cultural assets and a tourist attraction. Heritage trams operate on the free City Circle route, intended for visitors to Melbourne, and heritage restaurant trams travel through the city and surrounding areas during the evening. Melbourne is currently building 50 new E Class trams with some already in service in 2014. The E Class trams are about 30 metres long and are superior to the C2 class tram of similar length. Melbourne's bus network consists of almost 300 routes which mainly service the outer suburbs and fill the gaps in the network between rail and tram services. 127.6 million passenger trips were recorded on Melbourne's buses in 2013–2014, an increase of 10.2 percent on the previous year."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Quickline",
+            "sentences": [
+                "Quickline (also known as Signature Service) is a bus rapid transit service owned and operated by the Metropolitan Transit Authority of Harris County (METRO). The Quickline service began on June 1, 2009 with the 402 route (also called the QL2 route), that parallels the 2-Bellaire regular service route, which is the most heavily used bus route that METRO facilitates. Both routes run along Bellaire Boulevard."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Geography of Pakistan",
+            "sentences": [
+                "Pakistan is bordered by India to the east, Afghanistan to the west and Iran to the southwest while China borders the country in the northeast. The nation is geopolitically placed within some of the most controversial regional boundaries which share disputes and have many - a-times escalated military tensions between the nations, e.g., that of Kashmir with India and the Durand Line with Afghanistan. Its western borders include the Khyber Pass and Bolan Pass that have served as traditional migration routes between Central Eurasia and South Asia."
+            ],
+            "triple_list": []
+        },
+        {
+            "title": "Death Valley",
+            "sentences": [
+                "Death Valley is a desert valley located in Eastern California, in the northern Mojave Desert bordering the Great Basin Desert. It is one of the hottest places in the world along with deserts in the Middle East."
+            ],
+            "triple_list": []
+        }
+    ]
+}
