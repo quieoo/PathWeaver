@@ -511,7 +511,7 @@ python build_knowledge_graph_v4.3.py \
 
 ````
 
-## 多阶段生成（v4.4）
+## 多阶段生成（v4.4 ⭐）
 更弱的模型，更复杂的数据集
 4阶段：
 - 1. 尽可能全的抽取实体和三元组
@@ -598,5 +598,181 @@ nohup python build_knowledge_graph_v4.4.py \
   --overwrite \
   --sample-retries 2 \
   --answer-aware > build_knowledge_graph_v4.4.log 2>&1 &
+
+````
+- 在qwen3.5-27B上运行，生成质量挺好
+
+### qwen2.5-72B(/4bit)
+
+model serving:
+````bash
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 vllm serve models/qwen2.5-72B \
+  --served-model-name Qwen2.5-72B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code
+
+
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code
+````
+
+request:
+````bash
+python build_knowledge_graph_v4.4.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen2.5_72B.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen2.5-72B   --concurrency 8   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware   --limit 1 --verbose --seed 42
+
+python build_knowledge_graph_v4.4.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v4.4-qwen2.5_72B_4bit.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen2.5-72B-4bit   --concurrency 8   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware   --limit 1 --verbose --seed 42
+
+````
+
+结论：
+ - 4bit版本支持的batch size和单 batch下TPOT(18token/s -> 48token/s)都有明显提升
+ - 生成质量有些微偏移
+ - 非量化版本倾向于生成“_”连接的实体和关系，4bit版本没有这个问题
+
+
+ ## Triple-Only (v5)
+
+仅生成三元组，不再要求抽取KV对。
+属性三元组：
+- 正向：the <rel> of <head> is <tail>
+- 反向：<tail> is the <rel> of <head>
+关系三元组：
+- 正向：<head> <rel> <tail>
+- 反向：the entity that is related to <tail> by "<rel>" is <head>
+
+````bash
+
+# 启动模型服务
+conda activate vllm-graph
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen3.5-27B \
+  --served-model-name Qwen3.5-27B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --kv-cache-dtype auto \
+  --reasoning-parser qwen3 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}'  \
+  --trust-remote-code > Qwen3.5-27B.log 2>&1 &
+
+
+#8卡服务器
+conda activate triple
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 8 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+
+# 单样本测试
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 48
+
+
+# 抽取示例样本 -> 抽20个样本，模型自己的 answer_sufficient 是 18/20 = True，但如果严格按“只看 triple_list，不能借常识补桥”来评，我觉得是高估了。更贴切的结论是：严格可答率：13/20， 宽松可答率：16/20； 总用时2分40，rate=0.12/s。
+python build_knowledge_graph_v5.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen2.5-72B-4bit   --concurrency 64   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware   --limit 20 --seed 42
+
+# 对比同样的样本，用qwen3.5-27B抽的效果 -> 严格可答：14/20， 宽松可答：15/20。整体差不多。用时3分10秒，rate=0.10/s。最终结论，还是用2.5的抽
+python build_knowledge_graph_v5.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/musique_train_tripled_v5-qwen3.5-27B.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen3.5-27B   --concurrency 64   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware   --limit 20 --seed 42
+
+
+# 测试Hotpot数据集 -> 感觉还行
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_train.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 48
+````
+
+批次大小测试:
+  结论：64够了，再大性能不会再提
+````bash
+#=========4ul40===========
+
+# 64批次 -> 最高Generation Throughput 947.1 tokens/s，GPU KV Cache= 27%, rate=0.08, 0.11, 0.15, 0.17
+python build_knowledge_graph_v5.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen2.5-72B-4bit   --concurrency 64   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware
+
+# 128批次 -> 最高Generation Throughput 1049.6 tokens/s，GPU KV Cache= 42.5%, rate=0.05, 0.09, 0.12, 0.15
+python build_knowledge_graph_v5.py   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl   --api-base http://localhost:8000/v1   --api-mode chat   --allow-empty-api-key   --model Qwen2.5-72B-4bit   --concurrency 128   --skip-comparison   --resume   --overwrite   --sample-retries 0   --answer-aware
+
+````
+
+实操：
+````bash
+nohup python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/musique \
+  --sample-retries 2 \
+  --answer-aware > musique_train_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
+
+nohup python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_train.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://10.102.34.67:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/hotpot \
+  --sample-retries 2 \
+  --answer-aware > hotpot_train_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
 
 ````
