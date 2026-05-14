@@ -21,6 +21,18 @@ from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.models.olmo3.kblam_olmo3_attention import load_kblam_olmo3_model, replace_attention_with_kblam
+from kblam.models.qwen3.kblam_qwen3_attention import (
+    load_kblam_qwen3_model,
+    load_qwen3_query_head,
+)
+from kblam.kblam_attention.kblam_path import (
+    enable_path_attn_trace,
+    set_path_attn_trace_context,
+    backfill_path_attn_trace_records,
+    dump_path_attn_trace,
+    clear_path_attn_trace,
+)
+
 from transformers import AutoModelForCausalLM
 
 
@@ -34,11 +46,11 @@ from kblam.utils.eval_utils import (
     zero_shot_prompt_multi_entities,
     format_Q_llama,
     format_Q_phi3,
-    model_prune_format_mapping,
     answer_question,
     answer_question_deterministic,
     softmax,
     format_output_for_synthetic,
+    strip_generation_prefix,
     output_dag_sample,
 )
 from kblam.utils.train_utils import get_kb_embd
@@ -49,6 +61,19 @@ from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
 from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
 from kblam.dag_kv_retriever import DAGKVKBRetriever
 logging.set_verbosity_warning()
+
+
+def _get_kb_encoder_out_dim(model_config, kb_layer_frequency: int) -> int:
+    slots = model_config.num_hidden_layers // kb_layer_frequency + 1
+    head_dim = getattr(model_config, "head_dim", None)
+    num_heads = getattr(model_config, "num_attention_heads", None)
+
+    if head_dim is not None and num_heads is not None:
+        per_slot_dim = head_dim * num_heads
+    else:
+        per_slot_dim = model_config.hidden_size
+
+    return per_slot_dim * slots
 
 def _prepare_models(
     encoder_spec,
@@ -63,7 +88,11 @@ def _prepare_models(
     tokenizer = AutoTokenizer.from_pretrained(
         llm_base_dir, trust_remote_code=True, padding_side="left"
     )
-    tokenizer.pad_token = "^"
+    if llm_type == "qwen3":
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = "<|endoftext|>"
+    else:
+        tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token is not None else "^"
 
     if llm_type == "llama3":
         if query_head_path:
@@ -87,6 +116,14 @@ def _prepare_models(
             checkpoint_dir=model_path,      # 这个 stage1_lr_..._step_5600 目录
             device="cuda",
         )
+    elif llm_type == "qwen3":
+        model = load_kblam_qwen3_model(
+            base_model_dir=llm_base_dir,
+            checkpoint_dir=model_path,
+            device="cuda",
+        )
+        if query_head_path:
+            load_qwen3_query_head(model, query_head_path)
     else:
         model = KBLaMPhi3ForCausalLM.from_pretrained(
             model_path,
@@ -112,8 +149,7 @@ def _prepare_models(
         encoder_name=encoder_spec,
         projector_type="linear",
         endpoint_url="",
-        out_dim=model.config.hidden_size
-        * (model.config.num_hidden_layers // kb_layer_frequency + 1),
+        out_dim=_get_kb_encoder_out_dim(model.config, kb_layer_frequency),
         frozen_base_model=True,
         projector_kwargs={"mlp_depth": 1, "mlp_hidden_dim": 512},
         device=torch.device("cuda"),
@@ -198,6 +234,57 @@ def move_true_kb_to_front_inference(kb_embedding, true_index: int):
 
     return (new_keys, new_vals)
 
+
+def _resolve_trace_sample_id(row: dict, fallback: int):
+    sample_id = row.get("_id", row.get("id", fallback))
+    if isinstance(sample_id, (str, int, float)):
+        return sample_id
+    return str(sample_id)
+
+
+def _extract_trace_kv_items(row: dict):
+    dag = row.get("dag")
+    if isinstance(dag, dict):
+        kv_nodes = dag.get("kv_nodes") or []
+        items = []
+        for idx, kv in enumerate(kv_nodes):
+            if isinstance(kv, dict):
+                items.append(
+                    {
+                        "kv_id": int(idx),
+                        "key": str(kv.get("key", "")),
+                        "value": str(kv.get("value", "")),
+                        "score": kv.get("score"),
+                    }
+                )
+            else:
+                items.append({"kv_id": int(idx), "key": str(kv), "value": "", "score": None})
+        return items
+
+    triple_lists = row.get("triple_lists")
+    if isinstance(triple_lists, list):
+        items = []
+        for idx, tri in enumerate(triple_lists):
+            if isinstance(tri, dict):
+                key = tri.get("key_string")
+                if key is None:
+                    key = str(tri.get("entity", tri.get("head", "")))
+                value = tri.get("value_string")
+                if value is None:
+                    value = tri.get("description", tri.get("tail", tri.get("value", "")))
+                items.append(
+                    {
+                        "kv_id": int(idx),
+                        "key": str(key or ""),
+                        "value": str(value or ""),
+                    }
+                )
+            else:
+                items.append({"kv_id": int(idx), "key": str(tri), "value": ""})
+        return items
+
+    return []
+
 def _perform_eval_batched(
     *,
     model,
@@ -216,6 +303,8 @@ def _perform_eval_batched(
     verbose=False,
     enable_silver: bool = True,
     output_first_samples: int = 0,
+    enable_trace: bool = False,
+    trace_dataset_name: str = "",
 ):
 
     # ---------- optional filter (2wiki) ----------
@@ -232,7 +321,7 @@ def _perform_eval_batched(
     all_source_indices = []
 
     TTFTs, TPOTs = [], []
-    retrieval_time = 0.003
+    retrieval_time = 0.0
     start_time = time.time()
 
     if output_first_samples > 0:
@@ -331,6 +420,24 @@ def _perform_eval_batched(
                 target_kb_vals = kb_vals
                 target_kb_adj = kb_adj if hop_num is not None else None
 
+            if enable_trace:
+                set_path_attn_trace_context(
+                    sample_id=_resolve_trace_sample_id(row, batch_idx[i]),
+                    dataset=trace_dataset_name or dataset_type,
+                    dataset_type=dataset_type,
+                    source_index=int(batch_idx[i]),
+                    batch_id=int(batch_id),
+                    batch_offset=int(i),
+                    question=str(Q),
+                    answer=str(A),
+                    kv_items=_extract_trace_kv_items(row),
+                    kb_scale_factor=(
+                        None
+                        if kb_config.kb_scale_factor is None
+                        else float(kb_config.kb_scale_factor)
+                    ),
+                )
+
             output = answer_question_deterministic(
                 tokenizer,
                 model,
@@ -361,8 +468,17 @@ def _perform_eval_batched(
             TTFTs.append(prefill_s)
             TPOTs.append(decode_s / decode_tokens)
 
-            model_out = format_output_for_synthetic(output[2:])
+            model_out = format_output_for_synthetic(
+                strip_generation_prefix(output, model)
+            )
             gt = format_output_for_synthetic(A)
+
+            if enable_trace:
+                backfill_path_attn_trace_records(
+                    model_output_raw=str(output),
+                    model_output_final=str(model_out),
+                    answer_final=str(gt),
+                )
 
             if remove_sorry and "sorry" in model_out.lower():
                 continue
@@ -376,6 +492,7 @@ def _perform_eval_batched(
         kb_retriever.print_metrics()
         retrieval_time = kb_retriever.get_avg_retrieval_time()
     print(f"QPS: {query_size / (end_time - start_time):.2f}")
+    print(f"Average Latency: {(end_time - start_time) / query_size:.4f}")
     print(f"Avg TTFT: {np.mean(TTFTs)+retrieval_time:.4f}")
     print(f"Avg TPOT: {np.mean(TPOTs):.4f}")
 
@@ -398,6 +515,8 @@ def eval_main_process(
     enable_retrieval: bool = False,
     enable_silver: bool = True,
     output_first_samples: int = 0,
+    enable_trace: bool = False,
+    trace_dataset_name: str = "",
 ):
     if query_size > len(dataset):
         query_size = len(dataset)
@@ -453,6 +572,8 @@ def eval_main_process(
             enable_retrieval=enable_retrieval,
             enable_silver=enable_silver,
             output_first_samples=output_first_samples,
+            enable_trace=enable_trace,
+            trace_dataset_name=trace_dataset_name,
         )
         
         results_pair_list.append((model_outputs, answers, source_indices))
@@ -470,6 +591,17 @@ def eval_generate(
     kb_retriever, 
     enable_silver: bool = True
 ):
+    if args.enable_trace:
+        clear_path_attn_trace()
+        enable_path_attn_trace(
+            True,
+            store_raw=True,
+            store_kb_normalized=True,
+        )
+        if not args.path_attn:
+            print("[WARN] enable_trace=True but path_attn=False, trace may be empty.")
+    else:
+        enable_path_attn_trace(False)
 
     results_pair_list, scale_factor_list = eval_main_process(
         dataset,
@@ -486,6 +618,8 @@ def eval_generate(
         args.query_size,
         kb_retriever.is_hnsw_ready(),
         enable_silver=enable_silver,
+        enable_trace=args.enable_trace,
+        trace_dataset_name=args.dataset_type,
     )
     
     save_dir = None
@@ -538,6 +672,19 @@ def eval_generate(
             
             except Exception as e:
                 print(f"⚠️ Failed to save results for sf={sf}: {str(e)}")
+
+    if args.enable_trace:
+        if args.path_attn_trace_path is not None:
+            trace_path = Path(args.path_attn_trace_path)
+        elif save_dir is not None:
+            trace_path = save_dir / f"{args.exp_config_name}-path_attn_trace.pt"
+        else:
+            trace_path = Path(f"{args.exp_config_name}-path_attn_trace.pt")
+
+        trace_path.parent.mkdir(exist_ok=True, parents=True)
+        dump_path_attn_trace(str(trace_path))
+        enable_path_attn_trace(False)
+        print(f"Path attention trace saved to {trace_path}")
 def debug_measure_retrieval_accuracy(kb_retriever: KBRetriever, dataset: list[dict], topk: int = 1):
     # topk=[1, 10, 100, 1000]
     # eval_policy=[1, 2, 3]
@@ -661,6 +808,18 @@ parent_parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=False,
     help="Whether to use path attention",
+)
+parent_parser.add_argument(
+    "--enable_trace",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Whether to collect and dump path attention traces",
+)
+parent_parser.add_argument(
+    "--path_attn_trace_path",
+    type=str,
+    default=None,
+    help="Optional output path for path attention trace .pt file",
 )
 parent_parser.add_argument(
     "--hnsw_index_path",

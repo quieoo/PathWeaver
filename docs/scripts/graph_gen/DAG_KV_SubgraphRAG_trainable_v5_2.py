@@ -1,8 +1,12 @@
 import argparse
+import gc
 import json
 import os
+import shutil
 import random
 import re
+import tempfile
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -16,19 +20,63 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 import pickle
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from numpy.lib.format import open_memmap
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
 
 # ============================================================
 # 0) IO
 # ============================================================
+def _read_concatenated_json_objects(path: str) -> List[Dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    data: List[Dict[str, Any]] = []
+    buf = ''
+
+    with open(path, 'r', encoding='utf-8') as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                s = buf.lstrip()
+                if not s:
+                    buf = ''
+                    break
+                try:
+                    obj, idx = decoder.raw_decode(s)
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(obj, dict):
+                    raise ValueError(f'Expected JSON object in {path}, got {type(obj).__name__}')
+                data.append(obj)
+                buf = s[idx:]
+
+    s = buf.lstrip()
+    while s:
+        obj, idx = decoder.raw_decode(s)
+        if not isinstance(obj, dict):
+            raise ValueError(f'Expected JSON object in {path}, got {type(obj).__name__}')
+        data.append(obj)
+        s = s[idx:].lstrip()
+    return data
+
+
 def read_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
     if path.endswith('.jsonl'):
-        data = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    data.append(json.loads(line))
-        return data
+        try:
+            data = []
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        data.append(json.loads(line))
+            return data
+        except json.JSONDecodeError:
+            return _read_concatenated_json_objects(path)
 
     with open(path, 'r', encoding='utf-8') as f:
         obj = json.load(f)
@@ -205,6 +253,7 @@ class KVEdge:
     dst_name: str
     key: str
     value: str
+    edge_score: float
     score: float
     title: str
     triple_type: str
@@ -220,6 +269,7 @@ class KVEdge:
 def iter_triples(sample: Dict[str, Any], supporting_only: bool) -> Iterable[Tuple[str, Dict[str, Any]]]:
     ctx = sample.get('context', []) or []
     supporting_titles: Optional[Set[str]] = None
+    yielded = False
     if supporting_only:
         sf = sample.get('supporting_facts', []) or []
         supporting_titles = {t for t, _ in sf if isinstance(t, str)}
@@ -235,7 +285,17 @@ def iter_triples(sample: Dict[str, Any], supporting_only: bool) -> Iterable[Tupl
         if supporting_titles is not None and title not in supporting_titles:
             continue
         for tri in tri_list:
+            yielded = True
             yield title, tri
+
+    if yielded:
+        return
+
+    # Fallback for merged tripled datasets where triples live at the sample top level.
+    top_level_triples = sample.get('triple_list', []) or []
+    for tri in top_level_triples:
+        title = norm_text(tri.get('title', '') if isinstance(tri, dict) else '')
+        yield title, tri
 
 
 def get_or_add_node(name: str, node_map: Dict[str, int], node_names: List[str]) -> int:
@@ -321,6 +381,7 @@ def build_kvedge_graph(sample: Dict[str, Any], supporting_only: bool) -> Tuple[L
                 dst_name=node_names[dst],
                 key=key,
                 value=value,
+                edge_score=0.0,
                 score=0.0,
                 title=norm_text(title),
                 triple_type=ttype,
@@ -358,7 +419,7 @@ def print_kvedge_graph(
         e = kvedges[eid]
         print(
             f'  eid={eid} src={e.src}("{e.src_name}") -> dst={e.dst}("{e.dst_name}") '
-            f'key="{e.key}" value="{e.value}" score={e.score:.4f}'
+            f'key="{e.key}" value="{e.value}" edge_score={e.edge_score:.4f} score={e.score:.4f}'
         )
 
     print('[Graph] node adjacency:')
@@ -465,6 +526,30 @@ def embed_texts_cached(
         emb = np.array(emb)
     emb = emb.astype(np.float32)
     return {t: emb[i] for i, t in enumerate(uniq)}
+
+
+def merge_text_embedding_caches(
+    embedder: SentenceTransformer,
+    text_groups: List[List[str]],
+    batch_size: int,
+) -> Dict[str, np.ndarray]:
+    """
+    Encode multiple text groups incrementally while deduplicating across groups.
+    Earlier groups take priority if the same normalized text appears again.
+    """
+    merged: Dict[str, np.ndarray] = {}
+    seen: Set[str] = set()
+    for texts in text_groups:
+        uniq_texts: List[str] = []
+        for t in texts:
+            t = norm_text(t)
+            if t and t not in seen:
+                seen.add(t)
+                uniq_texts.append(t)
+        if not uniq_texts:
+            continue
+        merged.update(embed_texts_cached(embedder, uniq_texts, batch_size=batch_size))
+    return merged
 
 
 def build_edge_feature_dict(
@@ -746,15 +831,139 @@ class EdgeDataset(Dataset):
         return self.xs[idx], self.ys[idx]
 
 class BinaryDataset(Dataset):
-    def __init__(self, xs: np.ndarray, ys: np.ndarray):
-        self.xs = torch.from_numpy(xs.astype(np.float32))
-        self.ys = torch.from_numpy(ys.astype(np.float32))
+    def __init__(self, xs: np.ndarray, ys: np.ndarray, indices: Optional[np.ndarray] = None):
+        self.xs = xs
+        self.ys = ys
+        if indices is None:
+            self.indices = np.arange(len(ys), dtype=np.int64)
+        else:
+            self.indices = np.asarray(indices, dtype=np.int64)
 
     def __len__(self):
-        return len(self.ys)
+        return len(self.indices)
 
     def __getitem__(self, idx: int):
-        return self.xs[idx], self.ys[idx]
+        real_idx = int(self.indices[idx])
+        y = float(self.ys[real_idx])
+        return real_idx, y
+
+
+def make_binary_collate(xs: np.ndarray) -> Callable[[List[Tuple[int, float]]], Tuple[torch.Tensor, torch.Tensor]]:
+    def _collate(batch: List[Tuple[int, float]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices = np.fromiter((idx for idx, _ in batch), dtype=np.int64, count=len(batch))
+        labels = np.fromiter((label for _, label in batch), dtype=np.float32, count=len(batch))
+        xb = np.asarray(xs[indices], dtype=np.float32)
+        yb = torch.from_numpy(labels)
+        return torch.from_numpy(xb), yb
+
+    return _collate
+
+
+def build_loader(
+    dataset: BinaryDataset,
+    xs: np.ndarray,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_batches: int,
+) -> DataLoader:
+    loader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": max(0, int(num_workers)),
+        "pin_memory": bool(pin_memory),
+        "collate_fn": make_binary_collate(xs),
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(2, int(prefetch_batches))
+    return DataLoader(**loader_kwargs)
+
+
+class ChunkedArrayWriter:
+    def __init__(self, out_dir: str, prefix: str, feature_dtype=np.float16, label_dtype=np.float32, chunk_size: int = 50000):
+        self.out_dir = out_dir
+        self.prefix = prefix
+        self.feature_dtype = feature_dtype
+        self.label_dtype = label_dtype
+        self.chunk_size = chunk_size
+        self._x_buf: List[np.ndarray] = []
+        self._y_buf: List[Union[int, float]] = []
+        self._chunk_idx = 0
+        self.num_rows = 0
+        self.feature_dim: Optional[int] = None
+        self.x_chunk_paths: List[str] = []
+        self.y_chunk_paths: List[str] = []
+        os.makedirs(self.out_dir, exist_ok=True)
+
+    def add(self, vec: np.ndarray, label: Union[int, float]) -> None:
+        arr = np.asarray(vec, dtype=self.feature_dtype)
+        if self.feature_dim is None:
+            self.feature_dim = int(arr.shape[0])
+        self._x_buf.append(arr)
+        self._y_buf.append(label)
+        self.num_rows += 1
+        if len(self._x_buf) >= self.chunk_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._x_buf:
+            return
+        x_arr = np.stack(self._x_buf).astype(self.feature_dtype, copy=False)
+        y_arr = np.asarray(self._y_buf, dtype=self.label_dtype)
+        x_path = os.path.join(self.out_dir, f'{self.prefix}_x_chunk_{self._chunk_idx:05d}.npy')
+        y_path = os.path.join(self.out_dir, f'{self.prefix}_y_chunk_{self._chunk_idx:05d}.npy')
+        print(
+            f'[ChunkWriter:{self.prefix}] flush chunk={self._chunk_idx} rows={x_arr.shape[0]} '
+            f'dim={x_arr.shape[1]} -> {x_path}'
+        )
+        np.save(x_path, x_arr)
+        np.save(y_path, y_arr)
+        self.x_chunk_paths.append(x_path)
+        self.y_chunk_paths.append(y_path)
+        self._chunk_idx += 1
+        self._x_buf.clear()
+        self._y_buf.clear()
+        del x_arr, y_arr
+        gc.collect()
+
+    def finalize(self) -> Tuple[str, str]:
+        self.flush()
+        if self.feature_dim is None:
+            raise ValueError(f'No rows written for {self.prefix}')
+
+        final_x = os.path.join(self.out_dir, f'{self.prefix}_X.npy')
+        final_y = os.path.join(self.out_dir, f'{self.prefix}_Y.npy')
+        x_mm = open_memmap(final_x, mode='w+', dtype=self.feature_dtype, shape=(self.num_rows, self.feature_dim))
+        y_mm = open_memmap(final_y, mode='w+', dtype=self.label_dtype, shape=(self.num_rows,))
+
+        start = 0
+        for chunk_idx, (x_path, y_path) in enumerate(zip(self.x_chunk_paths, self.y_chunk_paths)):
+            x_chunk = np.load(x_path, mmap_mode='r')
+            y_chunk = np.load(y_path, mmap_mode='r')
+            end = start + x_chunk.shape[0]
+            print(
+                f'[ChunkWriter:{self.prefix}] merge chunk={chunk_idx} rows={x_chunk.shape[0]} '
+                f'range=[{start},{end})'
+            )
+            x_mm[start:end] = x_chunk
+            y_mm[start:end] = y_chunk
+            start = end
+            del x_chunk, y_chunk
+            gc.collect()
+
+        x_mm.flush()
+        y_mm.flush()
+        del x_mm, y_mm
+
+        for p in self.x_chunk_paths + self.y_chunk_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return final_x, final_y
 
 
 class MLPScorer(nn.Module):
@@ -795,11 +1004,6 @@ def collect_training_examples(
     samples: List[Dict[str, Any]],
     embedder: SentenceTransformer,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    edge_xs: List[np.ndarray] = []
-    edge_ys: List[int] = []
-    node_xs: List[np.ndarray] = []
-    node_ys: List[int] = []
-
     total_edges = 0
     pos_edges = 0
     total_nodes = 0
@@ -807,6 +1011,22 @@ def collect_training_examples(
 
     used_samples = samples[:args.limit] if args.limit else samples
     train_embed_batch_size = args.batch_size
+    train_cache_base = args.train_cache_path.strip()
+    work_dir = (
+        train_cache_base + '.dir'
+        if train_cache_base
+        else tempfile.mkdtemp(prefix='subgraphrag_train_build_')
+    )
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    edge_writer = ChunkedArrayWriter(work_dir, 'edge')
+    node_writer = ChunkedArrayWriter(work_dir, 'node')
+
+    print(
+        f'[Collect] start samples={len(used_samples)} '
+        f'embed_batch={train_embed_batch_size} work_dir={work_dir}'
+    )
 
     prepared = []
     all_texts: List[str] = []
@@ -846,11 +1066,18 @@ def collect_training_examples(
     if not prepared:
         raise ValueError('No valid samples found for training example construction.')
 
+    print(
+        f'[Collect] pass1_done valid_samples={len(prepared)} '
+        f'unique_text_candidates={len(all_texts)}'
+    )
+
     text_emb_cache = embed_texts_cached(
         embedder=embedder,
         texts=all_texts,
         batch_size=train_embed_batch_size,
     )
+    num_unique_emb_texts = len(text_emb_cache)
+    print(f'[Collect] embeddings_ready unique_texts={num_unique_emb_texts}')
 
     for item in tqdm(prepared, desc='Pass2: build weak labels / features'):
         sample = item['sample']
@@ -913,11 +1140,9 @@ def collect_training_examples(
         kept_neg_ids = neg_ids[:max_negs]
 
         for eid in pos_ids:
-            edge_xs.append(feat_dict[eid]['vector'])
-            edge_ys.append(1)
+            edge_writer.add(feat_dict[eid]['vector'], 1)
         for eid in kept_neg_ids:
-            edge_xs.append(feat_dict[eid]['vector'])
-            edge_ys.append(0)
+            edge_writer.add(feat_dict[eid]['vector'], 0)
 
         # ---------------------------
         # node-ending examples
@@ -947,55 +1172,69 @@ def collect_training_examples(
         pos_nodes_total += len(pos_node_ids)
 
         for nid in pos_node_ids:
-            node_xs.append(node_feat_dict[nid]['vector'])
-            node_ys.append(1)
+            node_writer.add(node_feat_dict[nid]['vector'], 1)
         for nid in neg_node_ids:
-            node_xs.append(node_feat_dict[nid]['vector'])
-            node_ys.append(0)
+            node_writer.add(node_feat_dict[nid]['vector'], 0)
 
-    if not edge_xs:
+    if edge_writer.num_rows == 0:
         raise ValueError('No edge training examples constructed.')
-    if not node_xs:
+    if node_writer.num_rows == 0:
         raise ValueError('No node-ending training examples constructed.')
+    print(
+        f'[Build examples] edge_rows={edge_writer.num_rows} node_rows={node_writer.num_rows} '
+        f'edge_dim={edge_writer.feature_dim} node_dim={node_writer.feature_dim}'
+    )
+    print('[Collect] releasing pass1/pass2 intermediate objects before memmap finalize')
 
-    X_edge = np.stack(edge_xs).astype(np.float32)
-    Y_edge = np.array(edge_ys, dtype=np.float32)
-    X_node = np.stack(node_xs).astype(np.float32)
-    Y_node = np.array(node_ys, dtype=np.float32)
+    del prepared
+    del all_texts
+    del text_emb_cache
+    gc.collect()
+
+    print('[Collect] finalizing edge chunks -> memmap')
+    edge_x_path, edge_y_path = edge_writer.finalize()
+    print('[Collect] finalizing node chunks -> memmap')
+    node_x_path, node_y_path = node_writer.finalize()
+    print(
+        f'[Collect] memmap_ready edge_x={edge_x_path} edge_y={edge_y_path} '
+        f'node_x={node_x_path} node_y={node_y_path}'
+    )
+    X_edge = np.load(edge_x_path, mmap_mode='r')
+    Y_edge = np.load(edge_y_path, mmap_mode='r')
+    X_node = np.load(node_x_path, mmap_mode='r')
+    Y_node = np.load(node_y_path, mmap_mode='r')
 
     meta = {
         'num_edge_examples': int(len(Y_edge)),
-        'num_edge_pos': int(Y_edge.sum()),
-        'num_edge_neg': int(len(Y_edge) - Y_edge.sum()),
+        'num_edge_pos': int(np.asarray(Y_edge).sum()),
+        'num_edge_neg': int(len(Y_edge) - np.asarray(Y_edge).sum()),
         'num_node_examples': int(len(Y_node)),
-        'num_node_pos': int(Y_node.sum()),
-        'num_node_neg': int(len(Y_node) - Y_node.sum()),
+        'num_node_pos': int(np.asarray(Y_node).sum()),
+        'num_node_neg': int(len(Y_node) - np.asarray(Y_node).sum()),
         'raw_total_edges': int(total_edges),
         'raw_pos_edges': int(pos_edges),
         'raw_total_nodes': int(total_nodes),
         'raw_pos_nodes': int(pos_nodes_total),
         'edge_input_dim': int(X_edge.shape[1]),
         'node_input_dim': int(X_node.shape[1]),
-        'num_unique_emb_texts': int(len(text_emb_cache)),
+        'num_unique_emb_texts': int(num_unique_emb_texts),
         'train_embed_batch_size': int(train_embed_batch_size),
+        'cache_format': 'npy_memmap',
+        'cache_build_dir': work_dir,
     }
     return X_edge, Y_edge, X_node, Y_node, meta
 
-def split_xy(X: np.ndarray, Y: np.ndarray, dev_ratio: float, seed: int):
-    idx = np.arange(len(Y))
+def split_indices(num_rows: int, dev_ratio: float, seed: int):
+    idx = np.arange(num_rows)
     rng = np.random.RandomState(seed)
     rng.shuffle(idx)
-    X = X[idx]
-    Y = Y[idx]
-
-    split = int(len(Y) * (1.0 - dev_ratio))
-    split = max(1, min(split, len(Y) - 1))
-    Xtr, Ytr = X[:split], Y[:split]
-    Xdv, Ydv = X[split:], Y[split:]
-    return Xtr, Ytr, Xdv, Ydv
+    split = int(num_rows * (1.0 - dev_ratio))
+    split = max(1, min(split, num_rows - 1))
+    return idx[:split], idx[split:]
 
 
 def train_one_binary_model(
+    args,
     model: nn.Module,
     X: np.ndarray,
     Y: np.ndarray,
@@ -1009,15 +1248,40 @@ def train_one_binary_model(
     seed: int,
     tag: str = 'model',
 ) -> Tuple[Dict[str, torch.Tensor], float]:
-    Xtr, Ytr, Xdv, Ydv = split_xy(X, Y, dev_ratio=0.1, seed=seed)
+    train_idx, dev_idx = split_indices(len(Y), dev_ratio=0.1, seed=seed)
+    Y_np = np.asarray(Y, dtype=np.float32)
+    log(
+        f'[{tag}] dataset_ready total={len(Y_np)} train={len(train_idx)} dev={len(dev_idx)} '
+        f'input_dim={X.shape[1]}'
+    )
 
-    train_ds = BinaryDataset(Xtr, Ytr)
-    dev_ds = BinaryDataset(Xdv, Ydv)
-    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=True)
-    dev_loader = DataLoader(dev_ds, batch_size=train_batch_size, shuffle=False)
+    train_ds = BinaryDataset(X, Y_np, train_idx)
+    dev_ds = BinaryDataset(X, Y_np, dev_idx)
+    train_loader = build_loader(
+        train_ds,
+        X,
+        batch_size=train_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda' and not args.disable_pin_memory),
+        prefetch_batches=args.prefetch_batches,
+    )
+    dev_loader = build_loader(
+        dev_ds,
+        X,
+        batch_size=train_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda' and not args.disable_pin_memory),
+        prefetch_batches=args.prefetch_batches,
+    )
+    log(
+        f'[{tag}] loaders_ready train_batches={len(train_loader)} dev_batches={len(dev_loader)} '
+        f'num_workers={args.num_workers} pin_memory={device.type == "cuda" and not args.disable_pin_memory}'
+    )
 
-    pos_count = float(Ytr.sum())
-    neg_count = float(len(Ytr) - pos_count)
+    pos_count = float(Y_np[train_idx].sum())
+    neg_count = float(len(train_idx) - pos_count)
     pos_weight = torch.tensor([max(1.0, neg_count / max(1.0, pos_count))], device=device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -1032,9 +1296,9 @@ def train_one_binary_model(
         model.train()
         total_loss = 0.0
 
-        for xb, yb in train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+        for batch_idx, (xb, yb) in enumerate(train_loader, start=1):
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
 
             logits = model(xb)
             loss = criterion(logits, yb)
@@ -1045,12 +1309,24 @@ def train_one_binary_model(
             optimizer.step()
 
             total_loss += float(loss.item()) * len(yb)
+            if batch_idx == 1 or batch_idx % args.train_log_interval == 0 or batch_idx == len(train_loader):
+                log(
+                    f'[{tag}][Epoch {epoch}] train_batch={batch_idx}/{len(train_loader)} '
+                    f'loss={float(loss.item()):.4f}'
+                )
 
-        dev_f1 = eval_binary_f1(model, dev_loader, device, threshold=threshold)
+        dev_f1 = eval_binary_f1(
+            model,
+            dev_loader,
+            device,
+            threshold=threshold,
+            tag=f'{tag}/dev',
+            log_interval=args.eval_log_interval,
+        )
         scheduler.step(dev_f1)
 
         train_loss = total_loss / max(1, len(train_ds))
-        print(f'[{tag}][Epoch {epoch}] train_loss={train_loss:.4f} dev_f1={dev_f1:.4f}')
+        log(f'[{tag}][Epoch {epoch}] train_loss={train_loss:.4f} dev_f1={dev_f1:.4f}')
 
         if dev_f1 > best_dev:
             best_dev = dev_f1
@@ -1059,7 +1335,7 @@ def train_one_binary_model(
         else:
             bad_epochs += 1
             if bad_epochs >= patience:
-                print(f'[{tag}] early stop, patience={patience}')
+                log(f'[{tag}] early stop, patience={patience}')
                 break
 
     if best_state is None:
@@ -1183,26 +1459,69 @@ def train_joint_model(
     idx_edge = np.arange(len(Y_edge))
     rng.shuffle(idx_edge)
     split_edge = int(len(Y_edge) * 0.9)
-    Xtr_edge, Ytr_edge = X_edge[idx_edge[:split_edge]], Y_edge[idx_edge[:split_edge]]
-    Xdv_edge, Ydv_edge = X_edge[idx_edge[split_edge:]], Y_edge[idx_edge[split_edge:]]
+    tr_edge_idx, dv_edge_idx = idx_edge[:split_edge], idx_edge[split_edge:]
     
     # Node 数据划分
     idx_node = np.arange(len(Y_node))
     rng.shuffle(idx_node)
     split_node = int(len(Y_node) * 0.9)
-    Xtr_node, Ytr_node = X_node[idx_node[:split_node]], Y_node[idx_node[:split_node:]]
-    Xdv_node, Ydv_node = X_node[idx_node[split_node:]], Y_node[idx_node[split_node:]]
+    tr_node_idx, dv_node_idx = idx_node[:split_node], idx_node[split_node:]
+    Y_edge_np = np.asarray(Y_edge, dtype=np.float32)
+    Y_node_np = np.asarray(Y_node, dtype=np.float32)
+    log(
+        f'[Joint] dataset_ready edge_total={len(Y_edge_np)} edge_train={len(tr_edge_idx)} edge_dev={len(dv_edge_idx)} '
+        f'node_total={len(Y_node_np)} node_train={len(tr_node_idx)} node_dev={len(dv_node_idx)} '
+        f'edge_dim={X_edge.shape[1]} node_dim={X_node.shape[1]}'
+    )
     
     # 创建 DataLoader
-    train_edge_ds = BinaryDataset(Xtr_edge, Ytr_edge)
-    train_node_ds = BinaryDataset(Xtr_node, Ytr_node)
-    dev_edge_ds = BinaryDataset(Xdv_edge, Ydv_edge)
-    dev_node_ds = BinaryDataset(Xdv_node, Ydv_node)
+    train_edge_ds = BinaryDataset(X_edge, Y_edge_np, tr_edge_idx)
+    train_node_ds = BinaryDataset(X_node, Y_node_np, tr_node_idx)
+    dev_edge_ds = BinaryDataset(X_edge, Y_edge_np, dv_edge_idx)
+    dev_node_ds = BinaryDataset(X_node, Y_node_np, dv_node_idx)
     
-    train_edge_loader = DataLoader(train_edge_ds, batch_size=args.train_batch_size, shuffle=True)
-    train_node_loader = DataLoader(train_node_ds, batch_size=args.train_batch_size, shuffle=True)
-    dev_edge_loader = DataLoader(dev_edge_ds, batch_size=args.train_batch_size, shuffle=False)
-    dev_node_loader = DataLoader(dev_node_ds, batch_size=args.train_batch_size, shuffle=False)
+    pin_memory = device.type == 'cuda' and not args.disable_pin_memory
+    train_edge_loader = build_loader(
+        train_edge_ds,
+        X_edge,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        prefetch_batches=args.prefetch_batches,
+    )
+    train_node_loader = build_loader(
+        train_node_ds,
+        X_node,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        prefetch_batches=args.prefetch_batches,
+    )
+    dev_edge_loader = build_loader(
+        dev_edge_ds,
+        X_edge,
+        batch_size=args.train_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        prefetch_batches=args.prefetch_batches,
+    )
+    dev_node_loader = build_loader(
+        dev_node_ds,
+        X_node,
+        batch_size=args.train_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        prefetch_batches=args.prefetch_batches,
+    )
+    log(
+        f'[Joint] loaders_ready edge_train_batches={len(train_edge_loader)} edge_dev_batches={len(dev_edge_loader)} '
+        f'node_train_batches={len(train_node_loader)} node_dev_batches={len(dev_node_loader)} '
+        f'num_workers={args.num_workers} pin_memory={pin_memory}'
+    )
     
     # 创建联合模型 - 传入正确的输入维度
     model = JointScorer(
@@ -1213,12 +1532,12 @@ def train_joint_model(
     ).to(device)
     
     # 计算类别权重
-    pos_count_edge = float(Ytr_edge.sum())
-    neg_count_edge = float(len(Ytr_edge) - pos_count_edge)
+    pos_count_edge = float(Y_edge_np[tr_edge_idx].sum())
+    neg_count_edge = float(len(tr_edge_idx) - pos_count_edge)
     pos_weight_edge = torch.tensor([max(1.0, neg_count_edge / max(1.0, pos_count_edge))], device=device)
     
-    pos_count_node = float(Ytr_node.sum())
-    neg_count_node = float(len(Ytr_node) - pos_count_node)
+    pos_count_node = float(Y_node_np[tr_node_idx].sum())
+    neg_count_node = float(len(tr_node_idx) - pos_count_node)
     pos_weight_node = torch.tensor([max(1.0, neg_count_node / max(1.0, pos_count_node))], device=device)
     
     criterion_edge = nn.BCEWithLogitsLoss(pos_weight=pos_weight_edge)
@@ -1248,32 +1567,37 @@ def train_joint_model(
         
         max_batches = max(len(train_edge_loader), len(train_node_loader))
         
-        for _ in range(max_batches):
+        epoch_t0 = time.perf_counter()
+        for batch_idx in range(1, max_batches + 1):
             # Edge batch
             loss_edge = 0.0
+            loss_edge_value = 0.0
             try:
                 xb_edge, yb_edge = next(edge_iter)
-                xb_edge = xb_edge.to(device)
-                yb_edge = yb_edge.to(device)
+                xb_edge = xb_edge.to(device, non_blocking=True)
+                yb_edge = yb_edge.to(device, non_blocking=True)
                 
                 logits_edge = model.forward_edge(xb_edge)
                 loss_edge = criterion_edge(logits_edge, yb_edge)
+                loss_edge_value = float(loss_edge.item())
                 
-                total_loss_edge += float(loss_edge.item()) * len(yb_edge)
+                total_loss_edge += loss_edge_value * len(yb_edge)
             except StopIteration:
                 pass
             
             # Node batch
             loss_node = 0.0
+            loss_node_value = 0.0
             try:
                 xb_node, yb_node = next(node_iter)
-                xb_node = xb_node.to(device)
-                yb_node = yb_node.to(device)
+                xb_node = xb_node.to(device, non_blocking=True)
+                yb_node = yb_node.to(device, non_blocking=True)
                 
                 logits_node = model.forward_node(xb_node)
                 loss_node = criterion_node(logits_node, yb_node)
+                loss_node_value = float(loss_node.item())
                 
-                total_loss_node += float(loss_node.item()) * len(yb_node)
+                total_loss_node += loss_node_value * len(yb_node)
             except StopIteration:
                 pass
             
@@ -1284,10 +1608,35 @@ def train_joint_model(
             total_loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            if (
+                batch_idx == 1
+                or batch_idx % args.train_log_interval == 0
+                or batch_idx == max_batches
+            ):
+                log(
+                    f'[Joint][Epoch {epoch}] train_batch={batch_idx}/{max_batches} '
+                    f'edge_loss={loss_edge_value:.4f} node_loss={loss_node_value:.4f}'
+                )
         
         # 验证
-        dev_f1_edge = eval_binary_f1_for_joint(model, dev_edge_loader, device, args.threshold, task='edge')
-        dev_f1_node = eval_binary_f1_for_joint(model, dev_node_loader, device, args.end_threshold, task='node')
+        dev_f1_edge = eval_binary_f1_for_joint(
+            model,
+            dev_edge_loader,
+            device,
+            args.threshold,
+            task='edge',
+            tag=f'Joint/edge_dev/epoch_{epoch}',
+            log_interval=args.eval_log_interval,
+        )
+        dev_f1_node = eval_binary_f1_for_joint(
+            model,
+            dev_node_loader,
+            device,
+            args.end_threshold,
+            task='node',
+            tag=f'Joint/node_dev/epoch_{epoch}',
+            log_interval=args.eval_log_interval,
+        )
         dev_f1_combined = (dev_f1_edge + dev_f1_node) / 2.0
         
         scheduler.step(dev_f1_combined)
@@ -1295,8 +1644,12 @@ def train_joint_model(
         train_loss_edge = total_loss_edge / max(1, len(train_edge_ds))
         train_loss_node = total_loss_node / max(1, len(train_node_ds))
         
-        print(f'[Joint][Epoch {epoch}] edge_loss={train_loss_edge:.4f} edge_f1={dev_f1_edge:.4f} | '
-              f'node_loss={train_loss_node:.4f} node_f1={dev_f1_node:.4f} | combined_f1={dev_f1_combined:.4f}')
+        epoch_s = time.perf_counter() - epoch_t0
+        log(
+            f'[Joint][Epoch {epoch}] edge_loss={train_loss_edge:.4f} edge_f1={dev_f1_edge:.4f} | '
+            f'node_loss={train_loss_node:.4f} node_f1={dev_f1_node:.4f} | combined_f1={dev_f1_combined:.4f} | '
+            f'epoch_s={epoch_s:.1f}'
+        )
         
         # 早停
         if dev_f1_combined > best_dev_combined:
@@ -1308,7 +1661,7 @@ def train_joint_model(
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
-                print(f'[Joint] early stop, patience={args.patience}')
+                log(f'[Joint] early stop, patience={args.patience}')
                 break
     
     if best_state is None:
@@ -1322,16 +1675,18 @@ def eval_binary_f1_for_joint(
     loader: DataLoader, 
     device: torch.device, 
     threshold: float,
-    task: str = 'edge'
+    task: str = 'edge',
+    tag: str = 'joint/dev',
+    log_interval: int = 0,
 ) -> float:
     """联合模型的评估函数"""
     model.eval()
     tp = fp = fn = 0
     
     with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+        for batch_idx, (xb, yb) in enumerate(loader, start=1):
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
             
             if task == 'edge':
                 logits = model.forward_edge(xb)
@@ -1344,6 +1699,10 @@ def eval_binary_f1_for_joint(
             tp += int(((pred == 1) & (yb == 1)).sum().item())
             fp += int(((pred == 1) & (yb == 0)).sum().item())
             fn += int(((pred == 0) & (yb == 1)).sum().item())
+            if log_interval > 0 and (
+                batch_idx == 1 or batch_idx % log_interval == 0 or batch_idx == len(loader)
+            ):
+                log(f'[{tag}] eval_batch={batch_idx}/{len(loader)}')
     
     p = tp / max(1, tp + fp)
     r = tp / max(1, tp + fn)
@@ -1462,10 +1821,24 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     cache_path = args.train_cache_path.strip()
+    cache_dir = cache_path + '.dir' if cache_path else ''
+    log(
+        f'[Train] start samples={len(samples)} mode={"joint" if args.joint_training else "independent"} '
+        f'cache_path={cache_path or "<none>"} rebuild_cache={args.rebuild_train_cache}'
+    )
     
     # 加载或构建训练数据
-    if cache_path and os.path.exists(cache_path) and not args.rebuild_train_cache:
-        print(f"[Load train cache] {cache_path}")
+    if cache_path and os.path.isdir(cache_dir) and not args.rebuild_train_cache:
+        log(f"[Load train cache dir] {cache_dir}")
+        X_edge = np.load(os.path.join(cache_dir, 'edge_X.npy'), mmap_mode='r')
+        Y_edge = np.load(os.path.join(cache_dir, 'edge_Y.npy'), mmap_mode='r')
+        X_node = np.load(os.path.join(cache_dir, 'node_X.npy'), mmap_mode='r')
+        Y_node = np.load(os.path.join(cache_dir, 'node_Y.npy'), mmap_mode='r')
+        with open(os.path.join(cache_dir, 'meta.json'), 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        log('[Train] cache_dir_loaded memmap arrays are ready')
+    elif cache_path and os.path.exists(cache_path) and not args.rebuild_train_cache:
+        log(f"[Load legacy train cache] {cache_path}")
         with open(cache_path, "rb") as f:
             cache_obj = pickle.load(f)
         X_edge = cache_obj["X_edge"]
@@ -1473,30 +1846,25 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
         X_node = cache_obj["X_node"]
         Y_node = cache_obj["Y_node"]
         meta = cache_obj["meta"]
+        log('[Train] legacy_cache_loaded arrays are in memory')
     else:
+        log('[Train] cache miss -> building training examples')
         X_edge, Y_edge, X_node, Y_node, meta = collect_training_examples(args, samples, embedder)
         
         if cache_path:
-            cache_dir = os.path.dirname(cache_path)
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-            with open(cache_path, "wb") as f:
-                pickle.dump({
-                    "X_edge": X_edge,
-                    "Y_edge": Y_edge,
-                    "X_node": X_node,
-                    "Y_node": Y_node,
-                    "meta": meta,
-                }, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[Saved train cache] {cache_path}")
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(os.path.join(cache_dir, 'meta.json'), 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            log(f"[Saved train cache dir] {cache_dir}")
     
-    print(json.dumps(meta, indent=2, ensure_ascii=False))
+    log(json.dumps(meta, indent=2, ensure_ascii=False))
     
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    log(f'[Train] device={device} edge_shape={tuple(X_edge.shape)} node_shape={tuple(X_node.shape)}')
     
     # ============ 关键改动：选择训练模式 ============
     if args.joint_training:
-        print("[Mode] Joint Training with Shared Encoder")
+        log("[Mode] Joint Training with Shared Encoder")
         joint_state, edge_best_dev, node_best_dev = train_joint_model(
             args, X_edge, Y_edge, X_node, Y_node, device
         )
@@ -1515,10 +1883,10 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
             'is_joint': True,
         }
         torch.save(ckpt, args.model_ckpt)
-        print(f'[Saved Joint Model] {args.model_ckpt}')
+        log(f'[Saved Joint Model] {args.model_ckpt}')
         
     else:
-        print("[Mode] Independent Training")
+        log("[Mode] Independent Training")
         # 原有独立训练逻辑
         edge_model = MLPScorer(
             in_dim=X_edge.shape[1],
@@ -1533,6 +1901,7 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
         ).to(device)
         
         edge_state, edge_best_dev = train_one_binary_model(
+            args=args,
             model=edge_model, X=X_edge, Y=Y_edge,
             train_batch_size=args.train_batch_size,
             lr=args.lr, weight_decay=args.weight_decay,
@@ -1542,6 +1911,7 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
         )
         
         node_state, node_best_dev = train_one_binary_model(
+            args=args,
             model=node_model, X=X_node, Y=Y_node,
             train_batch_size=args.train_batch_size,
             lr=args.end_lr, weight_decay=args.weight_decay,
@@ -1566,27 +1936,38 @@ def train_model(args, samples: List[Dict[str, Any]], embedder: SentenceTransform
             'is_joint': False,
         }
         torch.save(ckpt, args.model_ckpt)
-        print(f'[Saved] {args.model_ckpt}')
+        log(f'[Saved] {args.model_ckpt}')
     
-    print(json.dumps({
+    log(json.dumps({
         'edge_best_dev_f1': edge_best_dev,
         'node_best_dev_f1': node_best_dev,
         **meta
     }, ensure_ascii=False, indent=2))
 
 
-def eval_binary_f1(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float) -> float:
+def eval_binary_f1(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float,
+    tag: str = 'dev',
+    log_interval: int = 0,
+) -> float:
     model.eval()
     tp = fp = fn = 0
     with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+        for batch_idx, (xb, yb) in enumerate(loader, start=1):
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
             probs = torch.sigmoid(model(xb))
             pred = (probs >= threshold).float()
             tp += int(((pred == 1) & (yb == 1)).sum().item())
             fp += int(((pred == 1) & (yb == 0)).sum().item())
             fn += int(((pred == 0) & (yb == 1)).sum().item())
+            if log_interval > 0 and (
+                batch_idx == 1 or batch_idx % log_interval == 0 or batch_idx == len(loader)
+            ):
+                log(f'[{tag}] eval_batch={batch_idx}/{len(loader)}')
     p = tp / max(1, tp + fp)
     r = tp / max(1, tp + fn)
     if p + r == 0:
@@ -1731,6 +2112,7 @@ def apply_two_stage_joint_scores(
 
     for eid, e in kvedges.items():
         edge_s = float(edge_scores.get(eid, 0.0))
+        e.edge_score = edge_s
         dst_end = float(node_end_scores.get(e.dst, 0.0))
         src_end = float(node_end_scores.get(e.src, 0.0))
         src_incoming = float(incoming_best.get(e.src, 0.0))
@@ -2001,6 +2383,7 @@ def export_kv_nodes_and_adj(kept_kvedges: Set[int], kvedges: Dict[int, KVEdge], 
             'kv_idx': e.kv_idx,
         }
         if keep_score:
+            obj['edge_score'] = float(e.edge_score)
             obj['score'] = float(e.score)
         kv_nodes.append(obj)
     n = len(kv_nodes)
@@ -2329,7 +2712,264 @@ def answer_terminalization(
 
 
 
-def create_dag_with_model(
+def _init_generation_state() -> Dict[str, Any]:
+    return {
+        'out_samples': [],
+        'answer_recall': 0,
+        'graph_recall': 0,
+        'none_sink_recall': 0,
+        'answer_supported_recall': 0,
+        'sink_rank_buckets': {},
+        'answer_unsupported_sample_ids': [],
+        'answer_supported_sample_ids': [],
+    }
+
+
+def _init_latency_stats() -> Dict[str, Any]:
+    return {
+        'graph_build_s': 0.0,
+        'question_encode_s': 0.0,
+        'doc_text_encode_s': 0.0,
+        'feature_build_s': 0.0,
+        'model_scoring_s': 0.0,
+        'dag_postprocess_s': 0.0,
+        'export_s': 0.0,
+        'samples_profiled': 0,
+    }
+
+
+def _report_generation_summary(samples: List[Dict[str, Any]], state: Dict[str, Any]) -> None:
+    if len(samples) == 0:
+        return
+
+    print(f'Answer recall: {state["answer_recall"] / len(samples):.4f}')
+    print(f'Graph  recall: {state["graph_recall"] / len(samples):.4f}')
+    print(f'None-sink recall: {state["none_sink_recall"] / len(samples):.4f}')
+    print(f'Answer + supported sink ratio: {state["answer_supported_recall"] / len(samples):.4f}')
+    if state['sink_rank_buckets']:
+        merged_sink_rank_stats = merge_sink_rank_buckets(state['sink_rank_buckets'])
+        topk_probs = [
+            f'top-{k}={prob:.4f}'
+            for k, prob in enumerate(merged_sink_rank_stats['topk_probs'], start=1)
+        ]
+        print('Sink relevance rank stats (merged across final sink counts):')
+        print(
+            f'  all_samples={merged_sink_rank_stats["all_samples"]} '
+            f'answer_sink_samples={merged_sink_rank_stats["answer_sink_samples"]} '
+            + ' '.join(topk_probs)
+        )
+
+
+def _report_latency_summary(latency_stats: Dict[str, Any]) -> None:
+    n = latency_stats['samples_profiled']
+    if n <= 0:
+        return
+
+    online_total = (
+        latency_stats['question_encode_s']
+        + latency_stats['feature_build_s']
+        + latency_stats['model_scoring_s']
+        + latency_stats['dag_postprocess_s']
+        + latency_stats['export_s']
+    )
+    offline_total = latency_stats['graph_build_s'] + latency_stats['doc_text_encode_s']
+    print('Online latency breakdown:')
+    print(
+        f'  samples={n} '
+        f'question_encode={latency_stats["question_encode_s"]:.4f}s '
+        f'feature_build={latency_stats["feature_build_s"]:.4f}s '
+        f'model_scoring={latency_stats["model_scoring_s"]:.4f}s '
+        f'dag_postprocess={latency_stats["dag_postprocess_s"]:.4f}s '
+        f'export={latency_stats["export_s"]:.4f}s '
+        f'online_total={online_total:.4f}s'
+    )
+    print(
+        f'  avg_per_sample='
+        f'{(online_total / n):.6f}s '
+        f'question_encode={(latency_stats["question_encode_s"] / n):.6f}s '
+        f'feature_build={(latency_stats["feature_build_s"] / n):.6f}s '
+        f'model_scoring={(latency_stats["model_scoring_s"] / n):.6f}s '
+        f'dag_postprocess={(latency_stats["dag_postprocess_s"] / n):.6f}s '
+        f'export={(latency_stats["export_s"] / n):.6f}s'
+    )
+    print('Offline/auxiliary breakdown:')
+    print(
+        f'  graph_build={latency_stats["graph_build_s"]:.4f}s '
+        f'doc_text_encode={latency_stats["doc_text_encode_s"]:.4f}s '
+        f'offline_total={offline_total:.4f}s'
+    )
+    print(
+        f'  avg_per_sample='
+        f'{(offline_total / n):.6f}s '
+        f'graph_build={(latency_stats["graph_build_s"] / n):.6f}s '
+        f'doc_text_encode={(latency_stats["doc_text_encode_s"] / n):.6f}s'
+    )
+
+
+def _process_sample_dag(
+    args,
+    sample: Dict[str, Any],
+    sample_idx: int,
+    answer: str,
+    topic_nodes: List[int],
+    kvedges: Dict[int, KVEdge],
+    out_adj: Dict[int, List[int]],
+    in_adj: Dict[int, List[int]],
+    feat_dict: Dict[int, Dict[str, Any]],
+    edge_scores: Dict[int, float],
+    node_end_scores: Dict[int, float],
+    state: Dict[str, Any],
+    verbose: bool = False,
+) -> Tuple[float, float]:
+    if verbose:
+        print(f"edge_scores: {edge_scores}")
+        print(f"node_end_scores: {node_end_scores}")
+
+    dag_t0 = time.perf_counter()
+    apply_two_stage_joint_scores(
+        kvedges=kvedges,
+        edge_scores=edge_scores,
+        node_end_scores=node_end_scores,
+        alpha=args.end_alpha,
+        beta=args.end_beta,
+        gamma=args.end_gamma,
+    )
+    if verbose:
+        print_kvedge_graph(kvedges, out_adj, in_adj)
+
+    if any(value_matches_answer(e.value, answer) for e in kvedges.values()):
+        state['graph_recall'] += 1
+
+    kept_nodes, kept_edges = select_subgraph_edges(
+        topic_nodes=topic_nodes,
+        kvedges=kvedges,
+        out_adj=out_adj,
+        max_edges=args.max_edges,
+        max_nodes=args.max_nodes,
+        per_src_cap=args.per_src_cap,
+        expansion_hops=args.expansion_hops,
+        seed_edge_topk=args.seed_edge_topk,
+    )
+
+    if verbose:
+        print(f"kept nodes after subgraph selection: {kept_nodes}")
+        print(f"kept edges after subgraph selection: {kept_edges}")
+
+    kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
+    if verbose:
+        print(f"kept nodes after cycle breaking: {kept_nodes}")
+        print(f"kept edges after cycle breaking: {kept_edges}")
+
+    if args.answer_aware:
+        kept_nodes, kept_edges = answer_terminalization(
+            topic_nodes=topic_nodes,
+            max_sinks=args.max_sinks,
+            answer=answer,
+            kept_nodes=kept_nodes,
+            kept_edges=kept_edges,
+            kvedges=kvedges,
+        )
+
+    kept_nodes, kept_edges = enforce_max_sinks(topic_nodes, args.max_sinks, kept_nodes, kept_edges, kvedges)
+    kept_nodes, kept_edges = enforce_max_terminal_kv_nodes(
+        topic_nodes=topic_nodes,
+        max_sinks=args.max_sinks,
+        answer=answer,
+        kept_nodes=kept_nodes,
+        kept_edges=kept_edges,
+        kvedges=kvedges,
+    )
+    if verbose:
+        print(f"kept nodes after sink enforcement: {kept_nodes}")
+        print(f"kept edges after sink enforcement: {kept_edges}")
+    kept_nodes, kept_edges = reverse_beam_expand_from_sink_edges(
+        selected_nodes=kept_nodes,
+        selected_edges=kept_edges,
+        kvedges=kvedges,
+        in_adj=in_adj,
+        max_edges=args.max_edges,
+        max_nodes=args.max_nodes,
+        sink_edge_topk=args.reverse_sink_edge_topk,
+        reverse_hops=args.reverse_sink_hops,
+        beam_width=args.reverse_sink_beam_width,
+    )
+
+    dag_elapsed = time.perf_counter() - dag_t0
+    if not kept_edges:
+        sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'empty_after_prune'}}
+        state['out_samples'].append(sample)
+        return dag_elapsed, 0.0
+
+    outdeg = defaultdict(int)
+    for eid in kept_edges:
+        outdeg[kvedges[eid].src] += 1
+    sinks = [n for n in kept_nodes if outdeg.get(n, 0) == 0]
+
+    sink_hit = False
+    for sink in sinks:
+        for eid in kept_edges:
+            if kvedges[eid].dst == sink and value_matches_answer(kvedges[eid].value, answer):
+                sink_hit = True
+                break
+        if sink_hit:
+            break
+    if sink_hit:
+        state['answer_recall'] += 1
+    else:
+        if args.answer_aware:
+            return dag_elapsed, 0.0
+
+    sink_rank_stats = compute_sink_relevance_stats(
+        kept_edges=kept_edges,
+        kvedges=kvedges,
+        feat_dict=feat_dict,
+        answer=answer,
+    )
+    sample_id = sample.get('id', sample.get('_id', f'sample_{sample_idx}'))
+    if any(item['is_answer_sink'] and item['has_inbound'] for item in sink_rank_stats['sink_scores']):
+        state['answer_supported_recall'] += 1
+        state['answer_supported_sample_ids'].append(sample_id)
+    else:
+        if sink_hit:
+            state['answer_unsupported_sample_ids'].append(sample_id)
+
+    if any(value_matches_answer(kvedges[eid].value, answer) for eid in kept_edges):
+        state['none_sink_recall'] += 1
+
+    update_sink_rank_buckets(
+        rank_buckets=state['sink_rank_buckets'],
+        num_sinks=sink_rank_stats['num_sinks'],
+        best_answer_rank=sink_rank_stats['best_answer_rank'],
+    )
+
+    export_t0 = time.perf_counter()
+    kv_nodes, adj = export_kv_nodes_and_adj(kept_edges, kvedges, keep_score=args.keep_score)
+    if verbose:
+        print(f"Exported KV nodes: {kv_nodes}")
+        print(f"Exported adjacency matrix: {adj}")
+    goal_ids: List[int] = []
+    if answer:
+        for j, kv in enumerate(kv_nodes):
+            if value_matches_answer(kv.get('value', ''), answer):
+                goal_ids.append(j)
+
+    sample['dag'] = {
+        'kv_nodes': kv_nodes,
+        'adj': adj,
+        'meta': {
+            'num_entity_nodes': int(len(kept_nodes)),
+            'num_kv_edges': int(len(kept_edges)),
+            'num_kv_nodes': int(len(kv_nodes)),
+            'goal_ids': goal_ids,
+            'topic_entity_ids': [int(x) for x in topic_nodes],
+            'scorer': 'trainable_subgraphrag_mlp_two_stage_node_ending',
+        },
+    }
+    state['out_samples'].append(sample)
+    return dag_elapsed, (time.perf_counter() - export_t0)
+
+
+def create_dag_with_model_batched(
     args,
     samples: List[Dict[str, Any]],
     embedder: SentenceTransformer,
@@ -2338,28 +2978,20 @@ def create_dag_with_model(
     ckpt: Dict[str, Any],
     device: torch.device,
     verbose: bool = False,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
     if args.limit is not None and args.limit > 0:
         samples = samples[:args.limit]
 
     if verbose:
-        target_sample=0
+        target_sample = 0
         for s in samples:
             if s.get('answer') == "Rome":
                 target_sample = s
                 break
         samples = [target_sample]
         print(samples)
-    out_samples: List[Dict[str, Any]] = []
-    answer_recall = 0
-    graph_recall = 0
-    none_sink_recall = 0
-    answer_supported_recall = 0
-    sink_rank_buckets: Dict[int, Dict[str, Any]] = {}
-    
-    answer_unsupported_sample_ids: List[int] = []
-    answer_supported_sample_ids: List[int] = []
 
+    state = _init_generation_state()
     is_joint = ckpt.get('is_joint', False)
     infer_batch_size = max(1, int(args.infer_batch_size))
     for batch_start in tqdm(
@@ -2368,7 +3000,8 @@ def create_dag_with_model(
     ):
         sample_batch = samples[batch_start: batch_start + infer_batch_size]
         prepared: List[Dict[str, Any]] = []
-        text_pool: List[str] = []
+        question_texts: List[str] = []
+        doc_texts: List[str] = []
 
         for sample in sample_batch:
             question = norm_text(sample.get('question', ''))
@@ -2380,15 +3013,15 @@ def create_dag_with_model(
             node_names, kvedges, out_adj, in_adj = build_kvedge_graph(sample, supporting_only=args.supporting_only)
             if not kvedges:
                 sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'no_kv_edges'}}
-                out_samples.append(sample)
+                state['out_samples'].append(sample)
                 continue
 
-            text_pool.append(question)
-            text_pool.extend(node_names)
+            question_texts.append(question)
+            doc_texts.extend(node_names)
             for e in kvedges.values():
-                text_pool.append(norm_text(e.relation or e.key))
-                text_pool.append(norm_text(e.key))
-                text_pool.append(norm_text(e.value))
+                doc_texts.append(norm_text(e.relation or e.key))
+                doc_texts.append(norm_text(e.key))
+                doc_texts.append(norm_text(e.value))
             prepared.append({
                 'sample': sample,
                 'question': question,
@@ -2402,9 +3035,9 @@ def create_dag_with_model(
         if not prepared:
             continue
 
-        text_emb_cache = embed_texts_cached(
+        text_emb_cache = merge_text_embedding_caches(
             embedder=embedder,
-            texts=text_pool,
+            text_groups=[question_texts, doc_texts],
             batch_size=infer_batch_size,
         )
 
@@ -2484,175 +3117,190 @@ def create_dag_with_model(
                 node_scores_by_sample[i] = {nid: float(part[j]) for j, nid in enumerate(nids)}
 
         for i, ctx in enumerate(prepared):
-            sample = ctx['sample']
-            answer = ctx['answer']
-            topic_nodes = ctx['topic_nodes']
-            kvedges = ctx['kvedges']
-            out_adj = ctx['out_adj']
-            in_adj = ctx['in_adj']
-            edge_scores = edge_scores_by_sample[i]
-            node_end_scores = node_scores_by_sample[i]
-
-            if verbose:
-                print(f"edge_scores: {edge_scores}")
-                print(f"node_end_scores: {node_end_scores}")
-            apply_two_stage_joint_scores(
-                kvedges=kvedges,
-                edge_scores=edge_scores,
-                node_end_scores=node_end_scores,
-                alpha=args.end_alpha,
-                beta=args.end_beta,
-                gamma=args.end_gamma,
-            )
-            if verbose:
-                print_kvedge_graph(kvedges, out_adj, in_adj)
-
-            if any(value_matches_answer(e.value, answer) for e in kvedges.values()):
-                graph_recall += 1
-
-            kept_nodes, kept_edges = select_subgraph_edges(
-                topic_nodes=topic_nodes,
-                kvedges=kvedges,
-                out_adj=out_adj,
-                max_edges=args.max_edges,
-                max_nodes=args.max_nodes,
-                per_src_cap=args.per_src_cap,
-                expansion_hops=args.expansion_hops,
-                seed_edge_topk=args.seed_edge_topk,
-            )
-
-            if verbose:
-                print(f"kept nodes after subgraph selection: {kept_nodes}")
-                print(f"kept edges after subgraph selection: {kept_edges}")
-
-            kept_edges = break_cycles_to_dag(kept_nodes, kept_edges, kvedges)
-            if verbose:
-                print(f"kept nodes after cycle breaking: {kept_nodes}")
-                print(f"kept edges after cycle breaking: {kept_edges}")
-                
-
-            if args.answer_aware:
-                kept_nodes, kept_edges = answer_terminalization(
-                    topic_nodes=topic_nodes,
-                    max_sinks=args.max_sinks,
-                    answer=answer,
-                    kept_nodes=kept_nodes,
-                    kept_edges=kept_edges,
-                    kvedges=kvedges,
-                )
-
-            kept_nodes, kept_edges = enforce_max_sinks(topic_nodes, args.max_sinks, kept_nodes, kept_edges, kvedges)
-            kept_nodes, kept_edges = enforce_max_terminal_kv_nodes(
-                topic_nodes=topic_nodes,
-                max_sinks=args.max_sinks,
-                answer=answer,
-                kept_nodes=kept_nodes,
-                kept_edges=kept_edges,
-                kvedges=kvedges,
-            )
-            if verbose:
-                print(f"kept nodes after sink enforcement: {kept_nodes}")
-                print(f"kept edges after sink enforcement: {kept_edges}")
-            kept_nodes, kept_edges = reverse_beam_expand_from_sink_edges(
-                selected_nodes=kept_nodes,
-                selected_edges=kept_edges,
-                kvedges=kvedges,
-                in_adj=in_adj,
-                max_edges=args.max_edges,
-                max_nodes=args.max_nodes,
-                sink_edge_topk=args.reverse_sink_edge_topk,
-                reverse_hops=args.reverse_sink_hops,
-                beam_width=args.reverse_sink_beam_width,
-            )
-
-            if not kept_edges:
-                sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'empty_after_prune'}}
-                out_samples.append(sample)
-                continue
-
-            outdeg = defaultdict(int)
-            for eid in kept_edges:
-                outdeg[kvedges[eid].src] += 1
-            sinks = [n for n in kept_nodes if outdeg.get(n, 0) == 0]
-
-            sink_hit = False
-            for sink in sinks:
-                for eid in kept_edges:
-                    if kvedges[eid].dst == sink and value_matches_answer(kvedges[eid].value, answer):
-                        sink_hit = True
-                        break
-                if sink_hit:
-                    break
-            if sink_hit:
-                answer_recall += 1
-            else:
-                if args.answer_aware:
-                    continue
-            sink_rank_stats = compute_sink_relevance_stats(
-                kept_edges=kept_edges,
-                kvedges=kvedges,
+            _process_sample_dag(
+                args=args,
+                sample=ctx['sample'],
+                sample_idx=batch_start + i,
+                answer=ctx['answer'],
+                topic_nodes=ctx['topic_nodes'],
+                kvedges=ctx['kvedges'],
+                out_adj=ctx['out_adj'],
+                in_adj=ctx['in_adj'],
                 feat_dict=ctx['feat_dict'],
-                answer=answer,
-            )
-            if any(item['is_answer_sink'] and item['has_inbound'] for item in sink_rank_stats['sink_scores']):
-                answer_supported_recall += 1
-                answer_supported_sample_ids.append(sample.get('id', sample.get('_id', f'sample_{batch_start + i}')))
-            else:
-                if sink_hit:
-                    answer_unsupported_sample_ids.append(sample.get('id',sample.get('_id', f'sample_{batch_start + i}')))
-
-            if any(value_matches_answer(kvedges[eid].value, answer) for eid in kept_edges):
-                none_sink_recall += 1
-
-            update_sink_rank_buckets(
-                rank_buckets=sink_rank_buckets,
-                num_sinks=sink_rank_stats['num_sinks'],
-                best_answer_rank=sink_rank_stats['best_answer_rank'],
+                edge_scores=edge_scores_by_sample[i],
+                node_end_scores=node_scores_by_sample[i],
+                state=state,
+                verbose=verbose,
             )
 
-            kv_nodes, adj = export_kv_nodes_and_adj(kept_edges, kvedges, keep_score=args.keep_score)
-            if verbose:
-                print(f"Exported KV nodes: {kv_nodes}")
-                print(f"Exported adjacency matrix: {adj}")
-            goal_ids: List[int] = []
-            if answer:
-                for j, kv in enumerate(kv_nodes):
-                    if value_matches_answer(kv.get('value', ''), answer):
-                        goal_ids.append(j)
+    _report_generation_summary(samples, state)
+    return state['out_samples'], state['answer_unsupported_sample_ids'], state['answer_supported_sample_ids']
 
-            sample['dag'] = {
-                'kv_nodes': kv_nodes,
-                'adj': adj,
-                'meta': {
-                    'num_entity_nodes': int(len(kept_nodes)),
-                    'num_kv_edges': int(len(kept_edges)),
-                    'num_kv_nodes': int(len(kv_nodes)),
-                    'goal_ids': goal_ids,
-                    'topic_entity_ids': [int(x) for x in topic_nodes],
-                    'scorer': 'trainable_subgraphrag_mlp_two_stage_node_ending',
-                },
-            }
-            out_samples.append(sample)
 
-    if len(samples) > 0:
-        print(f'Answer recall: {answer_recall / len(samples):.4f}')
-        print(f'Graph  recall: {graph_recall / len(samples):.4f}')
-        print(f'None-sink recall: {none_sink_recall / len(samples):.4f}')
-        print(f'Answer + supported sink ratio: {answer_supported_recall / len(samples):.4f}')
-        if sink_rank_buckets:
-            merged_sink_rank_stats = merge_sink_rank_buckets(sink_rank_buckets)
-            topk_probs = [
-                f'top-{k}={prob:.4f}'
-                for k, prob in enumerate(merged_sink_rank_stats['topk_probs'], start=1)
-            ]
-            print('Sink relevance rank stats (merged across final sink counts):')
-            print(
-                f'  all_samples={merged_sink_rank_stats["all_samples"]} '
-                f'answer_sink_samples={merged_sink_rank_stats["answer_sink_samples"]} '
-                + ' '.join(topk_probs)
+def create_dag_with_model_profiled(
+    args,
+    samples: List[Dict[str, Any]],
+    embedder: SentenceTransformer,
+    edge_model: MLPScorer,
+    node_model: NodeEndScorer,
+    ckpt: Dict[str, Any],
+    device: torch.device,
+    verbose: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+    if args.limit is not None and args.limit > 0:
+        samples = samples[:args.limit]
+
+    if verbose:
+        target_sample = 0
+        for s in samples:
+            if s.get('answer') == "Rome":
+                target_sample = s
+                break
+        samples = [target_sample]
+        print(samples)
+
+    state = _init_generation_state()
+    latency_stats = _init_latency_stats()
+    is_joint = ckpt.get('is_joint', False)
+
+    for sample_idx, sample in enumerate(tqdm(samples, desc='Create DAG (strict per-sample profiling)')):
+        question = norm_text(sample.get('question', ''))
+        answer = norm_text(sample.get('answer', ''))
+        if verbose:
+            print(f"\nQuestion: {question}")
+            print(f"Answer: {answer}")
+
+        graph_build_t0 = time.perf_counter()
+        node_names, kvedges, out_adj, in_adj = build_kvedge_graph(sample, supporting_only=args.supporting_only)
+        latency_stats['graph_build_s'] += time.perf_counter() - graph_build_t0
+
+        latency_stats['samples_profiled'] += 1
+        if not kvedges:
+            sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'no_kv_edges'}}
+            state['out_samples'].append(sample)
+            continue
+
+        q_enc_t0 = time.perf_counter()
+        question_emb_cache = merge_text_embedding_caches(
+            embedder=embedder,
+            text_groups=[[question]],
+            batch_size=1,
+        )
+        latency_stats['question_encode_s'] += time.perf_counter() - q_enc_t0
+
+        doc_texts: List[str] = list(node_names)
+        for e in kvedges.values():
+            doc_texts.append(norm_text(e.relation or e.key))
+            doc_texts.append(norm_text(e.key))
+            doc_texts.append(norm_text(e.value))
+        doc_batch_size = max(1, len(doc_texts))
+        doc_enc_t0 = time.perf_counter()
+        doc_emb_cache = merge_text_embedding_caches(
+            embedder=embedder,
+            text_groups=[doc_texts],
+            batch_size=doc_batch_size,
+        )
+        latency_stats['doc_text_encode_s'] += time.perf_counter() - doc_enc_t0
+        text_emb_cache = {**doc_emb_cache, **question_emb_cache}
+
+        feature_t0 = time.perf_counter()
+        topic_nodes, feat_dict = build_edge_feature_dict(
+            question=question,
+            node_names=node_names,
+            node_emb=None,
+            kvedges=kvedges,
+            out_adj=out_adj,
+            in_adj=in_adj,
+            embedder=None,
+            batch_size=1,
+            topic_top_k=args.topic_top_k,
+            dde_hops=args.dde_hops,
+            mention_bonus=args.mention_bonus,
+            text_emb_cache=text_emb_cache,
+        )
+        node_emb = np.stack([text_emb_cache[norm_text(x)] for x in node_names]).astype(np.float32)
+        node_feat_dict = build_node_feature_dict(
+            question=question,
+            node_names=node_names,
+            node_emb=node_emb,
+            kvedges=kvedges,
+            out_adj=out_adj,
+            in_adj=in_adj,
+            topic_nodes=topic_nodes,
+            feat_dict=feat_dict,
+        )
+        latency_stats['feature_build_s'] += time.perf_counter() - feature_t0
+
+        scoring_t0 = time.perf_counter()
+        edge_scores: Dict[int, float] = {}
+        eids = sorted(feat_dict.keys())
+        if eids:
+            edge_X = np.stack([feat_dict[eid]['vector'] for eid in eids]).astype(np.float32)
+            edge_forward = edge_model.forward_edge if is_joint else None
+            edge_scores_all = _batched_sigmoid_scores(
+                edge_model,
+                device,
+                edge_X,
+                max(1, edge_X.shape[0]),
+                forward_fn=edge_forward,
             )
+            edge_scores = {eid: float(edge_scores_all[j]) for j, eid in enumerate(eids)}
 
-    return out_samples, answer_unsupported_sample_ids, answer_supported_sample_ids
+        node_end_scores: Dict[int, float] = {}
+        nids = sorted(node_feat_dict.keys())
+        if nids:
+            node_X = np.stack([node_feat_dict[nid]['vector'] for nid in nids]).astype(np.float32)
+            node_forward = node_model.forward_node if is_joint else None
+            node_scores_all = _batched_sigmoid_scores(
+                node_model,
+                device,
+                node_X,
+                max(1, node_X.shape[0]),
+                forward_fn=node_forward,
+            )
+            node_end_scores = {nid: float(node_scores_all[j]) for j, nid in enumerate(nids)}
+        latency_stats['model_scoring_s'] += time.perf_counter() - scoring_t0
+
+        dag_elapsed, export_elapsed = _process_sample_dag(
+            args=args,
+            sample=sample,
+            sample_idx=sample_idx,
+            answer=answer,
+            topic_nodes=topic_nodes,
+            kvedges=kvedges,
+            out_adj=out_adj,
+            in_adj=in_adj,
+            feat_dict=feat_dict,
+            edge_scores=edge_scores,
+            node_end_scores=node_end_scores,
+            state=state,
+            verbose=verbose,
+        )
+        latency_stats['dag_postprocess_s'] += dag_elapsed
+        latency_stats['export_s'] += export_elapsed
+
+    _report_generation_summary(samples, state)
+    _report_latency_summary(latency_stats)
+    return state['out_samples'], state['answer_unsupported_sample_ids'], state['answer_supported_sample_ids']
+
+
+def create_dag_with_model(
+    args,
+    samples: List[Dict[str, Any]],
+    embedder: SentenceTransformer,
+    edge_model: MLPScorer,
+    node_model: NodeEndScorer,
+    ckpt: Dict[str, Any],
+    device: torch.device,
+    verbose: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+    if args.profile_online_latency:
+        return create_dag_with_model_profiled(
+            args, samples, embedder, edge_model, node_model, ckpt, device, verbose=verbose
+        )
+    return create_dag_with_model_batched(
+        args, samples, embedder, edge_model, node_model, ckpt, device, verbose=verbose
+    )
 
 
 def drop_empty_kv_samples(samples: List[Dict[str, Any]], answerable_only: bool) -> List[Dict[str, Any]]:
@@ -2665,12 +3313,79 @@ def drop_empty_kv_samples(samples: List[Dict[str, Any]], answerable_only: bool) 
         if isinstance(kv_nodes, list) and len(kv_nodes) > 0:
             kept.append(s)
     return kept
+
+
+def create_dag_baseline_all_triples(
+    args,
+    samples: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+    out_samples: List[Dict[str, Any]] = []
+    answer_unsupported_sample_ids: List[int] = []
+    answer_supported_sample_ids: List[int] = []
+
+    for sample in tqdm(samples, desc='Baseline DAG'):
+        node_names, kvedges, out_adj, in_adj = build_kvedge_graph(
+            sample,
+            supporting_only=args.supporting_only,
+        )
+
+        kept_edges = set(kvedges.keys())
+        kept_list = sorted(kept_edges)
+        kv_nodes: List[Dict[str, Any]] = []
+        answer = norm_text(sample.get('answer', ''))
+        goal_ids: List[int] = []
+
+        for idx, eid in enumerate(kept_list):
+            e = kvedges[eid]
+            obj = {
+                'key': e.key,
+                'value': e.value,
+                'src_entity': e.src_name,
+                'dst_entity': e.dst_name,
+                'title': e.title,
+                'triple_type': e.triple_type,
+                'relation': e.relation,
+                'kv_idx': e.kv_idx,
+            }
+            if args.keep_score:
+                obj['edge_score'] = 0.0
+                obj['score'] = 0.0
+            kv_nodes.append(obj)
+            if answer and value_matches_answer(e.value, answer):
+                goal_ids.append(idx)
+
+        n = len(kv_nodes)
+        adj = [[0] * n for _ in range(n)]
+
+        sample['dag'] = {
+            'kv_nodes': kv_nodes,
+            'adj': adj,
+            'meta': {
+                'num_entity_nodes': int(len(node_names)),
+                'num_kv_edges': int(len(kept_edges)),
+                'num_kv_nodes': int(len(kv_nodes)),
+                'goal_ids': goal_ids,
+                'topic_entity_ids': [],
+                'scorer': 'baseline_all_triples_zero_adj',
+            },
+        }
+        out_samples.append(sample)
+
+        sid = sample.get('id', sample.get('_id', None))
+        if sid is not None:
+            if goal_ids:
+                answer_supported_sample_ids.append(sid)
+            else:
+                answer_unsupported_sample_ids.append(sid)
+
+    return out_samples, answer_unsupported_sample_ids, answer_supported_sample_ids
+
 # ============================================================
 # 9) CLI
 # ============================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['train', 'infer'], default='infer')
+    ap.add_argument('--mode', choices=['train', 'infer', 'baseline'], default='infer')
     ap.add_argument('--input', required=True)
     ap.add_argument('--output', default='')
     ap.add_argument('--model_ckpt', default='subgraphrag_mlp.pt')
@@ -2707,6 +3422,16 @@ def main():
     ap.add_argument('--hidden_dim', type=int, default=512)
     ap.add_argument('--dropout', type=float, default=0.10)
     ap.add_argument('--train_batch_size', type=int, default=512)
+    ap.add_argument('--num_workers', type=int, default=0,
+                    help='Number of DataLoader workers for training and dev evaluation.')
+    ap.add_argument('--prefetch_batches', type=int, default=2,
+                    help='Prefetch factor for each DataLoader worker.')
+    ap.add_argument('--disable_pin_memory', action='store_true',
+                    help='Disable pinned host memory when training on GPU.')
+    ap.add_argument('--train_log_interval', type=int, default=200,
+                    help='Log once every N training batches.')
+    ap.add_argument('--eval_log_interval', type=int, default=100,
+                    help='Log once every N eval batches.')
     ap.add_argument('--dev_ratio', type=float, default=0.1)
     ap.add_argument('--patience', type=int, default=3)
     ap.add_argument('--threshold', type=float, default=0.5)
@@ -2744,32 +3469,78 @@ def main():
 
     ap.add_argument('--answerable_only', action='store_true',
                     help='Only include answerable samples in training')
+    ap.add_argument(
+        '--keep_type',
+        type=str,
+        default='',
+        help='Optional comma-separated sample types to keep, e.g. bridge or bridge,compositional.',
+    )
 
     ap.add_argument('--dis_out_path', default=None)
+    ap.add_argument(
+        '--profile_online_latency',
+        action='store_true',
+        help='Print a latency breakdown for online DAG generation stages.',
+    )
 
     args = ap.parse_args()
 
     print(args)
-    embedder = SentenceTransformer(args.st_model)
     samples = read_json_or_jsonl(args.input)
     if args.limit:
         samples = samples[:args.limit]
-    
-    new_samples=[]
-    for s in samples:
-        if s.get('type')=="bridge":
-            new_samples.append(s)
-    samples=new_samples
+
+    if args.keep_type.strip():
+        keep_types = {norm_match(x) for x in args.keep_type.split(',') if x.strip()}
+        samples = [s for s in samples if norm_match(s.get('type', '')) in keep_types]
 
     print(f'Load {len(samples)} samples from {args.input}')
 
     if args.mode == 'train':
+        embedder = SentenceTransformer(args.st_model)
         train_model(args, samples, embedder)
+        return
+
+    if args.mode == 'baseline':
+        out, answer_unsupported_sample_ids, answer_supported_sample_ids = create_dag_baseline_all_triples(
+            args,
+            samples,
+        )
+        out = drop_empty_kv_samples(out, answerable_only=args.answerable_only)
+
+        if args.dis_out_path and out:
+            if "islet" in args.dis_out_path:
+                evaluated_samples_ids = []
+                for s in out:
+                    sid = s.get('id', s.get('_id', None))
+                    if sid is not None and sid not in answer_unsupported_sample_ids:
+                        evaluated_samples_ids.append(sid)
+            elif "supported" in args.dis_out_path:
+                evaluated_samples_ids = answer_supported_sample_ids
+            else:
+                evaluated_samples_ids = answer_supported_sample_ids
+
+            print(f"Saving {len(evaluated_samples_ids)} evaluated sample IDs to {args.dis_out_path}")
+            with open(args.dis_out_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "evaluated_samples": evaluated_samples_ids,
+                }, f, ensure_ascii=False, indent=2)
+
+        if not args.output:
+            raise ValueError('--output is required for --mode baseline')
+        if args.output.endswith('.jsonl'):
+            write_jsonl(args.output, out)
+        elif args.output.endswith('.json'):
+            write_json(args.output, out)
+        else:
+            raise ValueError(f'Unknown file format: {args.output}')
+        print(f'[DONE] input={len(samples)} output={len(out)} saved_to={args.output}')
         return
 
     if not args.model_ckpt or not os.path.exists(args.model_ckpt):
         raise FileNotFoundError(f'For --mode infer, model checkpoint is required: {args.model_ckpt}')
 
+    embedder = SentenceTransformer(args.st_model)
     edge_model, node_model, ckpt, device = load_model(args.model_ckpt, cpu=args.cpu)
     print(f'Loaded scorer from {args.model_ckpt}')
     out, answer_unsupported_sample_ids, answer_supported_sample_ids = create_dag_with_model(

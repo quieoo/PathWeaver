@@ -1,13 +1,20 @@
 from typing import Optional
 import re
+import time
 
 import numpy as np
 import torch
 import transformers
+from transformers.generation.streamers import BaseStreamer
 
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
+from kblam.models.llama3_model import kblam_profile_set
+from kblam.kblam_attention.kblam_path import (
+    is_path_attn_trace_enabled,
+    update_path_attn_trace_context,
+)
 
 instruction_prompts = """
 Please answer questions based on the given text with format: "The {property} of {name} is {description}"
@@ -24,6 +31,11 @@ Please answer the question in a very compact manner with format: The {property} 
 zero_shot_prompt_multi_entities = """
 Please answer the question in a very compact manner with format: "The {property} of {name1} is {description}; The {property} of {name2} is {description}; ...
 """
+
+QWEN3_SHORT_ANSWER_PROMPT = (
+    "Answer with a short span from the context. "
+    "Do not explain or output reasoning."
+)
 
 
 def _prune_for_llama(S: str) -> str:
@@ -44,6 +56,15 @@ def _prune_for_olmo3(S: str) -> str:
     S = S.replace("<|im_end|>", "")
     S = S.replace("<|im_start|>assistant", "\n\n")
     S = S.replace("<|im_start|>user", "")
+    S = S.replace("<|endoftext|>", "")
+    return S
+
+
+def _prune_for_qwen3(S: str) -> str:
+    S = S.replace("<|im_end|>", "")
+    S = S.replace("<|im_start|>assistant", "\n\n")
+    S = S.replace("<|im_start|>user", "")
+    S = S.replace("<|im_start|>system", "")
     S = S.replace("<|endoftext|>", "")
     return S
 
@@ -68,6 +89,16 @@ def format_Q_llama_short(Q: str):
 
 def format_Q_phi3(Q: str):
     return "<|user|>\n" + Q + "<|end|>\n" + "<|assistant|>\n"
+
+
+def format_Q_qwen3(Q: str, tokenizer):
+    user_content = f"{Q}\n\n{QWEN3_SHORT_ANSWER_PROMPT}"
+    messages = [{"role": "user", "content": user_content}]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 def format_QA_llama(Q: str, A: str):
 
@@ -114,6 +145,19 @@ def format_QA_olmo3(Q: str, A: str, tokenizer):
     )
 
 
+def format_QA_qwen3(Q: str, A: str, tokenizer):
+    user_content = f"{Q}\n\n{QWEN3_SHORT_ANSWER_PROMPT}"
+    messages = [{"role": "user", "content": user_content}]
+    if A is not None:
+        messages.append({"role": "assistant", "content": A})
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=(A is None),
+    )
+
+
 
 
 model_question_format_mapping = {
@@ -136,6 +180,28 @@ def answer_question(
     save_attention_weights: bool = False,
     attention_file_base_name: Optional[str] = None,
 ):
+    if getattr(model.config, "model_type", None) == "qwen3":
+        input_str = format_Q_qwen3(Q, tokenizer)
+        tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+        outputs = model.generate(
+            input_ids=tokenizer_output["input_ids"],
+            attention_mask=tokenizer_output["attention_mask"],
+            kb_kvs=kb,
+            kb_config=kb_config,
+            max_new_tokens=64,
+            tokenizer=tokenizer,
+            output_attentions=True,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
+            top_p=None,
+            use_cache=True,
+        ).squeeze()
+        answer = tokenizer.decode(
+            outputs[tokenizer_output["input_ids"].size(1):],
+            skip_special_tokens=True,
+        )
+        return answer.strip()
+
     for m in model_question_format_mapping:
         if isinstance(model, m):
             input_str = model_question_format_mapping[m](Q)
@@ -249,6 +315,17 @@ def format_output_for_synthetic(model_output: str) -> str:
     return _clean_candidate(text)
 
 
+def strip_generation_prefix(output: str, model) -> str:
+    text = str(output)
+    if getattr(model.config, "model_type", None) == "qwen3":
+        return text.lstrip()
+
+    if text.startswith("\n\n"):
+        return text[2:]
+
+    return text.lstrip()
+
+
 # def answer_question_deterministic(
 #     tokenizer: transformers.PreTrainedTokenizer,
 #     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
@@ -330,8 +407,40 @@ def extract_assistant_answer(text: str) -> str:
     # fallback：如果格式不完整，返回原文本
     return text.strip()
 
+
+class TimingStreamer(BaseStreamer):
+    """Capture first-token and decode timing for synchronous HF generate()."""
+
+    def __init__(self):
+        self._skip_prompt = True
+        self.first_token_time: Optional[float] = None
+        self.generated_tokens = 0
+
+    def put(self, value):
+        if self._skip_prompt:
+            self._skip_prompt = False
+            return
+
+        if isinstance(value, torch.Tensor):
+            token_count = int(value.numel())
+        elif isinstance(value, (list, tuple)):
+            token_count = len(value)
+        else:
+            token_count = 1
+
+        if token_count <= 0:
+            return
+
+        now = time.perf_counter()
+        if self.first_token_time is None:
+            self.first_token_time = now
+        self.generated_tokens += token_count
+
+    def end(self):
+        return
+
 @torch.no_grad()
-def olmo3_greedy_generate(
+def chat_template_greedy_generate(
     model,
     tokenizer,
     prompt_ids: torch.Tensor,
@@ -388,8 +497,26 @@ def answer_question_deterministic(
 ):
     device = next(model.parameters()).device
 
+    def _update_trace_prompt_metadata(prompt_text: str, input_ids: torch.Tensor) -> None:
+        if not is_path_attn_trace_enabled():
+            return
+        try:
+            ids_1d = input_ids[0].detach().to("cpu")
+            token_ids = ids_1d.tolist()
+            token_strs = tokenizer.convert_ids_to_tokens(token_ids)
+            update_path_attn_trace_context(
+                model_type=getattr(model.config, "model_type", ""),
+                tokenizer_name_or_path=getattr(tokenizer, "name_or_path", ""),
+                prompt_text=prompt_text,
+                prompt_input_ids=token_ids,
+                prompt_tokens=[str(tok) for tok in token_strs],
+                prompt_len=int(len(token_ids)),
+            )
+        except Exception as exc:
+            update_path_attn_trace_context(prompt_trace_error=str(exc))
+
     # ============================================================
-    # 1. OLMo3 分支（推荐 & 正确做法）
+    # 1. OLMo3 分支
     # ============================================================
     # print(f"model class: {model.__class__.__name__.lower()}, model type: {model.config.model_type}")
     if model.__class__.__name__.lower().startswith("olmo3forcausallm") or \
@@ -397,8 +524,9 @@ def answer_question_deterministic(
 
         prompt = format_QA_olmo3(Q, None, tokenizer)
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        _update_trace_prompt_metadata(prompt, inputs.input_ids)
 
-        generated = olmo3_greedy_generate(
+        generated = chat_template_greedy_generate(
             model,
             tokenizer,
             inputs.input_ids,
@@ -415,6 +543,46 @@ def answer_question_deterministic(
 
         return answer
 
+    if getattr(model.config, "model_type", None) == "qwen3":
+        prompt = format_QA_qwen3(Q, None, tokenizer)
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        _update_trace_prompt_metadata(prompt, inputs.input_ids)
+        timing_streamer = TimingStreamer()
+        gen_start = time.perf_counter()
+
+        outputs = model.generate(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask,
+            kb_kvs=kb,
+            kb_adj=kb_adj,
+            kb_config=kb_config,
+            max_new_tokens=16,
+            tokenizer=tokenizer,
+            output_attentions=save_attention_weights,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False,
+            top_p=None,
+            use_cache=True,
+            streamer=timing_streamer,
+        ).squeeze()
+        gen_end = time.perf_counter()
+
+        if timing_streamer.first_token_time is None:
+            prefill_s = gen_end - gen_start
+            decode_s = 0.0
+            decode_tokens = 0
+        else:
+            prefill_s = timing_streamer.first_token_time - gen_start
+            decode_s = max(0.0, gen_end - timing_streamer.first_token_time)
+            decode_tokens = max(0, timing_streamer.generated_tokens - 1)
+        kblam_profile_set(prefill_s, decode_s, decode_tokens)
+
+        answer = tokenizer.decode(
+            outputs[inputs.input_ids.size(1):],
+            skip_special_tokens=True,
+        )
+        return answer.strip()
+
     # ============================================================
     # 2. LLaMA / Phi3 分支（保持你原来的逻辑）
     # ============================================================
@@ -430,6 +598,7 @@ def answer_question_deterministic(
 
     input_ids = tokenizer_output["input_ids"]
     attention_masks = tokenizer_output["attention_mask"]
+    _update_trace_prompt_metadata(input_str, input_ids)
 
     with torch.autograd.no_grad():
         outputs = model.generate(
@@ -460,11 +629,16 @@ def answer_question_deterministic(
 
 
 def output_dag_sample(sample):
-    # 逐个访问样本中的context，如果triple_list为空，则跳过这个context
+    # Older DAG samples stored per-context triple_list, while newer ones only keep
+    # plain supporting passages in context and place triples at the sample level.
     filtered_context = []
-    for context in sample['context']:
-        if context['triple_list']:
+    for context in sample.get("context", []):
+        if not isinstance(context, dict):
+            filtered_context.append(context)
+            continue
+        triple_list = context.get("triple_list")
+        if triple_list is None or triple_list:
             filtered_context.append(context)
     new_sample = sample.copy()
-    new_sample['context'] = filtered_context
+    new_sample["context"] = filtered_context
     return new_sample

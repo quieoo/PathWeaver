@@ -130,6 +130,11 @@ def kblam_profile_reset():
 def kblam_profile_get():
     return dict(KBLaM_PROFILE)
 
+def kblam_profile_set(prefill_s: float, decode_s: float, decode_tokens: int):
+    KBLaM_PROFILE["prefill_s"] = float(prefill_s)
+    KBLaM_PROFILE["decode_s"] = float(decode_s)
+    KBLaM_PROFILE["decode_tokens"] = int(decode_tokens)
+
 class KblamLlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' implemented as Rectangular attention"""
 

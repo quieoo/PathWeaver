@@ -183,6 +183,14 @@ experiments/vector*
 
 *.csv
 experiments/subgraph_mlp/
+experiments/vector_rag/
+experiments/lmcache/persisted_kv/
+experiments/msa_cache/
 
 docs/scripts/dag_svgs/
 docs/scripts/triple_gen/cache*
+experiments/eval_results/
+experiments/structural_reasoning/*_heatmaps*/
+experiments/structural_reasoning/*report*/
+*.pt
+

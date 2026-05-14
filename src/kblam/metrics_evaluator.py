@@ -2,6 +2,7 @@ import re
 import string
 import os
 from statistics import fmean
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import numpy as np
@@ -446,6 +447,64 @@ def full_evaluation(model_outputs: list[str], references: list[str], lang: str =
         return comparison_str, metrics, faith01
     else:
         return comparison_str, metrics
+
+
+def fa_evaluate(
+    model_outputs: list[str],
+    references: list[str],
+    model_name: str = "qwen-plus",
+    batch_size: int = 20,
+    max_workers: int = 5,
+):
+    """Evaluate faithfulness with Bailian using absolute binary scoring."""
+    if len(model_outputs) != len(references):
+        raise ValueError(
+            f"Number of model outputs ({len(model_outputs)}) does not match number of references ({len(references)})"
+        )
+    if not model_outputs:
+        raise ValueError("model_outputs and references must not be empty")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if max_workers <= 0:
+        raise ValueError("max_workers must be positive")
+
+    if len(model_outputs) <= batch_size:
+        return compute_faithfulness_bailian(
+            model_outputs,
+            references,
+            model_name=model_name,
+            absolute=True,
+        )
+
+    batches = []
+    for start in range(0, len(model_outputs), batch_size):
+        end = min(start + batch_size, len(model_outputs))
+        batches.append((start, model_outputs[start:end], references[start:end]))
+
+    ordered_scores = [None] * len(batches)
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+        future_to_idx = {
+            executor.submit(
+                compute_faithfulness_bailian,
+                batch_outputs,
+                batch_references,
+                model_name,
+                True,
+            ): idx
+            for idx, (_, batch_outputs, batch_references) in enumerate(batches)
+        }
+
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            _, batch_scores = future.result()
+            ordered_scores[idx] = batch_scores
+
+    all_scores = []
+    for batch_scores in ordered_scores:
+        all_scores.extend(batch_scores)
+
+    return _mean(all_scores), all_scores
 
 
 # 只执行EM、ROUGE评估

@@ -35,6 +35,7 @@ from kblam.utils.eval_utils import (
     answer_question_deterministic,
     softmax,
     format_output_for_synthetic,
+    strip_generation_prefix,
 )
 from kblam.utils.train_utils import get_kb_embd
 from kblam.kb_retriever import KBRetriever
@@ -204,7 +205,7 @@ def perform_eval_musique(
         TTFTs.append(ttft)
         TPOTs.append(tpot)
 
-        model_output = model_output[2:]
+        model_output = strip_generation_prefix(model_output, model)
         full_outputs.append((model_output,answer))
         answers.append(answer)
         print(f"------------------sample {i}----------")
@@ -311,7 +312,7 @@ def perform_eval(
                 # save_attn_weights_policy="all-step-last-layer",
             ).split(Q)[1]
             # 去除输出中的前两个换行符
-            model_output = model_output[2:]
+            model_output = strip_generation_prefix(model_output, model)
             # print(f"raw model output: {model_output}")
         elif eval_mode == "icl":
             if multi_entites != -1:
@@ -523,7 +524,7 @@ def perform_eval_2wiki(
             TTFTs.append(ttft)
             TPOTs.append(tpot)
 
-            model_output=output_text[2:]
+            model_output = strip_generation_prefix(output_text, model)
             if remove_sorry and "sorry" in model_output.lower():
                 continue
             answers.append(format_output_for_synthetic(A))
@@ -640,7 +641,7 @@ def perform_eval_v2(
             )
             if Q in output_text:
                 output_text = output_text.split(Q)[1]
-                model_output=output_text[2:]
+                model_output = strip_generation_prefix(output_text, model)
             else:
                 model_output=output_text
             # print(f"model split output: {model_output}")

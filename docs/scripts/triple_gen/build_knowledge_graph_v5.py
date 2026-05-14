@@ -121,8 +121,12 @@ def norm_text(x: Any) -> str:
     return s
 
 
+def extract_sample_id(sample: Dict[str, Any]) -> str:
+    return norm_text(sample.get("_id", "")) or norm_text(sample.get("id", ""))
+
+
 def safe_sample_id(sample: Dict[str, Any], idx: int) -> str:
-    sid = norm_text(sample.get("_id", "")) or norm_text(sample.get("id", ""))
+    sid = extract_sample_id(sample)
     if sid:
         return sid
     return f"sample_{idx:08d}"
@@ -149,9 +153,11 @@ def build_progress_message(
 ) -> str:
     done = int(stats.get("done", 0))
     total = int(stats.get("total", 0))
+    triples_done = int(stats.get("triples_done", 0))
     started_at = float(stats.get("started_at", time.time()))
     elapsed_s = max(0.0, time.time() - started_at)
     rate = (done / elapsed_s) if elapsed_s > 0 and done > 0 else 0.0
+    triple_rate = (triples_done / elapsed_s) if elapsed_s > 0 and triples_done > 0 else 0.0
     remaining = max(0, total - done)
     eta_s = (remaining / rate) if rate > 0 else 0.0
     pct = (100.0 * done / total) if total > 0 else 100.0
@@ -159,6 +165,7 @@ def build_progress_message(
         f"[{now_ts()}] progress {done}/{total} ({pct:.1f}%) "
         f"ok={stats['ok']} err={stats['err']} retried={stats['retried']} "
         f"dropped={stats['dropped']} rate={rate:.2f}/s "
+        f"triples={triples_done} triple_rate={triple_rate:.2f} triples/s "
         f"elapsed={format_duration(elapsed_s)} eta={format_duration(eta_s)} "
         f"last={last_sample_id} failures={dict(sorted(failure_stats.items()))}"
     )
@@ -965,8 +972,9 @@ def normalize_stage2_revision(stage2: Dict[str, Any], verbose: bool = False) -> 
 
 def validate_stage2_revision(stage1: Dict[str, Any], stage2: Dict[str, Any], verbose: bool = False) -> None:
     validate_stage1(stage2)
-    if norm_text(stage2.get("_id", "")) != norm_text(stage1.get("_id", "")):
-        raise ValueError("stage2_revision._id does not match stage1._id")
+    if extract_sample_id(stage2) != extract_sample_id(stage1):
+        print(f"[WARN] stage2_revision id {extract_sample_id(stage2)} does not match stage1 id {extract_sample_id(stage1)}")
+        # raise ValueError("stage2_revision id does not match stage1 id")
     if not isinstance(stage2.get("answer_sufficient"), bool):
         raise ValueError("stage2_revision.answer_sufficient missing or invalid")
     if not isinstance(stage2.get("missing_links"), list):
@@ -1031,7 +1039,7 @@ def _normalize_stage_graph_triple(tri: Dict[str, Any]) -> Optional[Dict[str, str
 
 def dedupe_stage1(stage1: Dict[str, Any]) -> Dict[str, Any]:
     out = {
-        "_id": norm_text(stage1.get("_id", "")),
+        "_id": extract_sample_id(stage1),
         "entity_list": [],
         "triples": [],
     }
@@ -1078,8 +1086,8 @@ def dedupe_stage2_input_triples(triples: List[Dict[str, Any]]) -> List[Dict[str,
 def validate_stage1(stage1: Dict[str, Any]) -> None:
     if not isinstance(stage1, dict):
         raise ValueError("stage1 must be a dict")
-    if not isinstance(stage1.get("_id"), str):
-        raise ValueError("stage1._id missing or invalid")
+    if not extract_sample_id(stage1):
+        raise ValueError("stage1 id/_id missing or invalid")
     if not isinstance(stage1.get("entity_list"), list):
         raise ValueError("stage1.entity_list missing or invalid")
     if not isinstance(stage1.get("triples"), list):
@@ -1364,8 +1372,8 @@ def load_existing_output_ids(path: str) -> set[str]:
         for line in f:
             try:
                 obj = json.loads(line)
-                sample_id = obj.get("_id")
-                if isinstance(sample_id, str):
+                sample_id = extract_sample_id(obj) if isinstance(obj, dict) else ""
+                if sample_id:
                     ids.add(sample_id)
             except json.JSONDecodeError:
                 continue
@@ -1384,7 +1392,7 @@ def merge_stage1_and_stage2_graph(
     verbose: bool = False,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {
-        "_id": norm_text(stage2.get("_id", "")) or norm_text(stage1.get("_id", "")),
+        "_id": extract_sample_id(stage2) or extract_sample_id(stage1),
         "entity_list": [],
         "triples": [],
         "answer_sufficient": bool(stage2.get("answer_sufficient", False)),
@@ -1528,9 +1536,11 @@ async def queue_worker(
                 verbose=cfg.verbose,
             )
             append_jsonl(output_path, final_sample)
+            triple_count = len(final_sample.get("triple_list", []) or [])
             async with progress_lock:
                 stats["done"] += 1
                 stats["ok"] += 1
+                stats["triples_done"] += triple_count
                 done_cnt = stats["done"]
                 if done_cnt % max(1, progress_every) == 0 or done_cnt == stats["total"]:
                     print(build_progress_message(
@@ -1969,7 +1979,7 @@ def build_programmatic_final_from_graph(
     graph_for_kv: Dict[str, Any],
 ) -> Dict[str, Any]:
     out = {
-        "_id": norm_text(graph_for_kv.get("_id", "")) or safe_sample_id(sample, 0),
+        "_id": extract_sample_id(graph_for_kv) or safe_sample_id(sample, 0),
         "triple_list": [],
         "answer_sufficient": bool(graph_for_kv.get("answer_sufficient", False)),
         "missing_links": [
@@ -2008,8 +2018,8 @@ def validate_final_stage(stage_final: Dict[str, Any], verbose: bool = False) -> 
         return
     if not isinstance(stage_final, dict):
         raise ValueError("final stage must be a dict")
-    if not isinstance(stage_final.get("_id"), str):
-        raise ValueError("final._id missing or invalid")
+    if not extract_sample_id(stage_final):
+        raise ValueError("final id/_id missing or invalid")
     if not isinstance(stage_final.get("answer_sufficient"), bool):
         raise ValueError("final.answer_sufficient missing or invalid")
     if not isinstance(stage_final.get("missing_links"), list):
@@ -2044,6 +2054,8 @@ async def process_one_sample(
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     sample_id = safe_sample_id(sample, idx)
     sample["_id"] = sample_id
+    if "id" in sample and not norm_text(sample.get("id", "")):
+        sample["id"] = sample_id
 
     stage1_path = cache_path(stage_cache_subdir(cfg.stage_cache_dir, "stage1"), sample_id, "stage1")
     stage2_path = cache_path(stage_cache_subdir(cfg.stage_cache_dir, "stage2"), sample_id, "stage2")
@@ -2078,7 +2090,7 @@ async def process_one_sample(
 
     # ---------------- stage 2: answer-aware graph revision ----------------
     stage2_default = {
-        "_id": norm_text(stage1.get("_id", "")),
+        "_id": extract_sample_id(stage1),
         "answer_sufficient": False,
         "missing_links": [],
         "revision_notes": [],
@@ -2251,6 +2263,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "err": 0,
             "retried": 0,
             "dropped": 0,
+            "triples_done": 0,
             "started_at": time.time(),
         }
         failure_stats: Dict[str, int] = {}
@@ -2289,6 +2302,8 @@ async def main_async(args: argparse.Namespace) -> None:
         print(
             f"[{now_ts()}] DONE total={total} ok={stats['ok']} err={stats['err']} "
             f"retried={stats['retried']} dropped={stats['dropped']} "
+            f"triples={stats['triples_done']} "
+            f"triple_rate={stats['triples_done'] / max(1e-9, time.time() - stats['started_at']):.2f} triples/s "
             f"elapsed={format_duration(time.time() - stats['started_at'])} "
             f"failures={dict(sorted(failure_stats.items()))}"
         )
@@ -2361,6 +2376,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip-comparison", action="store_true", help="Add SKTP comparison description type to stage2 style hints")
     ap.add_argument("--verbose", action="store_true", help="Print verbose output")
     ap.add_argument("--seed", type=int, default=None, help="Random seed for shuffling samples")
+
+    
 
     return ap
 

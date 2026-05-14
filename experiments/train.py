@@ -36,6 +36,7 @@ from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
 from kblam.models.olmo3.kblam_olmo3_attention import load_kblam_olmo3_model, replace_attention_with_kblam
+from kblam.models.qwen3.kblam_qwen3_attention import load_kblam_qwen3_model
 
 
 
@@ -47,8 +48,14 @@ from kblam.dag_kv_retriever import DAGKVKBRetriever
 
 # from eval import eval_main_process
 from eval_generation import eval_main_process
-from kblam.metrics_evaluator import simple_evaluation, full_evaluation
-from kblam.utils.eval_utils import format_QA_llama, format_QA_phi3, format_QA_llama_short, format_QA_olmo3
+from kblam.metrics_evaluator import simple_evaluation, full_evaluation, fa_evaluate
+from kblam.utils.eval_utils import (
+    format_QA_llama,
+    format_QA_phi3,
+    format_QA_llama_short,
+    format_QA_olmo3,
+    format_QA_qwen3,
+)
 import re
 import shutil
 import random
@@ -85,11 +92,24 @@ logging.basicConfig(
     handlers=[RichHandler(console=console, rich_tracebacks=True)],
 )
 
+
+def _get_kb_encoder_out_dim(model_config, kb_layer_frequency: int) -> int:
+    slots = model_config.num_hidden_layers // kb_layer_frequency + 1
+    head_dim = getattr(model_config, "head_dim", None)
+    num_heads = getattr(model_config, "num_attention_heads", None)
+
+    if head_dim is not None and num_heads is not None:
+        per_slot_dim = head_dim * num_heads
+    else:
+        per_slot_dim = model_config.hidden_size
+
+    return per_slot_dim * slots
+
 # fmt: off
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--dataset_type",type=str,default="synthetic")
-parser.add_argument("--N", type=int, default=120000, help="Size of training set, select the first N samples for training")
+parser.add_argument("--N", type=int, default=None, help="Size of training set, select the first N samples for training")
 parser.add_argument("--B", type=int, default=10, help="Batch size")
 parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
 parser.add_argument("--sep_query_head", action=argparse.BooleanOptionalAction, help="Train a separate query head")
@@ -126,7 +146,7 @@ parser.add_argument("--kb_scale_factor", type=float, default=None, help="The sca
 parser.add_argument("--gradient_accm_step", type=int, default=20, help="Introduce QA with extended open-ended parts")
 parser.add_argument("--verbose", action="store_true", help="Set logging to debug")
 parser.add_argument("--log_to_file", action="store_true", help="Log to file as well as stdout")
-parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3", "olmo3"])
+parser.add_argument("--llm_type",type=str,default="llama3",choices=["llama3", "phi3", "olmo3", "qwen3"])
 parser.add_argument("--max_seq_len",type=int,default=None)
 parser.add_argument("--save_period", type=int, default=2000, help="Save every n steps")
 parser.add_argument("--debug_level", type=int, default=0, help="Debug level")
@@ -147,8 +167,29 @@ parser.add_argument("--disable_random_sample", action="store_true", default=Fals
 
 # Test arguments
 parser.add_argument("--test_data_path", type=str, default=None, help="The path of the test data")
+parser.add_argument(
+    "--test_data_paths",
+    nargs="+",
+    type=str,
+    default=None,
+    help="Multiple test dataset paths. Each dataset will be evaluated independently under the same test config.",
+)
 parser.add_argument("--test_precomputed_embed_keys_path", type=str, default=None, help="The path of the precomputed embed keys for testing")
 parser.add_argument("--test_precomputed_embed_values_path", type=str, default=None, help="The path of the precomputed embed values for testing")
+parser.add_argument(
+    "--test_precomputed_embed_keys_paths",
+    nargs="+",
+    type=str,
+    default=None,
+    help="Multiple precomputed test key embedding paths, aligned with --test_data_paths.",
+)
+parser.add_argument(
+    "--test_precomputed_embed_values_paths",
+    nargs="+",
+    type=str,
+    default=None,
+    help="Multiple precomputed test value embedding paths, aligned with --test_data_paths.",
+)
 parser.add_argument("--test_kb_size", type=int, default=None, help="The size of the KB set size for testing")
 parser.add_argument("--test_query_size", type=int, default=None, help="The size of the query set size for testing")
 parser.add_argument("--test_kb_scale_factor", type=float, default=None, help="The scale factor of the KB set size for testing")
@@ -314,6 +355,78 @@ def create_labels_for_olmo3_adapter(
     attention_masks,
 ):
     return _create_labels_for_olmo3(
+        input_ids=input_ids,
+        input_strs=input_strs,
+        tokenizer=tokenizer,
+        attention_mask=attention_masks,
+    )
+
+
+def _create_labels_for_qwen3(
+    input_ids: torch.Tensor,
+    input_strs: list[str],
+    tokenizer,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    labels = input_ids.clone()
+    labels[:] = -100
+
+    assistant_start = tokenizer(
+        "<|im_start|>assistant\n",
+        add_special_tokens=False,
+    ).input_ids
+    assistant_end = tokenizer(
+        "<|im_end|>",
+        add_special_tokens=False,
+    ).input_ids
+    qwen_pad_id = tokenizer.pad_token_id
+
+    for b in range(input_ids.size(0)):
+        seq = input_ids[b].tolist()
+        start_idx = None
+        end_idx = None
+        for i in range(len(seq) - len(assistant_start) + 1):
+            if seq[i : i + len(assistant_start)] == assistant_start:
+                # For Qwen, supervising the assistant header encourages the
+                # model to overfit template tokens instead of the answer span.
+                start_idx = i + len(assistant_start)
+                break
+
+        if start_idx is None:
+            continue
+
+        for i in range(start_idx, len(seq) - len(assistant_end) + 1):
+            if seq[i : i + len(assistant_end)] == assistant_end:
+                end_idx = i + len(assistant_end)
+                break
+
+        if end_idx is None:
+            if attention_mask is not None:
+                end_idx = int((attention_mask[b] == 1).nonzero()[-1].item()) + 1
+            else:
+                end_idx = len(seq)
+
+        labels[b, start_idx:end_idx] = input_ids[b, start_idx:end_idx]
+
+        if qwen_pad_id is not None:
+            pad_positions = input_ids[b] == qwen_pad_id
+            if attention_mask is not None:
+                pad_positions = pad_positions & (attention_mask[b] == 0)
+            labels[b] = labels[b].masked_fill(pad_positions, -100)
+
+        if attention_mask is not None:
+            labels[b] = labels[b].masked_fill(attention_mask[b] == 0, -100)
+
+    return labels
+
+
+def create_labels_for_qwen3_adapter(
+    input_ids,
+    input_strs,
+    tokenizer,
+    attention_masks,
+):
+    return _create_labels_for_qwen3(
         input_ids=input_ids,
         input_strs=input_strs,
         tokenizer=tokenizer,
@@ -773,6 +886,78 @@ def _load_cached_embeddings_v2(precomputed_embed_keys_path: str, precomputed_emb
     value_embds = np.load(precomputed_embed_values_path).astype("float32")
     return key_embds, value_embds
 
+
+def _load_dataset_file(dataset_path: str) -> list[dict]:
+    if dataset_path.endswith(".jsonl"):
+        return [json.loads(line.strip()) for line in open(dataset_path)]
+    if dataset_path.endswith(".json"):
+        return json.load(open(dataset_path))
+    raise ValueError(f"Unknown dataset format: {dataset_path}")
+
+
+def _normalize_optional_path_list(
+    paths: list[str] | None,
+    expected_len: int,
+    arg_name: str,
+) -> list[str | None]:
+    if paths is None:
+        return [None] * expected_len
+    if len(paths) != expected_len:
+        raise ValueError(
+            f"{arg_name} expects {expected_len} paths to match test datasets, got {len(paths)}"
+        )
+    return list(paths)
+
+
+def _build_test_dataset_specs(
+    *,
+    single_test_dataset: list[dict] | None = None,
+    single_test_data_path: str | None = None,
+    single_precomputed_keys_path: str | None = None,
+    single_precomputed_values_path: str | None = None,
+    multi_test_data_paths: list[str] | None = None,
+    multi_precomputed_keys_paths: list[str] | None = None,
+    multi_precomputed_values_paths: list[str] | None = None,
+) -> list[dict]:
+    if multi_test_data_paths:
+        key_paths = _normalize_optional_path_list(
+            multi_precomputed_keys_paths,
+            len(multi_test_data_paths),
+            "--test_precomputed_embed_keys_paths",
+        )
+        value_paths = _normalize_optional_path_list(
+            multi_precomputed_values_paths,
+            len(multi_test_data_paths),
+            "--test_precomputed_embed_values_paths",
+        )
+        specs = []
+        for idx, dataset_path in enumerate(multi_test_data_paths):
+            dataset = _load_dataset_file(dataset_path)
+            specs.append(
+                {
+                    "name": pathlib.Path(dataset_path).name,
+                    "path": dataset_path,
+                    "dataset": dataset,
+                    "precomputed_embed_keys_path": key_paths[idx],
+                    "precomputed_embed_values_path": value_paths[idx],
+                }
+            )
+        return specs
+
+    if single_test_dataset is None:
+        return []
+
+    dataset_name = pathlib.Path(single_test_data_path).name if single_test_data_path else "validation_split"
+    return [
+        {
+            "name": dataset_name,
+            "path": single_test_data_path,
+            "dataset": single_test_dataset,
+            "precomputed_embed_keys_path": single_precomputed_keys_path,
+            "precomputed_embed_values_path": single_precomputed_values_path,
+        }
+    ]
+
 def get_step_config(
     step: int,
     total_steps: int,
@@ -899,6 +1084,7 @@ class Trainer:
         max_seq_len: int | None = None,
         dataset_format: str = "synthetic",
         test_dataset: list[dict] | None = None,
+        test_datasets: list[dict] | None = None,
         precomputed_test_embed_keys_path: str | None = None,
         precomputed_test_embed_values_path: str | None = None,
         test_kb_size: int | None = None,
@@ -958,6 +1144,13 @@ class Trainer:
                 create_labels_for_olmo3_adapter,
             )
             self._get_params = lambda *args, **kwargs: []
+        elif getattr(llm_model.config, "model_type", None) == "qwen3":
+            self._get_batch = partial(
+                get_batch,
+                lambda Q, A: format_QA_qwen3(Q, A, self.tokenizer),
+                create_labels_for_qwen3_adapter,
+            )
+            self._get_params = _get_llama3_query_head_parameters
         else:
             raise ValueError(f"{llm_model} not recognised")
         
@@ -969,6 +1162,19 @@ class Trainer:
 
 
         # ==== 测试集 ====
+        if test_datasets is not None:
+            self.test_datasets = test_datasets
+        elif test_dataset is not None:
+            self.test_datasets = [
+                {
+                    "name": "test_dataset",
+                    "dataset": test_dataset,
+                    "precomputed_embed_keys_path": precomputed_test_embed_keys_path,
+                    "precomputed_embed_values_path": precomputed_test_embed_values_path,
+                }
+            ]
+        else:
+            self.test_datasets = []
         self.test_dataset = test_dataset
         self.precomputed_test_embed_keys_path = precomputed_test_embed_keys_path
         self.precomputed_test_embed_values_path = precomputed_test_embed_values_path
@@ -1024,81 +1230,107 @@ class Trainer:
         seed,
         train_config: KBLaMConfig = None,
     ):
-        if "autoschemakg" in self.dataset_format:
-            test_kb_retriever = AutoSchemaKGKBRetriever(
-                self.kbretriever.encoder,
-                self.test_dataset,
-                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
-                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
-            )
-        elif self.dataset_format == "dag":
-            test_kb_retriever = DAGKVKBRetriever(
-                encoder=self.kbretriever.encoder,
-                dataset=self.test_dataset,
-                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
-                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
-                max_kv_per_sample=self.kbretriever.max_kv_per_sample,
-                use_multihop_adj=self.kbretriever.use_multihop_adj,
-                max_hops=self.kbretriever.max_hops,
-                hop_decay=self.kbretriever.hop_decay,
-                dynamic_hops_by_longest_path=self.kbretriever.dynamic_hops_by_longest_path,
-                device=self.kbretriever.device,
-            )
-        else:
-            test_kb_retriever = KBRetriever(
-                self.kbretriever.encoder,
-                self.test_dataset,
-                precomputed_embed_keys_path=self.precomputed_test_embed_keys_path,
-                precomputed_embed_values_path=self.precomputed_test_embed_values_path,
-                base_embeder_path=train_config.base_embeder_path,
-            )
+        if not self.test_datasets:
+            raise ValueError("No test dataset configured for evaluation")
 
-        # test_kb_config = KBLaMConfig(
-        #     sep_query_head=True,
-        #     kb_layer_frequency=self.kb_token_layer_frequency,
-        #     path_attn=train_config.path_attn if train_config is not None else False,
-        # )
         test_kb_config = train_config
-        
-        # # force to use stage-0 configuration
-        # test_kb_config.current_step=0
 
-        results_pair_list, scale_factor_list = eval_main_process(
-            self.test_dataset,
-            self.tokenizer,
-            self.model,
-            self.kbretriever.encoder,
-            test_kb_config,
-            test_kb_retriever,
-            kb_scale_factor_range=self.test_kb_scale_factor_range,
-            kb_scale_factor=self.test_kb_scale_factor,
-            dataset_type=self.dataset_format,
-            seed=seed,
-            kb_size=self.test_kb_size,
-            query_size=self.test_query_size,
-            enable_silver=True,
-            output_first_samples=5 if test_kb_config.current_step<105 else 0,  # 只在第一轮评估输出样例，避免刷屏
+        total_score = 0.0
+
+        for test_spec in self.test_datasets:
+            dataset_name = test_spec["name"]
+            dataset = test_spec["dataset"]
+            precomputed_keys_path = test_spec.get("precomputed_embed_keys_path")
+            precomputed_values_path = test_spec.get("precomputed_embed_values_path")
+
+            if "autoschemakg" in self.dataset_format:
+                test_kb_retriever = AutoSchemaKGKBRetriever(
+                    self.kbretriever.encoder,
+                    dataset,
+                    precomputed_embed_keys_path=precomputed_keys_path,
+                    precomputed_embed_values_path=precomputed_values_path,
+                )
+            elif self.dataset_format == "dag":
+                test_kb_retriever = DAGKVKBRetriever(
+                    encoder=self.kbretriever.encoder,
+                    dataset=dataset,
+                    precomputed_embed_keys_path=precomputed_keys_path,
+                    precomputed_embed_values_path=precomputed_values_path,
+                    max_kv_per_sample=self.kbretriever.max_kv_per_sample,
+                    use_multihop_adj=self.kbretriever.use_multihop_adj,
+                    max_hops=self.kbretriever.max_hops,
+                    hop_decay=self.kbretriever.hop_decay,
+                    dynamic_hops_by_longest_path=self.kbretriever.dynamic_hops_by_longest_path,
+                    device=self.kbretriever.device,
+                )
+            else:
+                test_kb_retriever = KBRetriever(
+                    self.kbretriever.encoder,
+                    dataset,
+                    precomputed_embed_keys_path=precomputed_keys_path,
+                    precomputed_embed_values_path=precomputed_values_path,
+                    base_embeder_path=train_config.base_embeder_path,
+                )
+
+            results_pair_list, scale_factor_list = eval_main_process(
+                dataset,
+                self.tokenizer,
+                self.model,
+                self.kbretriever.encoder,
+                test_kb_config,
+                test_kb_retriever,
+                kb_scale_factor_range=self.test_kb_scale_factor_range,
+                kb_scale_factor=self.test_kb_scale_factor,
+                dataset_type=self.dataset_format,
+                seed=seed,
+                kb_size=self.test_kb_size,
+                query_size=self.test_query_size,
+                enable_silver=True,
+                # output_first_samples=5 if test_kb_config.current_step < 105 else 0,
+            )
+            results_pair = results_pair_list[0]
+            scale_factor = scale_factor_list[0]
+
+            model_outputs, answers = results_pair[:2]
+            if os.environ.get("DASHSCOPE_API_KEY"):
+                score, _ = fa_evaluate(model_outputs, answers)
+                self.logger.info(
+                    f"------- Test dataset: {dataset_name}, num_samples: {len(dataset)}, "
+                    f"scale_factor: {scale_factor}, FA01 Score: {score}"
+                )
+            else:
+                simple_score_dict = simple_evaluation(model_outputs, answers)
+                self.logger.info(
+                    f"------- Test dataset: {dataset_name}, num_samples: {len(dataset)}, "
+                    f"scale_factor: {scale_factor}, Simple scores: {simple_score_dict}"
+                )
+
+            preview_count = min(5, len(model_outputs))
+            for idx in range(preview_count):
+                self.logger.info(
+                    f"[{dataset_name}] Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}"
+                )
+
+            if len(model_outputs) > 0:
+                random_count = min(5, len(model_outputs))
+                random_idxs = np.random.choice(len(model_outputs), random_count, replace=False)
+                for idx in random_idxs:
+                    self.logger.info(
+                        f"[{dataset_name}] Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}"
+                    )
+
+            # total_rouge1 += float(simple_score_dict["rouge1"])
+            total_score += score
+
+        self.logger.info(
+            f"======= Aggregated score across {len(self.test_datasets)} datasets: "
+            f"{total_score:.6f}"
         )
-        results_pair=results_pair_list[0]
-        scale_factor=scale_factor_list[0]
-
-
-        model_outputs, answers = results_pair[:2]
-        _, simple_score_dict=simple_evaluation(model_outputs, answers)
-        self.logger.info(f"------- Scale factor: {scale_factor}, Simple scores: {simple_score_dict}")
-        # 输出前5个样本的结果
-        for idx in range(5):
-            self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
-        
-        # 输出5个随机样本的结果
-        random_idxs = np.random.choice(len(model_outputs), 5, replace=False)
-        for idx in random_idxs:
-            self.logger.info(f"Model Output: {model_outputs[idx]}\nTrue Answer: {answers[idx]}")
-        return simple_score_dict["rouge1"]
+        return total_score
 
 
 
-    def safe_evaluate_wrapper(self, seed: int = 1, delay_cleanup: bool = False, train_config: KBLaMConfig = None):
+    def safe_evaluate_wrapper(self, seed: int = 0, delay_cleanup: bool = False, train_config: KBLaMConfig = None):
         self.logger.info("===== [SAFE EVALUATION START] =====")
 
         try:
@@ -1109,11 +1341,13 @@ class Trainer:
 
             # Step 2️⃣ 保存训练状态
             was_training_encoder = self.kbretriever.encoder.training
+            was_training_model = self.model.training
             model_grad_state = torch.is_grad_enabled()
 
             # Step 3️⃣ 禁用梯度与 checkpoint
             torch.set_grad_enabled(False)
             self.kbretriever.encoder.eval()
+            self.model.eval()
             torch.cuda.synchronize()
 
             np_state = np.random.get_state()
@@ -1134,6 +1368,8 @@ class Trainer:
             torch.set_grad_enabled(model_grad_state)
             if was_training_encoder:
                 self.kbretriever.encoder.train()
+            if was_training_model:
+                self.model.train()
 
             # Step 6️⃣ 释放显存
             if not delay_cleanup:
@@ -1416,10 +1652,10 @@ class Trainer:
                     pbar.update(task, advance=1, loss=avg_loss)
 
                 # 运行模型验证
-                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and (self.test_dataset is not None) :    
+                if ((step == self.num_steps-1) or ((step % self.eval_step) == 0 and (step != start_step))) and self.test_datasets:
                     kb_config.current_step = step
                     kb_config.total_steps = self.num_steps
-                    real_time_accuracy=self.safe_evaluate_wrapper(seed=1, train_config=kb_config)
+                    real_time_accuracy=self.safe_evaluate_wrapper(seed=0, train_config=kb_config)
 
                 # 保存模型参数
                 # 如果是最后一步
@@ -1621,13 +1857,7 @@ def main():
     prefix_string = get_prefix_str(args)
     logger.info(f"Experiment prefix {get_prefix_str(args)}")
 
-    # 判断数据集是json还是jsonl格式
-    if args.train_data_path.endswith(".jsonl"):
-        dataset=[json.loads(line.strip()) for line in open(args.train_data_path)]
-    elif args.train_data_path.endswith(".json"):
-        dataset=json.load(open(args.train_data_path))
-    else:
-        raise ValueError(f"Unknown dataset format: {args.train_data_path}")
+    dataset = _load_dataset_file(args.train_data_path)
 
 #     if use_extended_qa:
 #         dataset = json.load(open(os.path.join(dataset_dir, f"{dataset_name}_augmented.json")))
@@ -1646,25 +1876,39 @@ def main():
 #         else:
 #             dataset = json.load(open(os.path.join(dataset_dir, f"train_datasets.json")))
 
-    N = min(N, len(dataset))
+    if N is None:
+        N = len(dataset)
+    else:
+        N = min(N, len(dataset))
     training_set = dataset[:N]
     print(f"[INFO]: Loaded {N} samples for training")
 
-    if args.test_query_size is not None:
-        if args.test_data_path is not None:
-            # 判断数据集是json还是jsonl格式
-            if args.test_data_path.endswith(".jsonl"):
-                test_dataset=[json.loads(line.strip()) for line in open(args.test_data_path)]
-            elif args.test_data_path.endswith(".json"):
-                test_dataset=json.load(open(args.test_data_path))
-            else:
-                raise ValueError(f"Unknown dataset format: {args.test_data_path}")
-            print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
-        else:
-            # test_dataset = None
-            print(f"Split the training set into {N-args.test_query_size} samples for training and {args.test_query_size} samples for validation")
-            training_set = dataset[args.test_query_size:]
-            test_dataset = dataset[:args.test_query_size]
+    test_dataset = None
+    test_datasets = []
+    if args.test_data_path is not None:
+        test_dataset = _load_dataset_file(args.test_data_path)
+        print(f"[INFO]: Loaded {len(test_dataset)} samples for validation")
+    # elif args.test_query_size is not None:
+    #     print(f"Split the training set into {N-args.test_query_size} samples for training and {args.test_query_size} samples for validation")
+    #     training_set = dataset[args.test_query_size:]
+    #     test_dataset = dataset[:args.test_query_size]
+
+    test_datasets = _build_test_dataset_specs(
+        single_test_dataset=test_dataset,
+        single_test_data_path=args.test_data_path,
+        single_precomputed_keys_path=args.test_precomputed_embed_keys_path,
+        single_precomputed_values_path=args.test_precomputed_embed_values_path,
+        multi_test_data_paths=args.test_data_paths,
+        multi_precomputed_keys_paths=args.test_precomputed_embed_keys_paths,
+        multi_precomputed_values_paths=args.test_precomputed_embed_values_paths,
+    )
+
+    if test_datasets:
+        for test_spec in test_datasets:
+            print(
+                f"[INFO]: Validation dataset {test_spec['name']} loaded with "
+                f"{len(test_spec['dataset'])} samples"
+            )
 
     # Set up the LLM
     original_model_spec = hf_model_spec              # base olmo3-7b
@@ -1688,7 +1932,13 @@ def main():
         trust_remote_code=True,
         token=hf_token if args.llm_type == "llama3" else None,
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    if args.llm_type == "qwen3":
+        # Keep Qwen's native pad/eos split so <|im_end|> remains a supervised
+        # assistant stop token instead of being masked as padding.
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = "<|endoftext|>"
+    else:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if args.llm_type == "llama3":
         model = KblamLlamaForCausalLM.from_pretrained(
@@ -1710,6 +1960,12 @@ def main():
         model = load_kblam_olmo3_model(
             base_model_dir=original_model_spec,      # 永远是 base olmo3
             checkpoint_dir=resume_ckpt_dir,          # 只有 resume 时才非 None
+            device="cuda",
+        )
+    elif args.llm_type == "qwen3":
+        model = load_kblam_qwen3_model(
+            base_model_dir=original_model_spec,
+            checkpoint_dir=resume_ckpt_dir,
             device="cuda",
         )
 
@@ -1734,8 +1990,7 @@ def main():
         encoder_name=encoder_spec,
         projector_type="linear",
         endpoint_url="",
-        out_dim=model.config.hidden_size  # type: ignore
-        * (model.config.num_hidden_layers // kb_token_layer_frequency + 1),  # type: ignore
+        out_dim=_get_kb_encoder_out_dim(model.config, kb_token_layer_frequency),  # type: ignore
         frozen_base_model=True,
         device=device,
     )
@@ -1817,6 +2072,7 @@ def main():
         max_seq_len=max_seq_len,
         dataset_format=dataset_type,
         test_dataset=test_dataset,
+        test_datasets=test_datasets,
         precomputed_test_embed_keys_path=args.test_precomputed_embed_keys_path,
         precomputed_test_embed_values_path=args.test_precomputed_embed_values_path,
         test_kb_size=args.test_kb_size,

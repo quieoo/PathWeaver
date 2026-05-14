@@ -640,7 +640,7 @@ python build_knowledge_graph_v4.4.py   --input /mnt/n0/datasets/wiki_hotspot_mus
  - 非量化版本倾向于生成“_”连接的实体和关系，4bit版本没有这个问题
 
 
- ## Triple-Only (v5)
+ # Triple-Only (v5)
 
 仅生成三元组，不再要求抽取KV对。
 属性三元组：
@@ -730,6 +730,22 @@ python build_knowledge_graph_v5.py \
   --sample-retries 0 \
   --answer-aware \
   --limit 1 --verbose --seed 48
+
+# 测试2wiki数据集 -> 
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_train_2hop.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --overwrite \
+  --sample-retries 0 \
+  --answer-aware \
+  --limit 1 --verbose --seed 48
 ````
 
 批次大小测试:
@@ -745,8 +761,9 @@ python build_knowledge_graph_v5.py   --input /mnt/n0/datasets/wiki_hotspot_musiq
 
 ````
 
-实操：
+## 实操
 ````bash
+# 4ul40
 nohup python build_knowledge_graph_v5.py \
   --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_train.jsonl \
   --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
@@ -759,20 +776,96 @@ nohup python build_knowledge_graph_v5.py \
   --resume \
   --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/musique \
   --sample-retries 2 \
-  --answer-aware > musique_train_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
-
+  --answer-aware >> musique_train_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
 nohup python build_knowledge_graph_v5.py \
-  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_train.json \
-  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
-  --api-base http://10.102.34.67:8000/v1 \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_train_2hop.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
   --api-mode chat \
   --allow-empty-api-key \
   --model Qwen2.5-72B-4bit \
   --concurrency 64 \
   --skip-comparison \
   --resume \
-  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/hotpot \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/2wiki \
+  --sample-retries 2 \
+  --answer-aware >> 2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
+
+# 8u4090
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+conda activate triple
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+nohup python build_knowledge_graph_v5.py \
+  --input /home/zhchen/zwb/datasets/hotpot_train.json \
+  --output /home/zhchen/zwb/datasets/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 128 \
+  --skip-comparison \
+  --resume \
+  --stage-cache-dir /home/zhchen/zwb/datasets/v5_cache/hotpot \
   --sample-retries 2 \
   --answer-aware > hotpot_train_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
 
+nohup python build_knowledge_graph_v5.py \
+  --input /home/zhchen/zwb/datasets/2wiki_train_2hop.json \
+  --output /home/zhchen/zwb/datasets/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 64 \
+  --skip-comparison \
+  --resume \
+  --stage-cache-dir /home/zhchen/zwb/datasets/v5_cache/2wiki \
+  --sample-retries 2 \
+  --answer-aware > 2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
+
 ````
+
+## triples/s
+
+- 4ul40, qwen2.5-72B-4bit, TP4
+  - Musique， batch size 64, SO(supporting only) -> 11.28  triples/s
+  - Hotpot, batch size 64, SO -> 13.06 triples/s
+  - Hotpot, batch size 128, SO -> 7.33 triples/s
+- 4ul40, qwen2.5-72B-4bit, TP1, PP4 (❌️)
+- 4ul40, qwen2.5-72B-4bit, 8192
+  - Hotpot, batch size 64, SO -> 13.5 triples/s
+
+````bash
+conda activate vllm-graph
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 8192  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+
+conda activate kblam
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_train.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/tmp.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --overwrite \
+  --concurrency 64
+
+
+````
+

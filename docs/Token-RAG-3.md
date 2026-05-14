@@ -4453,3 +4453,2585 @@ nohup python experiments/train.py \
   --model_save_dir experiments/train/dag_kv_hotpot_v5.2.5 --save_period 100 --keep_top_k_ckpt 5  > experiments/train/dag_kv_hotpot_v5.2.5/training_log.txt  2>&1 &
 
 ````
+
+
+# Qwen3
+
+训练一次Hotpot测试qwen模型的性能：
+````bash
+uv venv kblam --python 3.12
+source /mnt/n0/uv_envs/kblam/bin/activate
+
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train_dag_v5.2_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1.json \
+  --test_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 1 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_hotpot_qwen3_4B_v1 --save_period 100 --keep_top_k_ckpt 5  > experiments/train/dag_kv_hotpot_qwen3_4B_v1/training_log.txt  2>&1 &
+
+# 扫scale_factor_kb
+source /mnt/n0/uv_envs/kblam/bin/activate
+export CUDA_VISIBLE_DEVICES=0
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv \
+  --test_dataset hotpot_dev_dag_v5.2_cleaned_v1.json \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_hotpot_qwen3_4B_v1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_4200_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_hotpot_qwen3_4B_v1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_4200 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_dev_dag_v5.2_cleaned_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 4200 \
+  --t_step 8000 \
+  --kb_scale_factor_range 0.5 8.0 \
+  --exp_config_name qwen3_step4200_kbsf_range \
+  --save_dir /mnt/n0/PathWeaver/experiments/eval_results \
+  --seed 1
+
+````
+
+## multi-hop training set
+
+### triple_gen
+
+training_set:
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/hotpot_train.jsonl (不同版本)
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl
+
+合并数据集:
+  合并多个数据集文件
+  默认只保留 answer_sufficient == True 的样本
+  统一 id 和 _id 为 dataset_sourceid
+  保留 dataset 和 source_id 字段，方便回溯来源
+  先按合并后的 id 去重
+  再按样本内容去重，避免跨文件或源内重复内容残留
+  遇到重复时优先保留“质量更高”的版本：
+    answer_sufficient=True
+    triple_list 更长
+    context 更多
+    revision_notes 更多
+    整体 payload 更大
+  额外参数：--allow-answer-insufficient
+
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/merge_tripled_datasets.py \
+  --dataset hotpot=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --dataset 2wiki=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --dataset musique=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.stats.json
+````
+
+test_set:
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json
+    包含：{'compositional': 5234, 'comparison': 3022, 'inference': 1549}
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_clean/hotpot_dev_v1.json
+    包含：{'bridge': 350}
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_clean/musique_dev_answerable.jsonl
+    包含：answerable 2417
+
+提取测试集的三元组：
+````bash
+# setup 4ul40
+export CUDA_VISIBLE_DEVICES=0,1
+source /mnt/n0/uv_envs/kblam-rag/bin/activate
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+nohup bash -c '
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 128 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/2wiki_dev \
+  --sample-retries 2 \
+  --answer-aware;
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_clean/hotpot_dev_v1.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 128 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/hotpot_dev \
+  --sample-retries 2 \
+  --answer-aware;
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_clean/musique_dev_answerable.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 128 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/musique_dev \
+  --sample-retries 2 \
+  --answer-aware
+' > dev_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
+
+export CUDA_VISIBLE_DEVICES=0,1
+source /mnt/n0/uv_envs/kblam-rag/bin/activate
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen3.5-27B \
+  --served-model-name Qwen3.5-27B \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --max-model-len 16384  \
+  --kv-cache-dtype auto \
+  --reasoning-parser qwen3 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}'  \
+  --trust-remote-code > Qwen3.5-27B.log 2>&1 &
+nohup bash -c '
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev_2hop.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 64 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/2wiki_dev_qwen3.5_27B \
+  --sample-retries 2 \
+  --answer-aware;
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_clean/hotpot_dev_v1.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 64 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/hotpot_dev_qwen3.5_27B \
+  --sample-retries 2 \
+  --answer-aware;
+python build_knowledge_graph_v5.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_clean/musique_dev_answerable.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen3.5-27B \
+  --concurrency 64 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/v5_cache/musique_dev_qwen3.5_27B \
+  --sample-retries 2 \
+  --answer-aware
+' >> dev_tripled_v5-qwen3.5-27B.log 2>&1 &
+
+# setup 8u4090
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+conda activate triple
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 \
+nohup vllm serve models/qwen2.5-72B-4bit/ \
+  --served-model-name Qwen2.5-72B-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384  \
+  --enable-prefix-caching \
+  --trust-remote-code > Qwen2.5-72B-4bit.log 2>&1 &
+
+nohup python build_knowledge_graph_v5.py \
+  --input /home/zhchen/zwb/datasets/dev_set/2wiki_dev_2hop.json \
+  --output /home/zhchen/zwb/datasets/2wiki_dev_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --api-base http://localhost:8000/v1 \
+  --api-mode chat \
+  --allow-empty-api-key \
+  --model Qwen2.5-72B-4bit \
+  --concurrency 128 \
+  --skip-comparison \
+  --limit 300 \
+  --resume \
+  --stage-cache-dir /home/zhchen/zwb/datasets/v5_cache/2wiki_dev \
+  --sample-retries 2 \
+  --answer-aware > 2wiki_dev_tripled_v5-qwen2.5-72B_4bit.log 2>&1 &
+````
+
+### graph_gen
+
+````bash
+
+nohup python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --train_batch_size 1024 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_merged_v1.pkl \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3 \
+  > /mnt/n0/PathWeaver/docs/scripts/graph_gen/train_subgraph.log 2>&1 &
+
+nohup python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4 > /mnt/n0/PathWeaver/docs/scripts/graph_gen/infer_subgraph.log 2>&1 &
+# Answer recall: 0.9291
+# Graph  recall: 0.9820
+# None-sink recall: 0.9291
+# Answer + supported sink ratio: 0.8504
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=159126 answer_sink_samples=159126 top-1=0.7961 top-2=0.9490 top-3=1.0000
+# [DONE] input=171262 output=159126 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1.jsonl
+
+
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.8565
+# Graph  recall: 0.9662
+# None-sink recall: 0.8565
+# Answer + supported sink ratio: 0.8481
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=203 answer_sink_samples=203 top-1=0.7340 top-2=0.9212 top-3=1.0000
+# [DONE] input=237 output=203 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.8833
+# Graph  recall: 0.9933
+# None-sink recall: 0.8833
+# Answer + supported sink ratio: 0.8167
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=265 answer_sink_samples=265 top-1=0.8302 top-2=0.9692 top-3=1.0000
+# [DONE] input=300 output=265 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.6833
+# Graph  recall: 0.8967
+# None-sink recall: 0.6833
+# Answer + supported sink ratio: 0.6067
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=205 answer_sink_samples=205 top-1=0.7171 top-2=0.9064 top-3=1.0000
+# [DONE] input=300 output=205 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl
+
+````
+
+### create_embeddings
+
+````bash
+export CUDA_VISIBLE_DEVICES=1
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --batch_size 1024
+````
+
+### merged training
+
+````bash
+source /mnt/n0/uv_envs/kblam/bin/activate
+export CUDA_VISIBLE_DEVICES=1
+
+nohup python experiments/train.py \
+  --seed 1 --B 15  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 2 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_multihop_qwen3_4B_v1 --save_period 100 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_multihop_qwen3_4B_v1/training_log.txt  2>&1 &
+
+````
+
+结论：
+ - batch size 5/15: 精度上没有区别，5的速度更快
+ - kb_scale_factor(训练和验证统一) 4>2>1
+
+### Inference
+
+model_chkp:
+- /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/
+- /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt
+
+test_set_anwer_aware:
+- /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl 
+- /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl 
+- /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl
+
+test_set_no_aware:
+````bash
+source /mnt/n0/uv_envs/kblam/bin/activate
+export CUDA_VISIBLE_DEVICES=3
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.8439
+# Graph  recall: 0.9662
+# None-sink recall: 0.8650
+# Answer + supported sink ratio: 0.8397
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=237 answer_sink_samples=200 top-1=0.7400 top-2=0.9250 top-3=1.0000
+# [DONE] input=237 output=237 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.8233
+# Graph  recall: 0.9933
+# None-sink recall: 0.8867
+# Answer + supported sink ratio: 0.7700
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=300 answer_sink_samples=247 top-1=0.8300 top-2=0.9711 top-3=1.0000
+# [DONE] input=300 output=300 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+# Answer recall: 0.5900
+# Graph  recall: 0.8967
+# None-sink recall: 0.7133
+# Answer + supported sink ratio: 0.5500
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=300 answer_sink_samples=177 top-1=0.7627 top-2=0.9432 top-3=1.0000
+# [DONE] input=300 output=300 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --batch_size 1024
+
+````
+
+检索开销：
+````bash
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/retrieval_speed_test.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1 \
+  --infer_batch_size 1 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4 \
+  --limit 10 --profile_online_latency
+
+# samples=1 question_encode=0.4107s feature_build=0.0099s model_scoring=0.0468s dag_postprocess=0.0016s export=0.0002s online_total=0.4691s
+````
+question ecode时间占大头，但是这部分时间在原来的Vector RAG中也有
+剩下的时间包括打分、dag图构建的额外时间不超过0.06s
+
+
+
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset 2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+ # QPS: 3.41
+ # ---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.5005225885225886, 'rouge2': 0.14866666666666667, 'rougeL': 0.5028831168831169, 'rougeLsum': 0.5009446664446664, 'exact_match': 0.37, 'f1_overlap': 0.4944163059163059, 'faithfulness01': 0.42}
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset 2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+ # QPS: 3.41
+ # ---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.5005225885225886, 'rouge2': 0.14866666666666667, 'rougeL': 0.5028831168831169, 'rougeLsum': 0.5009446664446664, 'exact_match': 0.37, 'f1_overlap': 0.4944163059163059, 'faithfulness01': 0.42}
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+  # QPS: 2.76
+  # ---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.4701825396825397, 'rouge2': 0.1725, 'rougeL': 0.46938095238095234, 'rougeLsum': 0.4680396825396824, 'exact_match': 0.27, 'f1_overlap': 0.46112698412698416, 'faithfulness01': 0.34}
+
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+
+# QPS: 2.80
+# ---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.4625455655455654, 'rouge2': 0.29529365079365083, 'rougeL': 0.45640437340437334, 'rougeLsum': 0.46147363747363734, 'exact_match': 0.26, 'f1_overlap': 0.4472585192585193, 'faithfulness01': 0.29}
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_multihop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_no_aware_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+## multi/single-hops
+
+数据集准备：
+  - popqa
+  - squad: tripled版本（v4）中的问题polish过，替换成原版的问题(v4.1)
+````bash
+python /mnt/n0/datasets/popqa/popqa2dag.py \
+  --input /mnt/n0/datasets/popqa/test.tsv \
+  --output /mnt/n0/datasets/popqa/test_dag_singlehop.jsonl
+# [DONE] converted=14267 saved_to=/mnt/n0/datasets/popqa/test_dag_singlehop.jsonl
+python /mnt/n0/datasets/popqa/popsplit.py
+# [DONE] saved 14167 samples to /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/popqa.jsonl
+# [DONE] saved 100 samples to /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl
+
+python /mnt/n0/datasets/squad/v4/squad_v4_to_dag.py \
+  --input /mnt/n0/datasets/squad/v4/train_datasets_validation_questions.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/squad_v4.1.jsonl
+
+python /mnt/n0/datasets/squad/v4/squad_v4_to_dag.py \
+  --input /mnt/n0/datasets/squad/v4/test_datasets_validation_questions.json \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1.jsonl
+````
+
+合并training_set
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets.py \
+  --dataset popqa=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/popqa.jsonl \
+  --dataset squad=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/squad_v4.1.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_single_hop_train_tripled_v5.1.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_single_hop_train_tripled_v5.1.stats.json
+# [DONE] wrote 101668 samples to /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_single_hop_train_tripled_v5.1.jsonl
+
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets.py \
+  --dataset multihop=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit_dag_v1.jsonl \
+  --dataset singlehop=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_single_hop_train_tripled_v5.1.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.stats.json
+# [DONE] wrote 260794 samples to /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl
+
+````
+
+创建训练/测试集embedding
+````bash
+nohup python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.jsonl \
+  --batch_size 1024 > /mnt/n0/PathWeaver/docs/scripts/embedding.log 2>&1 &
+nohup python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --batch_size 1024 > /mnt/n0/PathWeaver/docs/scripts/embedding.log 2>&1 &
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1.jsonl \
+  --batch_size 1024
+````
+
+### Hybrid Training
+
+````bash
+export CUDA_VISIBLE_DEVICES=0
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4 --save_period 100 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/training_log.txt  2>&1 &
+
+export CUDA_VISIBLE_DEVICES=1
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 8 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb8 --save_period 100 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb8/training_log.txt  2>&1 &
+
+export CUDA_VISIBLE_DEVICES=2
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 16 \
+  --eval_step 100 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb16 --save_period 100 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb16/training_log.txt  2>&1 &
+````
+
+- v1.1
+squad数据集调整问题(v4.1)
+
+````bash
+export CUDA_VISIBLE_DEVICES=1
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 200 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1 --save_period 200 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1/training_log.txt  2>&1 &
+
+export CUDA_VISIBLE_DEVICES=2
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 200 \
+  --total_steps 12000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1 --save_period 200 --keep_top_k_ckpt 5  >> experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/training_log.txt  2>&1 &
+````
+
+
+解析训练日志：
+````bash
+source /mnt/n0/uv_envs/kblam/bin/activate
+python /mnt/n0/PathWeaver/experiments/train/show_training_score.py \
+  --f /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/training_log.txt
+
+
+````
+
+结论：
+ - kb 4>8>16
+
+### Hybrid Inference
+
+checkpoint: /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/stage1_lr_0.005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_11000
+- musique_dev_tripled_v5-qwen3.5-27B_dag_v1.json              
+                    l, num_samples: 205, scale_factor: 4.0, FA01                
+                    Score: 0.39 
+- hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl              
+                    , num_samples: 265, scale_factor: 4.0, FA01                 
+                    Score: 0.5     
+- 2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.j              
+                    sonl, num_samples: 203, scale_factor: 4.0,                  
+                    FA01 Score: 0.45 
+- popqa.jsonl,train.py:1297
+                    num_samples: 100, scale_factor: 4.0, FA01                   
+                    Score: 0.84    
+
+- popqa
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset popqa.jsonl  \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+- squad
+  v4.1测试集有问题
+  v4.0的前100条精度太高，可以开seed随机选
+QPS: 2.91
+---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.7472254991711647, 'rouge2': 0.3684237764224976, 'rougeL': 0.7338296653581484, 'rougeLsum': 0.736851076397516, 'exact_match': 0.55, 'f1_overlap': 0.7075176033460864, 'faithfulness01': 0.65}
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset squad_v4.jsonl  \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_11000 \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_11000_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 --seed 2
+
+````
+
+- 2wiki
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset 2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+
+- hotpot
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+- musique
+QPS: 2.50
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999/ \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1_kb4/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_7999_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 7999 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+
+## MintQA
+
+### 1.转格式
+
+````bash
+cd /mnt/n0/datasets/multi-hop/MintQA/
+python convert_to_vector_rag.py test \
+--limit 1 \
+--output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag.jsonl
+````
+
+### 2.剪枝
+MintQA原图太大，做剪枝:
+````bash
+# 3分钟
+python3 /mnt/n0/datasets/multi-hop/MintQA/convert_to_vector_rag.py \
+  test \
+  --max-triples-per-sample 256 \
+  --read-workers 8 \
+  --read-batch-size 16384 \
+  --io-batch-size 128 \
+  --num-workers 16 \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256.jsonl
+
+# 多线程会爆
+nohup python3 /mnt/n0/datasets/multi-hop/MintQA/convert_to_vector_rag.py \
+  train \
+  --max-triples-per-sample 256 \
+  --read-workers 16 \
+  --read-batch-size 16384 \
+  --io-batch-size 128 \
+  --num-workers 1 \
+  --output /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256.jsonl >> /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256.log 2>&1 &
+````
+
+剪枝到64
+````bash
+python3 /mnt/n0/datasets/multi-hop/MintQA/convert_to_vector_rag.py \
+  test \
+  --max-triples-per-sample 64 \
+  --read-workers 8 \
+  --read-batch-size 16384 \
+  --io-batch-size 128 \
+  --num-workers 16 \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl
+  # Hop distribution (shortest supporting path length):
+  #   1-hop: 882
+  #   2-hop: 673
+  #   3-hop: 133
+  #   4-hop: 2
+  #   no-path: 284
+
+python3 /mnt/n0/datasets/multi-hop/MintQA/convert_to_vector_rag.py \
+  train \
+  --max-triples-per-sample 64 \
+  --read-workers 16 \
+  --read-batch-size 16384 \
+  --io-batch-size 128 \
+  --num-workers 1 \
+  --output /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl
+  # Hop distribution (shortest supporting path length):
+  #   1-hop: 3513
+  #   2-hop: 2771
+  #   3-hop: 479
+  #   4-hop: 2
+  #   no-path: 1123
+````
+
+### 3. 过滤多跳样本
+
+````bash
+python3 /mnt/n0/datasets/multi-hop/MintQA/filter_multi_hop.py \
+ --input-file /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl \
+ --output-file /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2.jsonl \
+ --min-hop 2
+  # Load 1974 samples from /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl
+  # Filter 808 samples to /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2.jsonl
+python3 /mnt/n0/datasets/multi-hop/MintQA/filter_multi_hop.py \
+ --input-file /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl \
+ --output-file /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_3.jsonl \
+ --min-hop 3
+  # Filter 135 samples to /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_3.jsonl
+
+python3 /mnt/n0/datasets/multi-hop/MintQA/filter_multi_hop.py \
+ --input-file /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl \
+ --output-file /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_2.jsonl \
+ --min-hop 2
+  # Load 7888 samples from /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl
+  # Filter 3252 samples to /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_2.jsonl
+
+python3 /mnt/n0/datasets/multi-hop/MintQA/filter_multi_hop.py \
+ --input-file /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl \
+ --output-file /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1.jsonl \
+ --min-hop 1
+  # Load 7888 samples from /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl
+  # Filter 6765 samples to /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1.jsonl
+
+````
+
+vector-rag推理：
+````bash
+python3 /mnt/n0/PathWeaver/experiments/vector_rag.py \
+  --dataset-path /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256.jsonl \
+  --dataset-type mintqa \
+  --model-path /mnt/n0/models/qwen3-4B-Instruct \
+  --embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --n-samples 100 \
+  --oracle-retrieval \
+  --max-model-len 32768 \
+  --mintqa_min_hop 2 \
+  --index-path /mnt/n0/PathWeaver/experiments/vector_rag_index/mintqa_dev_bge_256
+
+# {'rouge1': 0.8834848484848485, 'rouge2': 0.6222222222222222, 'rougeL': 0.8836363636363638, 'rougeLsum': 0.8810101010101008, 'exact_match': 0.87, 'f1_overlap': 0.8820808080808081, 'faithfulness01': 0.87}
+
+python3 /mnt/n0/PathWeaver/experiments/vector_rag.py \
+  --dataset-path /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256.jsonl \
+  --dataset-type mintqa \
+  --model-path /mnt/n0/models/qwen3-4B-Instruct \
+  --embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --n-samples 100 \
+  --similarity-top-k 16 \
+  --max-model-len 32768 \
+  --mintqa_min_hop 2 \
+  --index-path /mnt/n0/PathWeaver/experiments/vector_rag_index/mintqa_dev_bge_256
+  # {'rouge1': 0.33491916416916406, 'rouge2': 0.19285714285714284, 'rougeL': 0.33516288286876517, 'rougeLsum': 0.33220739391327625, 'exact_match': 0.28, 'f1_overlap': 0.3362784241901889, 'faithfulness01': 0.32}
+
+
+python /mnt/n0/PathWeaver/docs/experiments/msa.py \
+  --dataset-path /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256.jsonl \
+  --dataset-type mintqa \
+  --mintqa_min_hop 2 \
+  --n-samples 100 \
+  --block-size 2048 \
+  --memory-cache-dir /mnt/n0/PathWeaver/experiments/msa_cache/mintqa_test_pruned_256 \
+  --max-batch-size 1 \
+  --model-path /mnt/n0/models/MSA-4B
+
+# ========== Latency ==========
+# Per-question answer time: mean=3.1695s, p50=2.5817s, p95=4.7068s
+# Average generate count per request: 3.0300
+# Total input tokens per request: mean=298.7700, p50=252.0000, p95=599.0000
+# Total output tokens per request: mean=487.0700, p50=410.0000, p95=929.0000
+# Retrieval recall: mean=0.0000, p50=0.0000, p95=0.0000
+# Retrieval hit@16: mean=0.0000
+# Retrieval all-support-hit@16: mean=0.0000
+# Throughput (QPS): 0.32
+# =============================
+# {'rouge1': 0.22285867204259013, 'rouge2': 0.07213852813852813, 'rougeL': 0.22314523474409242, 'rougeLsum': 0.2245690490243535, 'exact_match': 0.14, 'f1_overlap': 0.22226666856951888, 'faithfulness01': 0.24}
+
+````
+
+### Tripled-Format & Graph Gen
+
+````bash
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256_tripled.jsonl
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256_tripled.jsonl
+
+# zero-shot, 使用 merged_multihop训练的mlp模型推
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_256_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+# Answer recall: 0.6575
+# Graph  recall: 0.8708
+# None-sink recall: 0.6575
+# Answer + supported sink ratio: 0.4752
+
+# 在mintqa上训+推
+nohup python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode train \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256_tripled.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --train_batch_size 1024 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_merged_v1_mintqa_only.pkl \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3 \
+  > /mnt/n0/PathWeaver/docs/scripts/graph_gen/train_subgraph.log 2>&1 &
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_256_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/mintqa_pruned_256_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+# Answer recall: 0.8354
+# Graph  recall: 0.8695
+# None-sink recall: 0.8354
+# Answer + supported sink ratio: 0.6471
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_256_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_256_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+  # Answer recall: 0.7882
+  # Graph  recall: 0.8708
+  # None-sink recall: 0.7882
+  # Answer + supported sink ratio: 0.5760
+  # Sink relevance rank stats (merged across final sink counts):
+  #   all_samples=1556 answer_sink_samples=1556 top-1=0.9165 top-2=0.9715 top-3=1.0000
+
+````
+
+#### pruned_64
+````bash
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_tripled.jsonl
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_tripled.jsonl
+
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_3.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_3_tripled.jsonl
+python /mnt/n0/datasets/multi-hop/MintQA/convert_to_tripled.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1.jsonl \
+  --output /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1_tripled.jsonl
+
+# zero-shot：
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+  # Answer recall: 0.7690
+  # Graph  recall: 0.8597
+  # None-sink recall: 0.7690
+  # Answer + supported sink ratio: 0.4569
+  # Sink relevance rank stats (merged across final sink counts):
+  #   all_samples=1518 answer_sink_samples=1518 top-1=0.8676 top-2=0.9483 top-3=1.0000
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+  # Answer recall: 0.8105
+  # Graph  recall: 0.8597
+  # None-sink recall: 0.8105
+  # Answer + supported sink ratio: 0.4210
+  # Sink relevance rank stats (merged across final sink counts):
+  #   all_samples=1600 answer_sink_samples=1600 top-1=0.9400 top-2=0.9822 top-3=1.0000
+
+# 训推
+nohup bash -c '
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode train \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_tripled.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only_pruned_64.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --train_batch_size 1024 \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_merged_v1_mintqa_only_pruned_64.pkl \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/mintqa_pruned_64_tripled_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v1_joint_mintqa_only_pruned_64.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+' > /mnt/n0/PathWeaver/docs/scripts/graph_gen/train_subgraph.log 2>&1 &
+
+# Answer recall: 0.8370
+# Graph  recall: 0.8626
+# None-sink recall: 0.8370
+# Answer + supported sink ratio: 0.4855
+# Sink relevance rank stats (merged across final sink counts):
+#   all_samples=6602 answer_sink_samples=6602 top-1=0.9440 top-2=0.9850 top-3=1.0000
+````
+
+### Merged Hybrid V2
+
+创建混合训练集：
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets.py \
+  --dataset mergedv1=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --dataset mintqa=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/mintqa_pruned_256_tripled_dag.jsonl \
+  --output  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.stats.json \
+  --allow-answer-insufficient
+
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets.py \
+  --dataset mergedv1=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_hop_train_dag_v1.1.jsonl \
+  --dataset mintqa=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/mintqa_pruned_64_tripled_dag.jsonl \
+  --output  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1.stats.json \
+  --allow-answer-insufficient
+````
+
+
+
+创建embedding：
+````bash
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.jsonl \
+  --batch_size 1024
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_256_tripled_dag.jsonl \
+  --batch_size 1024
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1.jsonl \
+  --batch_size 1024
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag.jsonl \
+  --batch_size 1024
+
+````
+
+训练
+````bash
+
+nohup python experiments/train.py \
+  --seed 1 --B 5  --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_v2.1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag.jsonl\
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_v1_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned_64_tripled_dag_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 200 \
+  --total_steps 10000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_qwen3_4B_v2 --save_period 200 --keep_top_k_ckpt 5  > experiments/train/dag_kv_merged_hybrid_qwen3_4B_v2/training_log.txt  2>&1 &
+
+````
+
+### Merged Hybrid V2.1
+
+#### Graph Gen
+纯单跳(已经有了dag图: [1])：
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/popqa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/squad_v4.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl
+
+对多跳数据集先合并一版训练集，然后训练mlp模型
+训练集:
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl
+  - /mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1_tripled.jsonl
+
+多跳数据集的测试集
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl
+  - /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl
+
+
+轻量版的合并脚本，ID级去重，只有样本里存在 answer_sufficient 且它明确为 False 时才过滤
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets_lightweight.py \
+  --dataset hotpot=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --dataset 2wiki=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --dataset musique=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl \
+  --dataset mintqa=/mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1.stats
+````
+输出：
+```
+{
+  "input_datasets": [
+    {
+      "dataset": "hotpot",
+      "path": "/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/hotpot_train_tripled_v5-qwen2.5-72B_4bit.jsonl",
+      "loaded": 72991,
+      "dropped_answer_sufficient_false": 482,
+      "duplicate_ids_dropped": 0,
+      "final_kept": 72509
+    },
+    {
+      "dataset": "2wiki",
+      "path": "/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/2wiki_train_2hop_tripled_v5-qwen2.5-72B_4bit.jsonl",
+      "loaded": 84130,
+      "dropped_answer_sufficient_false": 911,
+      "duplicate_ids_dropped": 3353,
+      "final_kept": 79866
+    },
+    {
+      "dataset": "musique",
+      "path": "/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/musique_train_tripled_v5-qwen2.5-72B_4bit.jsonl",
+      "loaded": 19874,
+      "dropped_answer_sufficient_false": 987,
+      "duplicate_ids_dropped": 0,
+      "final_kept": 18887
+    },
+    {
+      "dataset": "mintqa",
+      "path": "/mnt/n0/datasets/multi-hop/MintQA/train_vector_rag_pruned_64_hop_1_tripled.jsonl",
+      "loaded": 6765,
+      "dropped_answer_sufficient_false": 0,
+      "duplicate_ids_dropped": 0,
+      "final_kept": 6765
+    }
+  ],
+  "input_samples": 183760,
+  "dropped_answer_sufficient_false": 2380,
+  "duplicate_ids_dropped": 3353,
+  "final_samples": 178027,
+  "final_dataset_counts": {
+    "2wiki": 79866,
+    "hotpot": 72509,
+    "mintqa": 6765,
+    "musique": 18887
+  }
+}
+```
+
+在训练集上训练+训练集推理+测试集推理(answer-aware开或关)
+````bash
+nohup bash -c '
+set -euo pipefail
+
+python -u /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --train_batch_size 2048 \
+  --num_workers 0 \
+  --disable_pin_memory \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/training_data_cache_merged_v2.1.pkl \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+
+' > /mnt/n0/PathWeaver/docs/scripts/graph_gen/train_gen_subgraph.log 2>&1 &
+````
+
+output:
+```
+Answer recall: 0.9246
+Graph  recall: 0.9827
+None-sink recall: 0.9246
+Answer + supported sink ratio: 0.8310
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=164601 answer_sink_samples=164601 top-1=0.7888 top-2=0.9455 top-3=1.0000
+[DONE] input=178027 output=164601 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1_dag.jsonl
+
+
+Answer recall: 0.8776
+Graph  recall: 0.9662
+None-sink recall: 0.8776
+Answer + supported sink ratio: 0.8523
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=208 answer_sink_samples=208 top-1=0.7212 top-2=0.9375 top-3=1.0000
+[DONE] input=237 output=208 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+Answer recall: 0.8523
+Graph  recall: 0.9662
+None-sink recall: 0.8819
+Answer + supported sink ratio: 0.8312
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=237 answer_sink_samples=202 top-1=0.7277 top-2=0.9356 top-3=1.0000
+[DONE] input=237 output=237 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+
+Answer recall: 0.8800
+Graph  recall: 0.9933
+None-sink recall: 0.8800
+Answer + supported sink ratio: 0.8033
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=264 answer_sink_samples=264 top-1=0.7955 top-2=0.9697 top-3=1.0000
+[DONE] input=300 output=264 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+Answer recall: 0.8200
+Graph  recall: 0.9933
+None-sink recall: 0.8900
+Answer + supported sink ratio: 0.7667
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=300 answer_sink_samples=246 top-1=0.7967 top-2=0.9675 top-3=1.0000
+[DONE] input=300 output=300 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+
+Answer recall: 0.6333
+Graph  recall: 0.8967
+None-sink recall: 0.6333
+Answer + supported sink ratio: 0.5667
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=190 answer_sink_samples=190 top-1=0.7211 top-2=0.9091 top-3=1.0000
+[DONE] input=300 output=190 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+Answer recall: 0.5833
+Graph  recall: 0.8967
+None-sink recall: 0.6900
+Answer + supported sink ratio: 0.5467
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=300 answer_sink_samples=175 top-1=0.7657 top-2=0.9302 top-3=1.0000
+[DONE] input=300 output=300 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+
+Answer recall: 0.9257
+Graph  recall: 1.0000
+None-sink recall: 0.9257
+Answer + supported sink ratio: 0.6015
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=748 answer_sink_samples=748 top-1=0.8997 top-2=0.9677 top-3=1.0000
+[DONE] input=808 output=748 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa.jsonl
+Answer recall: 0.8911
+Graph  recall: 1.0000
+None-sink recall: 0.9282
+Answer + supported sink ratio: 0.5941
+Sink relevance rank stats (merged across final sink counts):
+  all_samples=808 answer_sink_samples=720 top-1=0.9014 top-2=0.9692 top-3=1.0000
+[DONE] input=808 output=808 saved_to=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl
+```
+
+#### 训练集+测试集准备
+
+训练集：合并单跳+多跳数据集
+````bash
+python /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merge_tripled_datasets_lightweight.py \
+  --dataset singlehop_pop=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/popqa.jsonl \
+  --dataset singlehop_squad=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/squad_v4.jsonl \
+  --dataset multihop=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1_dag.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.jsonl \
+  --stats-output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.stats
+````
+生成embedding
+训练集: /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.jsonl
+测试集(多跳有aa/naa两版)：
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa.jsonl
+  - /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl
+````bash
+nohup bash -c '
+set -euo pipefail
+
+FILES=(
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl
+)
+
+for file in "${FILES[@]}"; do
+  echo "[$(date -Iseconds)] start: $file"
+  python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+    --model_name qwen3-embedding-0.6B \
+    --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+    --dataset_type dag \
+    --dataset_path "$file" \
+    --batch_size 1024 \
+    --progress
+  echo "[$(date -Iseconds)] done:  $file"
+done
+' > /mnt/n0/PathWeaver/docs/scripts/embedding_v2.log 2>&1 &
+````
+
+#### 训练
+
+
+aa版测试集
+````bash
+export CUDA_VISIBLE_DEVICES=2
+mkdir -p experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_aa
+nohup python experiments/train.py \
+  --seed 1 --B 5 --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_aa_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 200 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_aa \
+  --save_period 200 --keep_top_k_ckpt 5 \
+  > experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_aa/training_log.txt 2>&1 &
+
+````
+
+naa版测试集
+````bash
+export CUDA_VISIBLE_DEVICES=3
+mkdir -p experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_naa
+nohup python experiments/train.py \
+  --seed 1 --B 5 --lr 5e-4 --use_lr_decay --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head --duplicate_true_kb \
+  --dynamic_kb_size 10 50 --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1.jsonl \
+  --train_precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1_qwen-embedding-0.6B_embd_key.npy \
+  --train_precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_training_v2.1_qwen-embedding-0.6B_embd_value.npy \
+  --test_data_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa.jsonl /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl \
+  --test_precomputed_embed_keys_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_key.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_qwen-embedding-0.6B_embd_key.npy \
+  --test_precomputed_embed_values_paths /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/popqa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/squad_v4_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_naa_qwen-embedding-0.6B_embd_value.npy /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_qwen-embedding-0.6B_embd_value.npy \
+  --hf_model_spec /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --verbose \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 200 \
+  --total_steps 8000 --N 9999999 \
+  --model_save_dir experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_naa \
+  --save_period 200 --keep_top_k_ckpt 5 \
+  > experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_naa/training_log.txt 2>&1 &
+
+````
+
+#### 时延测试
+
+Profile Online DAG Lantency
+  - 创建专门的单样本测试路径(profile_online_latency开启)
+
+总时间：
+  - 实体检索时间：
+  - DAG时间
+  - Prefill
+  - Decode
+
+实体检索时间，看vector-rag: 0.0454
+````bash
+python3 /mnt/n0/PathWeaver/experiments/vector_rag.py \
+  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/mintqa_test_pruned256.jsonl \
+  --queryset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/mintqa_test_pruned64_hop2.jsonl \
+  --model-path /mnt/n0/models/qwen3-4B-Instruct \
+  --embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --n-samples 100 \
+  --similarity-top-k 16 \
+  --max-model-len 32768 \
+  --index-path /mnt/n0/PathWeaver/experiments/vector_rag_index/mintqa_dev_bge_256
+````
+
+DAG时间: 0.042-0.02=0.022
+````bash
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_profile.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --keep_score \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4 \
+  --profile_online_latency
+# avg_per_sample=0.042126s question_encode=0.020508s feature_build=0.016761s model_scoring=0.003895s dag_postprocess=0.000889s export=0.000072s
+````
+
+Prefill+Decode时间：0.3905
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set \
+  --test_dataset mintqa_pruned64_hop2_dag_naa.jsonl  \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_naa/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_6800 \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_4B_naa/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_6800_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 6800 \
+  --t_step 8000 \
+  --kb_scale_factor 4 
+````
+
+## MoreHopQA (❌️，精度太低)
+
+- Triple Gen & Split
+将手工验证和未验证的数据集合并成一个, 验证过的在前面
+````bash
+cd /mnt/n0/datasets/morehopqa/data
+python merge.py
+````
+生成三元组：
+"/mnt/n0/datasets/morehopqa/prepare_kg/total_samples_to_tripled_kg_v1.jsonl"
+
+- Graph Gen
+````bash
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode infer \
+  --input /mnt/n0/datasets/morehopqa/prepare_kg/total_samples_to_tripled_kg_v1.jsonl \
+  --output /mnt/n0/datasets/morehopqa/prepare_kg/total_samples_to_tripled_kg_v1_dag.jsonl \
+  --model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_merged_v1_joint.pt \
+  --st_model /mnt/n0/models/bge-en-v1.5/ \
+  --batch_size 1024 \
+  --infer_batch_size 1024 \
+  --topic_top_k 8 \
+  --dde_hops 3 \
+  --mention_bonus 0.2 \
+  --seed_edge_topk 18 \
+  --expansion_hops 2 \
+  --per_src_cap 3 \
+  --max_nodes 30 \
+  --max_edges 40 \
+  --max_sinks 3 \
+  --answer_aware \
+  --keep_score \
+  --answerable_only \
+  --reverse_sink_edge_topk 2 \
+  --reverse_sink_hops 4 \
+  --reverse_sink_beam_width 4
+````
+
+- 数据集后处理
+划分训练集和验证集
+````bash
+cd /mnt/n0/datasets/morehopqa/prepare_kg
+python 1.merge.py
+python 1.1.supporting_extract.py samples_tripled_kg_v1_dag.jsonl --output samples_tripled_kg_v1_dag_fixed.jsonl
+python 2.split.py
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/morehopqa/prepare_kg/train_v1.jsonl \
+  --batch_size 1024
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/morehopqa/prepare_kg/dev_v1.jsonl \
+  --batch_size 1024
+
+````
+
+
+### baseline
+````bash
+python3 ../../experiments/vector_rag.py \
+  --dataset-path /mnt/n0/datasets/morehopqa/prepare_kg/samples_tripled_kg_v1_dag_fixed.jsonl \
+  --model-path /mnt/n0/models/qwen3-4B-Instruct \
+  --embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --n-samples 100 \
+  --oracle-retrieval \
+  --index-path ../../experiments/vector_rag_index/morehopqa_bge
+# {'rouge1': 0.19091804029304035, 'rouge2': 0.0, 'rougeL': 0.1688238150738151, 'rougeLsum': 0.166213924963925, 'exact_match': 0.09, 'f1_overlap': 0.10786782661782662, 'faithfulness01': 0.22}
+
+python3 ../../experiments/vector_rag.py \
+  --dataset-path /mnt/n0/datasets/morehopqa/prepare_kg/samples_tripled_kg_v1_dag.jsonl \
+  --model-path /mnt/n0/models/qwen3-4B-Instruct \
+  --embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --n-samples 100 \
+  --similarity-top-k 16 \
+  --index-path ../../experiments/vector_rag_index/morehopqa_bge
+
+````
+
+### zore-shot
+---- [1/1] kb_scale_factor: 4.0, {'rouge1': 0.1, 'rouge2': 0.0, 'rougeL': 0.10166666666666666, 'rougeLsum': 0.09999999999999998, 'exact_match': 0.06, 'f1_overlap': 0.065, 'faithfulness01': 0.06}
+````bash
+python3 /mnt/n0/PathWeaver/experiments/eval_generation.py generation \
+  --dataset_dir /mnt/n0/datasets/morehopqa/prepare_kg \
+  --test_dataset dev_v1.jsonl \
+  --model_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_11000 \
+  --encoder_dir /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_hop_qwen3_4B_v1.1.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_11000_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /mnt/n0/models/qwen3-4B-Instruct \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /mnt/n0/datasets/morehopqa/prepare_kg/dev_v1_qwen-embedding-0.6B_embd_key.npy \
+  --precomputed_embed_values_path /mnt/n0/datasets/morehopqa/prepare_kg/dev_v1_qwen-embedding-0.6B_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --step 11000 \
+  --t_step 12000 \
+  --kb_scale_factor 4
+````
+
+### 小规模继续训练
+
+### 混合训练
+
+
+
+
+
+# Graph-RAG
+
+## AutoSchemaKG Gen
+
+````bash
+source /mnt/n0/PathWeaver/envs/kblam-rag/bin/activate
+export CUDA_VISIBLE_DEVICES=2,3
+nohup python -m vllm.entrypoints.openai.api_server \
+  --model /mnt/n0/models/qwen2.5-72B-4bit \
+  --served-model-name qwen_72b \
+  --host 0.0.0.0 \
+  --enforce-eager \
+  --port 8001 \
+  --tensor-parallel-size 2 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.95 > /mnt/n0/PathWeaver/experiments/qwen2.5-72B-4bit.log 2>&1 &
+````
+
+转换数据集格式：
+````bash
+source /mnt/n0/PathWeaver/envs/kblam-rag/bin/activate
+cd /mnt/n0/AutoSchemaKG
+
+python atlas_rag/kg_construction/prepare_datasets.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/popqa_dataset.json \
+  --dataset_type popqa \
+  --output /mnt/n0/AutoSchemaKG/example/example_data/popqa_dataset.jsonl
+
+python atlas_rag/kg_construction/prepare_datasets.py \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/squad_dev.json \
+  --dataset_type squad \
+  --output /mnt/n0/AutoSchemaKG/example/example_data/squad_dev.jsonl
+
+python /mnt/n0/AutoSchemaKG/atlas_rag/kg_construction/prepare_datasets.py \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64.jsonl \
+  --dataset_type mintqa \
+  --output /mnt/n0/AutoSchemaKG/example/example_data/mintqa_test_64_triple.jsonl
+
+````
+
+构图：
+````bash
+export CUDA_VISIBLE_DEVICES=1
+nohup bash -c '
+set -euo pipefail
+python docs/scripts/1.create_kg_2wiki.py \
+  --data-directory /mnt/n0/AutoSchemaKG/example/example_data \
+  --data-name popqa_dataset.jsonl \
+  --output-directory /mnt/n0/AutoSchemaKG/example/generated/popqa_dataset \
+  --llm-endpoint http://127.0.0.1:8001/v1 \
+  --llm-model qwen_72b \
+  --batch-size-triple 256 \
+  --max-workers 64
+
+python docs/scripts/1.create_kg_2wiki.py \
+  --data-directory /mnt/n0/AutoSchemaKG/example/example_data \
+  --data-name squad_dev.jsonl \
+  --output-directory /mnt/n0/AutoSchemaKG/example/generated/squad_dev \
+  --llm-endpoint http://127.0.0.1:8001/v1 \
+  --llm-model qwen_72b \
+  --batch-size-triple 256 \
+  --max-workers 64
+' >> /mnt/n0/AutoSchemaKG/example/example_data/generate_pop_squad.log  2>&1 &
+
+
+nohup python /mnt/n0/AutoSchemaKG/docs/scripts/1.create_kg_2wiki.py \
+  --data-directory /mnt/n0/AutoSchemaKG/example/example_data \
+  --data-name mintqa_test_64_triple.jsonl \
+  --output-directory /mnt/n0/AutoSchemaKG/example/generated/mintqa_test_64_triple \
+  --llm-endpoint http://127.0.0.1:8001/v1 \
+  --llm-model qwen_72b \
+  --batch-size-triple 256 \
+  --max-workers 64 >> /mnt/n0/AutoSchemaKG/example/example_data/generate_mintqa_test_64_triple.log  2>&1 &
+````
+
+## Evaluate
+
+启动backend模型服务：
+````bash
+source /mnt/n0/uv_envs/kblam-rag/bin/activate
+export CUDA_VISIBLE_DEVICES=2
+nohup python -m vllm.entrypoints.openai.api_server \
+  --model /mnt/n0/models/qwen3-4B-Instruct/ \
+  --served-model-name qwen3_4B \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --tensor-parallel-size 1 \
+  --trust-remote-code \
+  --enforce-eager \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.85 \
+  --max-num-batched-tokens 8192 > /mnt/n0/PathWeaver/experiments/qwen3-4B-Instruct.log 2>&1 &
+````
+
+- pop
+  {'rouge1': 0.4080604893472538, 'rouge2': 0.013523809523809525, 'rougeL': 0.4087815126050418, 'rougeLsum': 0.40904996392496373, 'exact_match': 0.19, 'f1_overlap': 0.40841925558102027, 'faithfulness01': 0.71}
+  Average retrieval time: 2.9210 s
+  Average generation time: 2.5791 s
+  ````bash
+  source /mnt/n0/uv_envs/kblam-rag/bin/activate
+  export CUDA_VISIBLE_DEVICES=3
+
+  nohup python /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+    --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/popqa_queryset.json \
+    --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+    --kg-path /mnt/n0/AutoSchemaKG/example/generated/popqa_dataset/ \
+    --llm-endpoint http://127.0.0.1:8001/v1 \
+    --llm-model qwen3_4B \
+    --test-samples 100 \
+    --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_popqa_qwen3_4B_bge.log 2>&1 &
+  ````
+
+- squad
+
+  =====Metrics=====
+  {'rouge1': 0.7378571238702818, 'rouge2': 0.5179226190476189, 'rougeL': 0.7364400584795322, 'rougeLsum': 0.7396536416799575, 'exact_match': 0.67, 'f1_overlap': 0.7370502079619726, 'faithfulness01': 0.72}
+  Average retrieval time: 1.9344 s
+  Average generation time: 3.2991 s
+
+  ````bash
+  source /mnt/n0/uv_envs/kblam-rag/bin/activate
+  export CUDA_VISIBLE_DEVICES=3
+
+nohup python /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/squad_dev.json \
+  --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+  --kg-path /mnt/n0/AutoSchemaKG/example/generated/squad_dev/ \
+  --llm-endpoint http://127.0.0.1:8001/v1 \
+  --llm-model qwen3_4B \
+  --test-samples 100 \
+  --seed 2 \
+  --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_squad_qwen3_4B_bge.log 2>&1 &
+  ````
+
+- 2wiki
+  {'rouge1': 0.4753593073593073, 'rouge2': 0.3609919908466819, 'rougeL': 0.4738233766233767, 'rougeLsum': 0.47366277056277056, 'exact_match': 0.42, 'f1_overlap': 0.4714424242424242, 'faithfulness01': 0.45}
+  Average retrieval time: 2.7416 s
+  Average generation time: 3.3045 s
+  ````bash
+  source /mnt/n0/uv_envs/kblam-rag/bin/activate
+  export CUDA_VISIBLE_DEVICES=3
+
+  nohup python  /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+    --kg-path /mnt/n0/AutoSchemaKG/example/generated/2wiki_dev/ \
+    --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/2wiki_dev.json \
+    --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+    --llm-model qwen3_4B \
+    --test-samples 100 \
+    --llm-endpoint 'http://127.0.0.1:8001/v1' \
+    --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_2wiki_qwen3_4B_bge.log 2>&1 &
+  ````
+
+- hotpot
+  Average retrieval time: 6.4916 s
+  Average generation time: 3.2367 s
+  {'rouge1': 0.5784565580618211, 'rouge2': 0.3277408963585434, 'rougeL': 0.5783909774436089, 'rougeLsum': 0.5776271929824561, 'exact_match': 0.42, 'f1_overlap': 0.5776152882205514, 'faithfulness01': 0.5}
+
+  ````bash
+  source /mnt/n0/uv_envs/kblam-rag/bin/activate
+  export CUDA_VISIBLE_DEVICES=3
+
+  nohup python  /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+    --kg-path /mnt/n0/AutoSchemaKG/example/generated/hotpot_dev/ \
+    --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_clean/hotpot_dev_v1.json \
+    --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+    --llm-model qwen3_4B \
+    --test-samples 100 \
+    --llm-endpoint 'http://127.0.0.1:8001/v1' \
+    --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_hotpot_qwen3_4B_bge.log 2>&1 &
+  ````
+
+- musique
+
+  Average retrieval time: 3.2884 s
+  Average generation time: 3.7312 s
+  {'rouge1': 0.26632991220203495, 'rouge2': 0.1814308608058608, 'rougeL': 0.2611060089384897, 'rougeLsum': 0.2662143709852015, 'exact_match': 0.17, 'f1_overlap': 0.2660563996210785, 'faithfulness01': 0.27}
+
+  ````bash
+  source /mnt/n0/uv_envs/kblam-rag/bin/activate
+  export CUDA_VISIBLE_DEVICES=3
+
+  nohup python  /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+    --kg-path /mnt/n0/AutoSchemaKG/example/generated/musique_dev/ \
+    --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/musique_clean/musique_dev_answerable.jsonl \
+    --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+    --llm-model qwen3_4B \
+    --test-samples 100 \
+    --llm-endpoint 'http://127.0.0.1:8001/v1' \
+    --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_musique_qwen3_4B_bge.log 2>&1 &
+  ````
+- mintqa
+  Average retrieval time: 1.0019 s
+  Average generation time: 2.4292 s
+  {'rouge1': 0.46018518518518514, 'rouge2': 0.24, 'rougeL': 0.4606944444444445, 'rougeLsum': 0.4637499999999999, 'exact_match': 0.41, 'f1_overlap': 0.4604629629629629, 'faithfulness01': 0.41}
+````bash
+source /mnt/n0/uv_envs/kblam-rag/bin/activate
+export CUDA_VISIBLE_DEVICES=3
+
+nohup python  /mnt/n0/AutoSchemaKG/docs/scripts/2.kg_benchmark.py \
+  --kg-path /mnt/n0/AutoSchemaKG/example/generated/mintqa_test_64_triple/ \
+  --dataset-path /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2.jsonl \
+  --encoder-model /mnt/n0/models/bge-en-v1.5/ \
+  --llm-model qwen3_4B \
+  --test-samples 100 \
+  --llm-endpoint 'http://127.0.0.1:8001/v1' \
+  --topN 16 > /mnt/n0/PathWeaver/experiments/overall_graph_rag_mintqa_qwen3_4B_bge.log 2>&1 &
+````
+
+
+# KBLaM
+flat dag：将所有三元组展开，不做额外的检索
+````bash
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode baseline \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_2_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_base.jsonl \
+  --limit 1
+
+nohup bash -c '
+set -euo pipefail
+
+FILES=(
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa.jsonl
+)
+
+for file in "${FILES[@]}"; do
+  file_base="${file%.jsonl}_base"
+  echo "[$(date -Iseconds)] start: $file -> ${file_base}.jsonl"
+  python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+    --mode baseline \
+    --input "$file" \
+    --output "${file_base}.jsonl"
+  echo "[$(date -Iseconds)] done:  $file"
+done
+' > /mnt/n0/PathWeaver/docs/scripts/graph_gen/kblam_base.log 2>&1 &
+
+python /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode baseline \
+  --input /mnt/n0/datasets/multi-hop/MintQA/test_vector_rag_pruned_64_hop_3_tripled.jsonl \
+  --output /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop3_dag_base.jsonl
+
+````
+
+create embedding：
+````bash
+nohup bash -c '
+set -euo pipefail
+
+FILES=(
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_naa_base.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B_dag_aa_base.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B_dag_aa_base.jsonl
+  /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop2_dag_naa_base.jsonl
+)
+
+for file in "${FILES[@]}"; do
+  echo "[$(date -Iseconds)] start: $file"
+  python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+    --model_name qwen3-embedding-0.6B \
+    --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+    --dataset_type dag \
+    --dataset_path "$file" \
+    --batch_size 1024 \
+    --progress
+  echo "[$(date -Iseconds)] done:  $file"
+done
+' > /mnt/n0/PathWeaver/docs/scripts/embedding_v2.log 2>&1 &
+
+python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /mnt/n0/models/qwen-embedding-0.6B/ \
+  --dataset_type dag \
+  --dataset_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/mintqa_pruned64_hop3_dag_base.jsonl \
+  --batch_size 1024 \
+  --progress
+````
+
+t
