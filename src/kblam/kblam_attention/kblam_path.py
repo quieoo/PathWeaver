@@ -150,8 +150,8 @@ def _maybe_collect_path_attn_trace(
             "layer_idx": int(layer_idx),
             "kb_len": int(kb_len),
             "shape": tuple(alpha_kb.shape),
-            "path_attn_mix_ratio": float(getattr(kb_config, "path_attn_mix_ratio", 1.0)),
-            "kb_layer_frequency": int(getattr(kb_config, "kb_layer_frequency", 1)),
+            "path_attn_mix_ratio": float(getattr(kb_config, "path_attn_mix_ratio", 0.8)),
+            "kb_layer_frequency": int(getattr(kb_config, "kb_layer_frequency", 3)),
             "context": dict(_PATH_ATTN_TRACE["context"]),
         }
 
@@ -336,8 +336,7 @@ def _apply_kblam_path_attention_impl(
         A = kb_adj.to(device=alpha_kb.device, dtype=alpha_kb.dtype)
         beta_kb = alpha_kb @ A
 
-    # mix_ratio = getattr(kb_config, "path_attn_mix_ratio", 1.0)
-    mix_ratio = getattr(kb_config, "path_attn_mix_ratio", 0.7)
+    mix_ratio = getattr(kb_config, "path_attn_mix_ratio", 0.8)
     beta_kb = mix_ratio * beta_kb + (1.0 - mix_ratio) * alpha_kb
 
     beta_kb = beta_kb / beta_kb.sum(dim=-1, keepdim=True).clamp_min(1e-9)

@@ -22,6 +22,8 @@ from kblam.utils.dataset import (
     build_query_samples,
     compute_retrieval_recall_stats,
     extract_doc_title,
+    get_question,
+    get_sample_id,
     load_dataset,
     load_queryset,
 )
@@ -45,6 +47,12 @@ def parse_args():
         help="Unified dataset json path. Compatible with vector_rag.py inputs.",
     )
     parser.add_argument("--dataset-type", type=str, default="2wiki", help="Dataset type for logging.")
+    parser.add_argument(
+        "--dataset-limit",
+        type=int,
+        default=None,
+        help="Optionally truncate the loaded dataset to the first N rows before building memory/query data.",
+    )
     parser.add_argument("--n-samples", type=int, default=100, help="Number of leading rows used as queries.")
     parser.add_argument("--mintqa_min_hop", type=int, default=None, help="MintQA minimum support hops for query filtering.")
     parser.add_argument(
@@ -74,6 +82,12 @@ def parse_args():
     parser.add_argument("--template", type=str, default="QWEN3_INSTRUCT_TEMPLATE")
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--max-chunk-per-block", type=int, default=16 * 1024)
+    parser.add_argument(
+        "--pooling-kernel-size",
+        type=int,
+        default=None,
+        help="Override pooling_kernel_size from the model msa_config.",
+    )
     parser.add_argument(
         "--doc-top-k",
         type=int,
@@ -217,13 +231,39 @@ def build_memory_cache_root(args, dataset_path: str, model_config: ModelConfig) 
     return cache_root
 
 
+def _build_memory_docs_from_dataset_input(
+    dataset: List[Any],
+    memory_rows: Optional[int],
+) -> Tuple[List[str], int, str]:
+    rows = dataset if memory_rows is None else dataset[:memory_rows]
+    rows_used = len(rows)
+
+    if not rows:
+        return [], 0, "empty"
+
+    first_item = rows[0]
+    if isinstance(first_item, str):
+        docs = []
+        seen = set()
+        for doc in rows:
+            text = str(doc).strip()
+            if text and text not in seen:
+                seen.add(text)
+                docs.append(text)
+        return docs, rows_used, "memory_docs"
+
+    docs = build_memory_docs(rows, None)
+    return docs, rows_used, "samples"
+
+
 def run_msa(
     args,
-    dataset: List[Dict[str, Any]],
+    dataset: List[Any],
     queryset: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
-    memory_docs = build_memory_docs(dataset, args.memory_docs)
-    memory_rows_used = len(dataset) if args.memory_docs is None else min(args.memory_docs, len(dataset))
+    memory_docs, memory_rows_used, dataset_mode = _build_memory_docs_from_dataset_input(
+        dataset, args.memory_docs
+    )
     memory_doc_titles = [extract_doc_title(doc) for doc in memory_docs]
     query_source = queryset if queryset is not None else dataset
     query_samples = build_query_samples(query_source, args.n_samples, seed=args.seed)
@@ -237,6 +277,7 @@ def run_msa(
         raise ValueError("No query samples were built from the dataset.")
 
     print(f"Dataset type: {args.dataset_type}")
+    print(f"Dataset mode: {dataset_mode}")
     print(f"Loaded {len(dataset)} rows from dataset")
     if queryset is not None:
         print(f"Loaded {len(queryset)} rows from queryset")
@@ -246,8 +287,13 @@ def run_msa(
 
     msa_config = read_msa_config(args.model_path)
     doc_top_k = args.doc_top_k if args.doc_top_k is not None else msa_config.get("doc_top_k", 16)
-    pooling_kernel_size = msa_config.get("pooling_kernel_size", 64)
+    pooling_kernel_size = (
+        args.pooling_kernel_size
+        if args.pooling_kernel_size is not None
+        else msa_config.get("pooling_kernel_size", 64)
+    )
     router_layer_idx = msa_config.get("router_layer_idx", "all")
+    print(f"Pooling kernel size: {pooling_kernel_size}")
 
     model_config = ModelConfig(
         model_path=args.model_path,
@@ -280,6 +326,14 @@ def run_msa(
     stat_answer_decode_time: List[float] = []
     stat_answer_token_count: List[int] = []
     stat_answer_tpot: List[float] = []
+    stat_retrieval_round_total: List[float] = []
+    stat_prefill_before_doc_query: List[float] = []
+    stat_doc_query_time: List[float] = []
+    stat_retrieval_tail_time: List[float] = []
+    stat_answer_prefill: List[float] = []
+    stat_final_round_prefill: List[float] = []
+    stat_final_round_answer_ttft: List[float] = []
+    stat_final_round_routing: List[float] = []
     stat_generate_count: List[int] = []
     stat_total_input_tokens: List[int] = []
     stat_total_output_tokens: List[int] = []
@@ -304,6 +358,14 @@ def run_msa(
         requests[req_idx]["answer_ttft"] = None
         requests[req_idx]["answer_decode_time"] = 0.0
         requests[req_idx]["answer_token_count"] = 0
+        requests[req_idx]["retrieval_round_total"] = 0.0
+        requests[req_idx]["prefill_before_doc_query"] = None
+        requests[req_idx]["doc_query_time"] = 0.0
+        requests[req_idx]["answer_prefill"] = None
+        requests[req_idx]["final_round_prefill"] = None
+        requests[req_idx]["final_round_answer_ttft"] = None
+        requests[req_idx]["final_round_prefill_before_doc_query"] = None
+        requests[req_idx]["final_round_doc_query_time"] = 0.0
 
     with tempfile.NamedTemporaryFile(mode="wb", suffix=".pkl", delete=False) as fp:
         pickle.dump(memory_docs, fp)
@@ -343,8 +405,10 @@ def run_msa(
                 batch_elapsed = time.perf_counter() - batch_start
 
                 first_answer_latencies = (round_metrics or {}).get("first_answer_token_latency_s", [])
-                answer_decode_times = (round_metrics or {}).get("answer_decode_time_s", [])
                 answer_token_counts = (round_metrics or {}).get("answer_token_count", [])
+                prefill_before_doc_query = (round_metrics or {}).get("prefill_before_doc_query_s", [])
+                doc_query_times = (round_metrics or {}).get("doc_query_time_s", [])
+                is_regenerate_rounds = (round_metrics or {}).get("is_regenerate_round", [])
                 for req_idx in indices:
                     to_send[req_idx]["generate_count"] = to_send[req_idx].get("generate_count", 0) + 1
                 finished_this_round = 0
@@ -359,15 +423,21 @@ def run_msa(
                         first_answer_latencies[idx] if idx < len(first_answer_latencies) else None
                     )
                     if answer_first_token_latency is not None and request.get("answer_ttft") is None:
-                        request["answer_ttft"] = (
-                            request.get("elapsed_before_answer_round", 0.0) + answer_first_token_latency
-                        )
-                    answer_decode_time = answer_decode_times[idx] if idx < len(answer_decode_times) else None
-                    if answer_decode_time is not None:
-                        request["answer_decode_time"] = request.get("answer_decode_time", 0.0) + answer_decode_time
+                        request["answer_prefill"] = answer_first_token_latency
                     answer_token_count = answer_token_counts[idx] if idx < len(answer_token_counts) else None
                     if answer_token_count is not None:
                         request["answer_token_count"] = request.get("answer_token_count", 0) + int(answer_token_count)
+                    router_prefill_time = (
+                        prefill_before_doc_query[idx] if idx < len(prefill_before_doc_query) else None
+                    )
+                    if router_prefill_time is not None and request.get("prefill_before_doc_query") is None:
+                        request["prefill_before_doc_query"] = router_prefill_time
+                    doc_query_time = doc_query_times[idx] if idx < len(doc_query_times) else None
+                    if doc_query_time is not None:
+                        request["doc_query_time"] = request.get("doc_query_time", 0.0) + float(doc_query_time)
+                    is_regenerate_round = (
+                        is_regenerate_rounds[idx] if idx < len(is_regenerate_rounds) else False
+                    )
                     cleaned = response.replace("<|endoftext|>", "")
                     split_token = "\nPlease answer the question based"
                     if split_token in cleaned:
@@ -375,6 +445,7 @@ def run_msa(
                     new_prompt = should_regenerate(request, cleaned)
                     # print(f"following generate\n input: {request}\n output: {new_prompt}")
                     if new_prompt is not None:
+                        request["retrieval_round_total"] = request.get("retrieval_round_total", 0.0) + batch_elapsed
                         request["elapsed_before_answer_round"] = (
                             request.get("elapsed_before_answer_round", 0.0) + batch_elapsed
                         )
@@ -387,10 +458,69 @@ def run_msa(
                         request["recall_topk"] = recall_topk
                         request["response"] = cleaned
                         request["pred_answer"] = parse_pred_answer(cleaned)
+                        retrieval_round_total = request.get("retrieval_round_total", 0.0)
+                        answer_prefill = request.get("answer_prefill")
+                        final_round_answer_ttft = None
+                        final_round_routing = 0.0
+                        if is_regenerate_round and answer_first_token_latency is not None:
+                            request["final_round_answer_ttft"] = answer_first_token_latency
+                            request["final_round_prefill_before_doc_query"] = (
+                                float(router_prefill_time) if router_prefill_time is not None else None
+                            )
+                            request["final_round_doc_query_time"] = (
+                                float(doc_query_time) if doc_query_time is not None else 0.0
+                            )
+                            final_round_answer_ttft = request["final_round_answer_ttft"]
+                            final_round_routing = (
+                                (request["final_round_prefill_before_doc_query"] or 0.0)
+                                + request.get("final_round_doc_query_time", 0.0)
+                            )
+                            request["final_round_prefill"] = max(
+                                0.0,
+                                final_round_answer_ttft - final_round_routing,
+                            )
+                        if answer_prefill is not None:
+                            request["answer_ttft"] = retrieval_round_total + answer_prefill
+                            request["answer_decode_time"] = max(
+                                0.0,
+                                request.get("latency", 0.0) - request["answer_ttft"],
+                            )
+                        else:
+                            request["answer_ttft"] = None
+                            request["answer_decode_time"] = 0.0
                         results.append(request)
                         stat_question_latency.append(request.get("latency", 0.0))
+                        if retrieval_round_total > 0.0:
+                            stat_retrieval_round_total.append(request["retrieval_round_total"])
+                        if request.get("prefill_before_doc_query") is not None:
+                            stat_prefill_before_doc_query.append(request["prefill_before_doc_query"])
+                        if request.get("doc_query_time", 0.0) > 0.0:
+                            stat_doc_query_time.append(request["doc_query_time"])
+                        if (
+                            request.get("retrieval_round_total", 0.0) > 0.0
+                            and request.get("prefill_before_doc_query") is not None
+                        ):
+                            retrieval_tail_time = (
+                                request["retrieval_round_total"]
+                                - request["prefill_before_doc_query"]
+                                - request.get("doc_query_time", 0.0)
+                            )
+                            stat_retrieval_tail_time.append(max(0.0, retrieval_tail_time))
                         if request.get("answer_ttft") is not None:
                             stat_answer_ttft.append(request["answer_ttft"])
+                        if request.get("answer_prefill") is not None:
+                            stat_answer_prefill.append(request["answer_prefill"])
+                        if request.get("final_round_answer_ttft") is not None:
+                            stat_final_round_answer_ttft.append(request["final_round_answer_ttft"])
+                        if request.get("final_round_prefill_before_doc_query") is not None or request.get(
+                            "final_round_doc_query_time", 0.0
+                        ) > 0.0:
+                            stat_final_round_routing.append(
+                                (request.get("final_round_prefill_before_doc_query") or 0.0)
+                                + request.get("final_round_doc_query_time", 0.0)
+                            )
+                        if request.get("final_round_prefill") is not None:
+                            stat_final_round_prefill.append(request["final_round_prefill"])
                         if request.get("answer_decode_time", 0.0) > 0.0:
                             stat_answer_decode_time.append(request["answer_decode_time"])
                         if request.get("answer_token_count", 0) > 0:
@@ -441,12 +571,51 @@ def run_msa(
         if os.path.exists(memory_path):
             os.remove(memory_path)
 
-    print("\n========== Latency ==========")
+    print("\n========== MSA Metrics ==========")
+    print("[Overall]")
     summarize_latency("Per-question answer time", stat_question_latency, "s")
+    if stat_question_latency and sum(stat_question_latency) > 0:
+        print(f"Throughput (QPS): {len(stat_question_latency) / sum(stat_question_latency):.2f}")
+
+    print("\n[Retrieval Phase]")
+    if stat_retrieval_round_total:
+        summarize_latency("Retrieval round total", stat_retrieval_round_total, "s")
+    else:
+        print("[WARN] No retrieval-round totals were captured.")
+    if stat_prefill_before_doc_query:
+        summarize_latency("Router prefill before doc_query", stat_prefill_before_doc_query, "s")
+    else:
+        print("[WARN] No router-prefill timings were captured.")
+    if stat_doc_query_time:
+        summarize_latency("doc_query retrieval core", stat_doc_query_time, "s")
+    else:
+        print("[WARN] No doc_query timings were captured.")
+    if stat_retrieval_tail_time:
+        summarize_latency("Retrieval round tail (ID generation/context copy)", stat_retrieval_tail_time, "s")
+    else:
+        print("[WARN] No retrieval-tail timings were captured.")
+
+    print("\n[Answer Phase]")
     if stat_answer_ttft:
-        summarize_latency("Answer TTFT", stat_answer_ttft, "s")
+        summarize_latency("Answer TTFT (= retrieval round total + answer prefill)", stat_answer_ttft, "s")
     else:
         print("[WARN] No Answer TTFT values were captured.")
+    if stat_answer_prefill:
+        summarize_latency("Answer prefill to first token", stat_answer_prefill, "s")
+    else:
+        print("[WARN] No answer-prefill timings were captured.")
+    if stat_final_round_answer_ttft:
+        summarize_latency("Final-round answer TTFT", stat_final_round_answer_ttft, "s")
+    else:
+        print("[WARN] No final-round answer TTFT values were captured.")
+    if stat_final_round_routing:
+        summarize_latency("Final-round routing", stat_final_round_routing, "s")
+    else:
+        print("[WARN] No final-round routing timings were captured.")
+    if stat_final_round_prefill:
+        summarize_latency("Final-round prefill (= final-round answer TTFT - final-round routing)", stat_final_round_prefill, "s")
+    else:
+        print("[WARN] No final-round-prefill timings were captured.")
     if stat_answer_decode_time:
         summarize_latency("Answer decode time", stat_answer_decode_time, "s")
     else:
@@ -458,16 +627,18 @@ def run_msa(
         print("[WARN] No answer TPOT values were captured.")
     if stat_generate_count:
         print(f"Average generate count per request: {statistics.fmean(stat_generate_count):.4f}")
+
+    print("\n[Workload]")
     summarize_latency("Total input tokens per request", stat_total_input_tokens, "")
     summarize_latency("Total output tokens per request", stat_total_output_tokens, "")
+
+    print("\n[Retrieval Quality]")
     summarize_latency("Retrieval recall", stat_retrieval_recall, "")
     if stat_retrieval_hit:
         print(f"Retrieval hit@{doc_top_k}: mean={statistics.fmean(stat_retrieval_hit):.4f}")
     if stat_retrieval_all_hit:
         print(f"Retrieval all-support-hit@{doc_top_k}: mean={statistics.fmean(stat_retrieval_all_hit):.4f}")
-    if stat_question_latency and sum(stat_question_latency) > 0:
-        print(f"Throughput (QPS): {len(stat_question_latency) / sum(stat_question_latency):.2f}")
-    print("=============================\n")
+    print("=================================\n")
 
     return predictions, answers, sample_ids
 
@@ -476,6 +647,12 @@ def main():
     mp.set_start_method("spawn", force=True)
     args = parse_args()
     dataset = load_dataset(args.dataset_path)
+    if args.dataset_limit is not None:
+        if args.dataset_limit <= 0:
+            raise ValueError("--dataset-limit must be a positive integer when set.")
+        original_len = len(dataset)
+        dataset = dataset[: args.dataset_limit]
+        print(f"Truncated dataset to first {len(dataset)} rows (original {original_len})")
     queryset = load_queryset(args.queryset_path)
     filtered_queryset = queryset
 
@@ -493,9 +670,19 @@ def main():
         )
 
     predictions, answers, sample_ids = run_msa(args, dataset, queryset=filtered_queryset)
+    query_source = filtered_queryset if filtered_queryset is not None else dataset
+    question_by_sample_id = {
+        get_sample_id(row, i): (get_question(row) or "")
+        for i, row in enumerate(query_source)
+    }
+    questions = [question_by_sample_id.get(sample_id, "") for sample_id in sample_ids]
 
     if args.dis_out_path is not None:
-        metrics, faith_01_scores = evaluate_model_outputs(predictions, answers)
+        metrics, faith_01_scores = evaluate_model_outputs(
+            predictions,
+            answers,
+            questions=questions,
+        )
         num_scored = min(len(predictions), len(faith_01_scores))
         if len(faith_01_scores) != len(predictions):
             print(
@@ -511,7 +698,7 @@ def main():
             json.dump({"evaluated_samples": evaluated_samples_ids}, f, ensure_ascii=False, indent=2)
         print(f"✅ Evaluation {len(evaluated_samples_ids)} results saved to {args.dis_out_path}")
     else:
-        _, metrics = full_evaluation(predictions, answers)
+        _, metrics = full_evaluation(predictions, answers, questions=questions)
         print(metrics)
 
 

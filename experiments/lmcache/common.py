@@ -12,6 +12,13 @@ def setup_lmcache_environment(
     enable_sparse: bool = False,
     enable_async_loading: bool = False,
 ) -> None:
+    # Disable usage/telemetry paths in both LMCache and vLLM. In this
+    # environment cpuinfo can fail during worker bootstrap and abort engine init.
+    os.environ["LMCACHE_TRACK_USAGE"] = "false"
+    os.environ["VLLM_NO_USAGE_STATS"] = "1"
+    os.environ["VLLM_DO_NOT_TRACK"] = "1"
+    os.environ["DO_NOT_TRACK"] = "1"
+
     os.environ["LMCACHE_CHUNK_SIZE"] = str(chunk_size)
     os.environ["LMCACHE_ENABLE_BLENDING"] = "True"
     os.environ["LMCACHE_BLEND_SPECIAL_STR"] = blend_special_str

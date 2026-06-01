@@ -3380,6 +3380,64 @@ def create_dag_baseline_all_triples(
 
     return out_samples, answer_unsupported_sample_ids, answer_supported_sample_ids
 
+
+def create_dag_local_propogation(
+    args,
+    samples: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[int], List[int]]:
+    out_samples: List[Dict[str, Any]] = []
+    answer_unsupported_sample_ids: List[int] = []
+    answer_supported_sample_ids: List[int] = []
+
+    for sample in tqdm(samples, desc='Local propagation DAG'):
+        node_names, kvedges, out_adj, in_adj = build_kvedge_graph(
+            sample,
+            supporting_only=args.supporting_only,
+        )
+
+        if not kvedges:
+            sample['dag'] = {'kv_nodes': [], 'adj': [], 'meta': {'reason': 'no_kv_edges'}}
+            out_samples.append(sample)
+            continue
+
+        kept_nodes = set()
+        for e in kvedges.values():
+            kept_nodes.add(e.src)
+            kept_nodes.add(e.dst)
+
+        kept_edges = break_cycles_to_dag(kept_nodes, set(kvedges.keys()), kvedges)
+        answer = norm_text(sample.get('answer', ''))
+        kv_nodes, adj = export_kv_nodes_and_adj(kept_edges, kvedges, keep_score=args.keep_score)
+
+        goal_ids: List[int] = []
+        if answer:
+            for idx, kv in enumerate(kv_nodes):
+                if value_matches_answer(kv.get('value', ''), answer):
+                    goal_ids.append(idx)
+
+        sample['dag'] = {
+            'kv_nodes': kv_nodes,
+            'adj': adj,
+            'meta': {
+                'num_entity_nodes': int(len(kept_nodes)),
+                'num_kv_edges': int(len(kept_edges)),
+                'num_kv_nodes': int(len(kv_nodes)),
+                'goal_ids': goal_ids,
+                'topic_entity_ids': [],
+                'scorer': 'local_propogation_all_triples_dag',
+            },
+        }
+        out_samples.append(sample)
+
+        sid = sample.get('id', sample.get('_id', None))
+        if sid is not None:
+            if goal_ids:
+                answer_supported_sample_ids.append(sid)
+            else:
+                answer_unsupported_sample_ids.append(sid)
+
+    return out_samples, answer_unsupported_sample_ids, answer_supported_sample_ids
+
 # ============================================================
 # 9) CLI
 # ============================================================
@@ -3482,8 +3540,18 @@ def main():
         action='store_true',
         help='Print a latency breakdown for online DAG generation stages.',
     )
+    ap.add_argument(
+        '--local_propogation',
+        action='store_true',
+        help='Export the full merged KV graph without retrieval or filtering.',
+    )
 
     args = ap.parse_args()
+
+    input_basename = os.path.basename(args.input)
+    if input_basename == '2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl' and not args.local_propogation:
+        args.local_propogation = True
+        print('[INFO] Auto-enabled --local_propogation for merged tripled 2wiki input.')
 
     print(args)
     samples = read_json_or_jsonl(args.input)
@@ -3528,6 +3596,42 @@ def main():
 
         if not args.output:
             raise ValueError('--output is required for --mode baseline')
+        if args.output.endswith('.jsonl'):
+            write_jsonl(args.output, out)
+        elif args.output.endswith('.json'):
+            write_json(args.output, out)
+        else:
+            raise ValueError(f'Unknown file format: {args.output}')
+        print(f'[DONE] input={len(samples)} output={len(out)} saved_to={args.output}')
+        return
+
+    if args.local_propogation:
+        out, answer_unsupported_sample_ids, answer_supported_sample_ids = create_dag_local_propogation(
+            args,
+            samples,
+        )
+        out = drop_empty_kv_samples(out, answerable_only=args.answerable_only)
+
+        if args.dis_out_path and out:
+            if "islet" in args.dis_out_path:
+                evaluated_samples_ids = []
+                for s in out:
+                    sid = s.get('id', s.get('_id', None))
+                    if sid is not None and sid not in answer_unsupported_sample_ids:
+                        evaluated_samples_ids.append(sid)
+            elif "supported" in args.dis_out_path:
+                evaluated_samples_ids = answer_supported_sample_ids
+            else:
+                evaluated_samples_ids = answer_supported_sample_ids
+
+            print(f"Saving {len(evaluated_samples_ids)} evaluated sample IDs to {args.dis_out_path}")
+            with open(args.dis_out_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "evaluated_samples": evaluated_samples_ids,
+                }, f, ensure_ascii=False, indent=2)
+
+        if not args.output:
+            raise ValueError('--output is required for --local_propogation')
         if args.output.endswith('.jsonl'):
             write_jsonl(args.output, out)
         elif args.output.endswith('.json'):

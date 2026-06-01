@@ -156,15 +156,15 @@ def build_progress_message(
     triples_done = int(stats.get("triples_done", 0))
     started_at = float(stats.get("started_at", time.time()))
     elapsed_s = max(0.0, time.time() - started_at)
-    rate = (done / elapsed_s) if elapsed_s > 0 and done > 0 else 0.0
+    doc_rate = (done / elapsed_s) if elapsed_s > 0 and done > 0 else 0.0
     triple_rate = (triples_done / elapsed_s) if elapsed_s > 0 and triples_done > 0 else 0.0
     remaining = max(0, total - done)
-    eta_s = (remaining / rate) if rate > 0 else 0.0
+    eta_s = (remaining / doc_rate) if doc_rate > 0 else 0.0
     pct = (100.0 * done / total) if total > 0 else 100.0
     return (
         f"[{now_ts()}] progress {done}/{total} ({pct:.1f}%) "
         f"ok={stats['ok']} err={stats['err']} retried={stats['retried']} "
-        f"dropped={stats['dropped']} rate={rate:.2f}/s "
+        f"dropped={stats['dropped']} doc_rate={doc_rate:.2f} docs/s "
         f"triples={triples_done} triple_rate={triple_rate:.2f} triples/s "
         f"elapsed={format_duration(elapsed_s)} eta={format_duration(eta_s)} "
         f"last={last_sample_id} failures={dict(sorted(failure_stats.items()))}"
@@ -2302,6 +2302,7 @@ async def main_async(args: argparse.Namespace) -> None:
         print(
             f"[{now_ts()}] DONE total={total} ok={stats['ok']} err={stats['err']} "
             f"retried={stats['retried']} dropped={stats['dropped']} "
+            f"doc_rate={stats['done'] / max(1e-9, time.time() - stats['started_at']):.2f} docs/s "
             f"triples={stats['triples_done']} "
             f"triple_rate={stats['triples_done'] / max(1e-9, time.time() - stats['started_at']):.2f} triples/s "
             f"elapsed={format_duration(time.time() - stats['started_at'])} "

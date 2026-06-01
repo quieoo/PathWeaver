@@ -90,6 +90,60 @@ def last_token_pool(last_hidden_states: torch.Tensor, attention_mask: torch.Tens
         return last_hidden_states[batch_idx, seq_lens]
 
 
+def save_reformatted_dataset(path: str, dataset: list[dict]) -> None:
+    if path.endswith(".jsonl"):
+        with open(path, "w", encoding="utf-8") as f:
+            for row in dataset:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    elif path.endswith(".json"):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dataset, f, indent=2, ensure_ascii=False)
+    else:
+        raise ValueError(f"Unknown dataset format: {path}")
+
+
+def iter_sample_kv_pairs(sample: dict):
+    context = sample.get("context", [])
+    found_context_pairs = False
+    if isinstance(context, list):
+        for ctx in context:
+            if not isinstance(ctx, dict):
+                continue
+            for triple in ctx.get("triple_list", []) or []:
+                if not isinstance(triple, dict):
+                    continue
+                key_string = triple.get("key_string")
+                description = triple.get("description")
+                if key_string is None or description is None:
+                    continue
+                found_context_pairs = True
+                yield str(key_string), str(description)
+
+    if found_context_pairs:
+        return
+
+    for triple in sample.get("triple_list", []) or []:
+        if not isinstance(triple, dict):
+            continue
+        kv_lists = triple.get("kv_lists", []) or []
+        if isinstance(kv_lists, list) and kv_lists:
+            for kv in kv_lists:
+                if not isinstance(kv, dict):
+                    continue
+                key_string = kv.get("key_string")
+                value_string = kv.get("value_string")
+                if key_string is None or value_string is None:
+                    continue
+                yield str(key_string), str(value_string)
+            continue
+
+        key_string = triple.get("key_string")
+        description = triple.get("description")
+        if key_string is None or description is None:
+            continue
+        yield str(key_string), str(description)
+
+
 # -------------------------
 # 主流程
 # -------------------------
@@ -147,6 +201,19 @@ if __name__ == "__main__":
         for sample in dataset:
             key_strings.append(str(sample["key_string"]))
             value_strings.append(str(sample["description"]))
+    elif args.dataset_type == "all_triples":
+        sid = 0
+        for sample in dataset:
+            num_triples = 0
+            for key_string, value_string in iter_sample_kv_pairs(sample):
+                key_strings.append(key_string)
+                value_strings.append(value_string)
+                num_triples += 1
+            sample["start_id"] = sid
+            sample["num_triples"] = num_triples
+            sid += num_triples
+        save_reformatted_dataset(args.dataset_path, dataset)
+        print(f"✅ Reformatted {len(dataset)} samples to {args.dataset_path}")
     elif args.dataset_type == "2wiki":
         for sample in dataset:
             if len(sample["triple_lists"]) != 2:
@@ -182,8 +249,7 @@ if __name__ == "__main__":
             sample["start_id"] = sid
             sample["num_triples"] = num_triples
             sid += num_triples
-        with open(args.dataset_path, "w", encoding="utf-8") as f:
-            json.dump(dataset, f, indent=2, ensure_ascii=False)
+        save_reformatted_dataset(args.dataset_path, dataset)
         print(f"✅ Reformatted {len(dataset)} samples to {args.dataset_path}")
 
     else:

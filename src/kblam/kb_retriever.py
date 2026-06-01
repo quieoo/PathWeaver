@@ -487,6 +487,42 @@ class KBRetriever:
         kb_embedding = (train_set_key, train_set_val)
         return kb_embedding
 
+    def get_all_triples_embeddings_batch(
+        self,
+        batch_indices: List[int],
+        device: torch.device | None = None,
+    ):
+        if not self._use_cached_embd():
+            raise RuntimeError("get_all_triples_embeddings_batch only supports cached KB embedding")
+
+        kb_keys = []
+        kb_vals = []
+
+        for idx in batch_indices:
+            sample = self.dataset[idx]
+            start_id = int(sample.get("start_id", 0))
+            num_triples = int(sample.get("num_triples", 0))
+
+            if num_triples <= 0:
+                key_np = self.key_embds[0:0]
+                val_np = self.value_embds[0:0]
+            else:
+                end_id = start_id + num_triples
+                key_np = self.key_embds[start_id:end_id]
+                val_np = self.value_embds[start_id:end_id]
+
+            key_emb = self.encoder.encode_key(base_emb=key_np)
+            val_emb = self.encoder.encode_val(base_emb=val_np)
+
+            if device is not None:
+                key_emb = key_emb.to(device)
+                val_emb = val_emb.to(device)
+
+            kb_keys.append(key_emb)
+            kb_vals.append(val_emb)
+
+        return kb_keys, kb_vals
+
     def get_embeddings_with_adj_2wiki(
         self,
         batch_indices,

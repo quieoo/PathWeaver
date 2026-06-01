@@ -192,5 +192,11 @@ docs/scripts/triple_gen/cache*
 experiments/eval_results/
 experiments/structural_reasoning/*_heatmaps*/
 experiments/structural_reasoning/*report*/
+experiments/structural_reasoning/*.jsonl
+experiments/structural_reasoning/hop_datasets
 *.pt
 
+docs/scripts/triple_gen/lite-openIE/stanford-corenlp-4.5.10/
+docs/scripts/triple_gen/triple_gen_no_llm/stage_cache/
+experiments/Knowledge_editable/cache_*
+experiments/Knowledge_editable/rounds_qwen35_27b/

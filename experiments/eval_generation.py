@@ -25,6 +25,10 @@ from kblam.models.qwen3.kblam_qwen3_attention import (
     load_kblam_qwen3_model,
     load_qwen3_query_head,
 )
+from kblam.models.qwen3.kblam_qwen3_moe_attention import (
+    load_kblam_qwen3_moe_model,
+    load_qwen3_moe_query_head,
+)
 from kblam.kblam_attention.kblam_path import (
     enable_path_attn_trace,
     set_path_attn_trace_context,
@@ -85,10 +89,13 @@ def _prepare_models(
     kb_layer_frequency,
     kb_scale_factor,
 ):
+    is_qwen_family = llm_type in {"qwen3", "qwen3_moe", "qwen_moe"}
+    is_qwen_moe = llm_type in {"qwen3_moe", "qwen_moe"}
+
     tokenizer = AutoTokenizer.from_pretrained(
         llm_base_dir, trust_remote_code=True, padding_side="left"
     )
-    if llm_type == "qwen3":
+    if is_qwen_family:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = "<|endoftext|>"
     else:
@@ -124,6 +131,15 @@ def _prepare_models(
         )
         if query_head_path:
             load_qwen3_query_head(model, query_head_path)
+    elif is_qwen_moe:
+        model = load_kblam_qwen3_moe_model(
+            base_model_dir=llm_base_dir,
+            checkpoint_dir=model_path,
+            device=None,
+            device_map="auto",
+        )
+        if query_head_path:
+            load_qwen3_moe_query_head(model, query_head_path)
     else:
         model = KBLaMPhi3ForCausalLM.from_pretrained(
             model_path,
@@ -283,6 +299,58 @@ def _extract_trace_kv_items(row: dict):
                 items.append({"kv_id": int(idx), "key": str(tri), "value": ""})
         return items
 
+    context = row.get("context")
+    if isinstance(context, list):
+        items = []
+        kv_id = 0
+        for ctx in context:
+            if not isinstance(ctx, dict):
+                continue
+            for tri in ctx.get("triple_list", []) or []:
+                if not isinstance(tri, dict):
+                    continue
+                items.append(
+                    {
+                        "kv_id": int(kv_id),
+                        "key": str(tri.get("key_string", "")),
+                        "value": str(tri.get("description", "")),
+                    }
+                )
+                kv_id += 1
+        return items
+
+    triple_list = row.get("triple_list")
+    if isinstance(triple_list, list):
+        items = []
+        kv_id = 0
+        for tri in triple_list:
+            if not isinstance(tri, dict):
+                continue
+            kv_lists = tri.get("kv_lists", []) or []
+            if isinstance(kv_lists, list) and kv_lists:
+                for kv in kv_lists:
+                    if not isinstance(kv, dict):
+                        continue
+                    items.append(
+                        {
+                            "kv_id": int(kv_id),
+                            "key": str(kv.get("key_string", "")),
+                            "value": str(kv.get("value_string", "")),
+                        }
+                    )
+                    kv_id += 1
+                continue
+
+            items.append(
+                {
+                    "kv_id": int(kv_id),
+                    "key": str(tri.get("key_string", "")),
+                    "value": str(tri.get("description", tri.get("value_string", ""))),
+                }
+            )
+            kv_id += 1
+        return items
+
     return []
 
 def _perform_eval_batched(
@@ -305,6 +373,7 @@ def _perform_eval_batched(
     output_first_samples: int = 0,
     enable_trace: bool = False,
     trace_dataset_name: str = "",
+    dag_kb_size: int = 1,
 ):
 
     # ---------- optional filter (2wiki) ----------
@@ -352,7 +421,13 @@ def _perform_eval_batched(
                 # top-1 加 随机KB
                 kb_keys, kb_vals = kb_retriever.get_kb_batch_by_hnsw(questions, topk=1, device=torch.device("cuda"), random_sample=kb_size-1)
             else:
-                kb_keys, kb_vals = kb_retriever.get_key_embeddings(batch_idx)
+                if dataset_type == "all_triples":
+                    kb_keys, kb_vals = kb_retriever.get_all_triples_embeddings_batch(
+                        batch_idx,
+                        device=torch.device("cuda"),
+                    )
+                else:
+                    kb_keys, kb_vals = kb_retriever.get_key_embeddings(batch_idx)
         else:
             if enable_retrieval:
                 rerank_policy=2
@@ -384,10 +459,29 @@ def _perform_eval_batched(
                 elif dataset_type=="dag":
                     kb_keys, kb_vals, kb_adj = [], [], []
                     for idx in batch_idx:
-                        k, v, a = kb_retriever.get_kb_embedding(
-                            idx,
-                            device=torch.device("cuda"),
-                        )
+                        if dag_kb_size > 1:
+                            candidate_ids = np.arange(len(dataset))
+                            distractor_pool = candidate_ids[candidate_ids != idx]
+                            num_distractors = min(dag_kb_size - 1, len(distractor_pool))
+                            distractor_ids = (
+                                np.random.choice(
+                                    distractor_pool,
+                                    size=num_distractors,
+                                    replace=False,
+                                ).astype(int).tolist()
+                                if num_distractors > 0
+                                else []
+                            )
+                            sample_ids = [int(idx), *distractor_ids]
+                            k, v, a = kb_retriever.get_kb_embedding_s(
+                                sample_ids,
+                                device=torch.device("cuda"),
+                            )
+                        else:
+                            k, v, a = kb_retriever.get_kb_embedding(
+                                idx,
+                                device=torch.device("cuda"),
+                            )
                         kb_keys.append(k)
                         kb_vals.append(v)
                         kb_adj.append(a)
@@ -517,8 +611,10 @@ def eval_main_process(
     output_first_samples: int = 0,
     enable_trace: bool = False,
     trace_dataset_name: str = "",
+    min_hop: int | None = None,
+    dag_kb_size: int = 1,
 ):
-    if query_size > len(dataset):
+    if query_size > len(dataset) or query_size == -1:
         query_size = len(dataset)
     if kb_size > query_size:
         kb_size = query_size
@@ -527,6 +623,20 @@ def eval_main_process(
         query_idx = np.random.randint(0, len(dataset), query_size)
     else:
         query_idx = np.arange(query_size)
+    
+    if min_hop is not None:
+        new_query_idx=[]
+        for qid in query_idx:
+            item=dataset[qid]
+            qd=item.get("question_decomposition", {})
+            if qd is None:
+                break
+            if len(qd) < min_hop:
+                continue
+            new_query_idx.append(qid)
+        if len(new_query_idx)>0:
+            print(f"Get {len(new_query_idx)} samples from {len(query_idx)} samples with hop >= {min_hop}")
+            query_idx=new_query_idx
 
     if kb_scale_factor_range is not None:
         scale_factor_list=[]
@@ -542,7 +652,13 @@ def eval_main_process(
     results_pair_list=[]
     for sf in scale_factor_list:
         kb_config.kb_scale_factor = sf
-        if "2wiki" in dataset_type or "dag" in dataset_type:
+        batch_enable_retrieval = enable_retrieval
+        if dataset_type == "all_triples":
+            filter_fn=None
+            hop_num=None
+            use_kb_adj=False
+            batch_enable_retrieval = False
+        elif "2wiki" in dataset_type or "dag" in dataset_type:
             # 2wiki， hotpot_2hop, musique_2hop等两跳数据集
             # def _2hop_filter(row):
             #     ans = format_output_for_synthetic(row["A"])
@@ -569,11 +685,12 @@ def eval_main_process(
             hop_num=hop_num,
             use_kb_adj=use_kb_adj,
             filter_fn=filter_fn,
-            enable_retrieval=enable_retrieval,
+            enable_retrieval=batch_enable_retrieval,
             enable_silver=enable_silver,
             output_first_samples=output_first_samples,
             enable_trace=enable_trace,
             trace_dataset_name=trace_dataset_name,
+            dag_kb_size=dag_kb_size,
         )
         
         results_pair_list.append((model_outputs, answers, source_indices))
@@ -620,6 +737,8 @@ def eval_generate(
         enable_silver=enable_silver,
         enable_trace=args.enable_trace,
         trace_dataset_name=args.dataset_type,
+        min_hop=args.min_hop,
+        dag_kb_size=args.dag_kb_size,
     )
     
     save_dir = None
@@ -748,7 +867,7 @@ parent_parser.add_argument(
 parent_parser.add_argument(
     "--query_size",
     type=int,
-    default=100,
+    default=-1,
     help="Number of queries to generate per KB entry",
 )
 
@@ -853,6 +972,20 @@ parent_parser.add_argument(
     default=True,
     help="Whether to perform full evaluation"
 )
+parent_parser.add_argument(
+    "--min_hop",
+    type=int,
+    default=None,
+    help="min hop",
+)
+parent_parser.add_argument("--path_attn_mix_ratio", type=float, default=0.8)
+parent_parser.add_argument(
+    "--dag_kb_size",
+    type=int,
+    default=1,
+    help="For DAG inference, concatenate this many samples into one KB (1 = no distractors).",
+)
+
 
 
 # Create subparsers
@@ -918,6 +1051,7 @@ def main():
     kb_config.path_attn = args.path_attn
     kb_config.current_step=args.step
     kb_config.total_steps=args.t_step
+    kb_config.path_attn_mix_ratio=args.path_attn_mix_ratio
 
     if args.dataset_type == "autoschemakg_2wiki":
         kb_retriever = AutoSchemaKGKBRetriever(

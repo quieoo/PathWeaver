@@ -265,6 +265,74 @@ class DAGKVKBRetriever:
 
         return kb_keys, kb_vals, kb_adj
 
+    def _build_sample_base_tensors(
+        self,
+        sample_id: int,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample = self.samples[sample_id]
+        select_idx = self._select_indices(sample)
+        dev = device or torch.device(self.device)
+
+        if select_idx.size == 0:
+            empty = torch.zeros((0, 0), dtype=torch.float32, device=dev)
+            empty_adj = torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.long, device=dev),
+                torch.empty((0,), dtype=torch.float32, device=dev),
+                (0, 0),
+                dtype=torch.float32,
+                device=dev,
+            ).coalesce()
+            return empty, empty, empty_adj
+
+        adj = sample.adj[np.ix_(select_idx, select_idx)].astype(np.float32)
+        if self.use_multihop_adj and self.max_hops > 1:
+            adj = _build_multihop_adj(
+                adj=adj,
+                max_hops=self.max_hops,
+                decay=self.hop_decay,
+                dynamic_hops_by_longest_path=self.dynamic_hops_by_longest_path,
+            )
+
+        if self.key_embds is not None and self.value_embds is not None:
+            offset = int(self.sample_offsets[sample_id])
+            base_idx = offset + select_idx
+            key_base = self.key_embds[base_idx]
+            val_base = self.value_embds[base_idx]
+        else:
+            assert self.base_embedder is not None
+            keys = [sample.key_texts[i] for i in select_idx]
+            vals = [sample.value_texts[i] for i in select_idx]
+            concat = keys + vals
+            base_emb = self.base_embedder.encode(
+                concat,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            ).astype(np.float32)
+            key_base = base_emb[: len(keys)]
+            val_base = base_emb[len(keys) :]
+
+        key_base_t = torch.tensor(key_base, dtype=torch.float32, device=dev)
+        val_base_t = torch.tensor(val_base, dtype=torch.float32, device=dev)
+
+        nz = np.where(adj > 0)
+        if nz[0].size == 0:
+            indices = torch.empty((2, 0), dtype=torch.long, device=dev)
+            values = torch.empty((0,), dtype=torch.float32, device=dev)
+        else:
+            indices = torch.tensor(np.vstack(nz), dtype=torch.long, device=dev)
+            values = torch.tensor(adj[nz], dtype=torch.float32, device=dev)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            (adj.shape[0], adj.shape[1]),
+            dtype=torch.float32,
+            device=dev,
+        ).coalesce()
+        return key_base_t, val_base_t, kb_adj
+
     def get_kb_embedding(
         self,
         sample_id: int,
@@ -326,4 +394,53 @@ class DAGKVKBRetriever:
             device=dev,
         ).coalesce()
 
+        return kb_keys, kb_vals, kb_adj
+
+    def get_base_embedding_s(
+        self,
+        sample_ids: Sequence[int],
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dev = device or torch.device(self.device)
+        key_blocks: List[torch.Tensor] = []
+        val_blocks: List[torch.Tensor] = []
+        row_parts: List[torch.Tensor] = []
+        col_parts: List[torch.Tensor] = []
+        val_parts: List[torch.Tensor] = []
+
+        offset = 0
+        for sid in sample_ids:
+            key_base, val_base, kb_adj = self._build_sample_base_tensors(int(sid), dev)
+            key_blocks.append(key_base)
+            val_blocks.append(val_base)
+            if kb_adj._nnz() > 0:
+                idx = kb_adj.indices()
+                row_parts.append(idx[0] + offset)
+                col_parts.append(idx[1] + offset)
+                val_parts.append(kb_adj.values())
+            offset += key_base.shape[0]
+
+        if key_blocks:
+            kb_keys = torch.cat(key_blocks, dim=0)
+            kb_vals = torch.cat(val_blocks, dim=0)
+        else:
+            kb_keys = torch.zeros((0, 0), dtype=torch.float32, device=dev)
+            kb_vals = torch.zeros((0, 0), dtype=torch.float32, device=dev)
+
+        if row_parts:
+            rows = torch.cat(row_parts, dim=0)
+            cols = torch.cat(col_parts, dim=0)
+            values = torch.cat(val_parts, dim=0)
+            indices = torch.stack([rows, cols], dim=0)
+        else:
+            indices = torch.empty((2, 0), dtype=torch.long, device=dev)
+            values = torch.empty((0,), dtype=torch.float32, device=dev)
+
+        kb_adj = torch.sparse_coo_tensor(
+            indices,
+            values,
+            (kb_keys.shape[0], kb_keys.shape[0]),
+            dtype=torch.float32,
+            device=dev,
+        ).coalesce()
         return kb_keys, kb_vals, kb_adj

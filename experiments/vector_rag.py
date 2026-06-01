@@ -9,11 +9,12 @@ import statistics
 import sys
 import hashlib
 import random
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 
 
@@ -26,6 +27,10 @@ try:
     from llama_index.core import Settings
 except ImportError:
     from llama_index import Settings
+try:
+    from llama_index.core.schema import MetadataMode
+except ImportError:
+    MetadataMode = None
 
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
@@ -60,16 +65,133 @@ from common import (
     setup_lmcache_environment,
 )
 
+
+class LMCacheBreakdownReader:
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self._offset = 0
+        self._records_by_req_id: Dict[str, List[Dict[str, Any]]] = {}
+
+    def _refresh(self) -> None:
+        if not self.path or not os.path.exists(self.path):
+            return
+        with open(self.path, "r", encoding="utf-8") as fh:
+            fh.seek(self._offset)
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                req_id = str(record.get("req_id", "")).strip()
+                if not req_id:
+                    continue
+                self._records_by_req_id.setdefault(req_id, []).append(record)
+            self._offset = fh.tell()
+
+    def pop(self, req_id: Optional[str]) -> List[Dict[str, Any]]:
+        self._refresh()
+        if not req_id:
+            return []
+        return self._records_by_req_id.pop(str(req_id), [])
+
+    def cleanup(self) -> None:
+        if self.path and os.path.exists(self.path):
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
+def _setup_lmcache_breakdown_runtime() -> Optional[LMCacheBreakdownReader]:
+    patch_dir = Path(__file__).resolve().parent / "lmcache_breakdown_patch"
+    if not patch_dir.exists():
+        print(f"[WARN] LMCache breakdown patch dir not found: {patch_dir}")
+        return None
+
+    fd, breakdown_path = tempfile.mkstemp(prefix="pathweaver_lmcache_breakdown_", suffix=".jsonl")
+    os.close(fd)
+    os.environ["PATHWEAVER_ENABLE_LMCACHE_BREAKDOWN"] = "1"
+    os.environ["PATHWEAVER_LMCACHE_BREAKDOWN_FILE"] = breakdown_path
+
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    patch_str = str(patch_dir)
+    pythonpath_parts = [part for part in existing_pythonpath.split(os.pathsep) if part]
+    if patch_str not in pythonpath_parts:
+        pythonpath_parts.insert(0, patch_str)
+        os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+
+    return LMCacheBreakdownReader(breakdown_path)
+
+
+def _summarize_lmcache_breakdown_records(records: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {
+        "lookup_time_s": None,
+        "kv_load_time_s": None,
+        "blend_total_time_s": None,
+        "recompute_time_s": None,
+        "lmcache_cached_tokens": None,
+        "vllm_cached_tokens": None,
+        "external_tokens_to_load": None,
+        "prompt_tokens": None,
+        "retrieved_tokens": None,
+    }
+    if not records:
+        return out
+
+    kv_load_time = 0.0
+    blend_total_time = 0.0
+    retrieved_tokens = 0
+    retrieved_tokens_seen = False
+
+    for record in records:
+        event = record.get("event")
+        if event == "scheduler_lookup":
+            if record.get("lookup_time_s") is not None:
+                out["lookup_time_s"] = float(record["lookup_time_s"])
+            for key in ("lmcache_cached_tokens", "vllm_cached_tokens", "external_tokens_to_load", "prompt_tokens"):
+                if record.get(key) is not None:
+                    out[key] = float(record[key])
+        elif event in {"worker_retrieve", "worker_retrieve_layerwise"}:
+            if record.get("kv_load_time_s") is not None:
+                kv_load_time += float(record["kv_load_time_s"])
+            if record.get("retrieved_tokens") is not None:
+                retrieved_tokens += int(record["retrieved_tokens"])
+                retrieved_tokens_seen = True
+        elif event == "worker_blend_total" and record.get("blend_total_time_s") is not None:
+            blend_total_time += float(record["blend_total_time_s"])
+
+    if kv_load_time > 0.0:
+        out["kv_load_time_s"] = kv_load_time
+    if blend_total_time > 0.0:
+        out["blend_total_time_s"] = blend_total_time
+    if retrieved_tokens_seen:
+        out["retrieved_tokens"] = float(retrieved_tokens)
+    if out["blend_total_time_s"] is not None:
+        out["recompute_time_s"] = max(
+            0.0,
+            float(out["blend_total_time_s"]) - float(out["kv_load_time_s"] or 0.0),
+        )
+    return out
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue (TTFT & TPOT)')
     # 数据集参数（建议直接给到 jsonl 路径）
     parser.add_argument('--dataset-path', type=str,
                         default='/mnt/n0/datasets/MuSiQue/musique_ans_v1.0_dev.jsonl',
-                        help='MuSiQue 数据集（jsonl）本地路径')
+                        help='评测数据集本地路径，支持 json/jsonl（如 MuSiQue、HotpotQA）')
+    parser.add_argument('--dataset-limit', type=int, default=None,
+                        help='可选：仅使用前 N 条 dataset 数据参与建索引/检索')
     parser.add_argument('--queryset-path', type=str, default=None,
                         help='可选查询集路径；支持完整 json/jsonl 样本，或包含 evaluated_samples/sample_ids/ids 的 JSON 文件')
     parser.add_argument('--n-samples', type=int, default=10, help='测试样本数量')
-    parser.add_argument('--dataset-type', type=str, default='musique', help='数据集类型（musique/squad）')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='随机抽样种子；默认 None 表示按原顺序取前 N 条，否则按 seed 随机选择样本')
+    parser.add_argument('--dataset-type', type=str, default='musique',
+                        choices=('musique', 'squad', 'hotpotqa', '2wikimultihopqa', 'mintqa'),
+                        help='数据集类型（musique/squad/hotpotqa/2wikimultihopqa/mintqa）')
 
     # 数据集处理
     parser.add_argument('--mintqa_min_hop', type=int, default=None, help='MintQA 最小跳数')
@@ -78,8 +200,8 @@ def parse_args():
     parser.add_argument('--model-path', type=str,
                         default='/mnt/n0/models/llama3_8B_instruct/',
                         help='vLLM 模型路径（llama/deepseek/qwen 等）')
-    parser.add_argument('--tensor-parallel-size', type=int, default=1,
-                        help='vLLM tensor parallel size，默认 1，适合本地 Qwen3-4B')
+    parser.add_argument('--tensor-parallel-size', type=int, default=None,
+                        help='vLLM tensor parallel size，默认 None')
     parser.add_argument('--gpu-memory-utilization', type=float, default=0.9,
                         help='vLLM GPU memory utilization')
     parser.add_argument('--max-model-len', type=int, default=8192,
@@ -89,6 +211,8 @@ def parse_args():
 
     # 检索参数
     parser.add_argument('--similarity-top-k', type=int, default=5, help='相似度检索 Top-K')
+    parser.add_argument('--disable-title-bias', action='store_true',
+                        help='禁用标题带来的隐性检索优势：标题不参与 embedding，且不会出现在检索上下文中')
     parser.add_argument('--embedding-model', type=str,
                         default='sentence-transformers/all-MiniLM-L6-v2',
                         help='嵌入模型名称')
@@ -183,6 +307,98 @@ def _dedupe_docs(docs: List[Document]) -> List[Document]:
         deduped_docs.append(doc)
     return deduped_docs
 
+
+def _truncate_dataset_rows(dataset: List[Any], dataset_limit: Optional[int]) -> List[Any]:
+    if dataset_limit is None:
+        return dataset
+    if dataset_limit <= 0:
+        raise ValueError("--dataset-limit must be a positive integer when set.")
+    original_len = len(dataset)
+    truncated = dataset[:dataset_limit]
+    print(f"Truncated dataset to first {len(truncated)} rows (original {original_len})")
+    return truncated
+
+
+def _make_document(text: str, title: str, idx: Any, disable_title_bias: bool) -> Document:
+    doc = Document(
+        text=text,
+        metadata={
+            "title": title,
+            "idx": idx,
+        },
+    )
+    if disable_title_bias:
+        # Keep title in metadata for recall accounting, but remove it from embedding
+        # and LLM-visible metadata to avoid title-match shortcuts.
+        doc.excluded_embed_metadata_keys = ["title", "idx"]
+        doc.excluded_llm_metadata_keys = ["title", "idx"]
+    return doc
+
+
+def _strip_memory_doc_title(raw_text: str) -> Tuple[str, str]:
+    text = str(raw_text).strip()
+    if not text:
+        return "", ""
+    lines = text.splitlines()
+    first_line = lines[0].strip() if lines else ""
+    title = ""
+    if first_line.startswith("Title:"):
+        title = first_line.split("Title:", 1)[1].strip()
+        body = "\n".join(lines[1:]).strip()
+        return title, body
+    return "", text
+
+
+def _build_docs_from_dataset_input(dataset: List[Any], disable_title_bias: bool = False) -> Tuple[List[Document], str]:
+    if not dataset:
+        return [], "empty"
+
+    first_item = dataset[0]
+    if isinstance(first_item, str):
+        docs: List[Document] = []
+        for idx, raw_doc in enumerate(dataset):
+            text = str(raw_doc).strip()
+            if not text:
+                continue
+            title, body = _strip_memory_doc_title(text)
+            doc_text = body if disable_title_bias and title else text
+            docs.append(_make_document(doc_text, title, idx, disable_title_bias))
+        return docs, "memory_docs"
+
+    docs = []
+    for row in dataset:
+        for ctx in iter_row_contexts(row):
+            docs.append(
+                _make_document(
+                    ctx["text"],
+                    ctx.get("title", ""),
+                    ctx.get("idx"),
+                    disable_title_bias,
+                )
+            )
+    return docs, "samples"
+
+
+def _get_node_text(node, disable_title_bias: bool) -> str:
+    if disable_title_bias and MetadataMode is not None:
+        return _normalize_chunk_text(node.get_content(metadata_mode=MetadataMode.NONE))
+    return _normalize_chunk_text(node.get_content())
+
+
+def _validate_eval_rows(eval_rows: List[Any], dataset_mode: str, queryset_path: Optional[str]) -> None:
+    if not eval_rows:
+        raise ValueError("No evaluation rows found.")
+
+    first_row = eval_rows[0]
+    if isinstance(first_row, dict):
+        return
+
+    raise ValueError(
+        "The loaded dataset contains memory-doc strings rather than QA samples, "
+        "so it cannot be used directly for evaluation. Please provide QA samples "
+        "through --queryset-path when using this dataset format."
+    )
+
 def setup_retriever(args, dataset, queryset=None):
     retriever = None
     print(f"setting embed model to {args.embedding_model}")
@@ -212,19 +428,14 @@ def setup_retriever(args, dataset, queryset=None):
     )
 
     docs = []
+    dataset_mode = "samples"
     oracle_contexts_per_sample = []
     if not index_exists and not args.oracle_retrieval and not args.without_knowledge:
-        for row in dataset:
-            for ctx in iter_row_contexts(row):
-                docs.append(
-                    Document(
-                        text=ctx["text"],
-                        metadata={
-                            "title": ctx.get("title", ""),
-                            "idx": ctx.get("idx"),
-                        },
-                    )
-                )
+        docs, dataset_mode = _build_docs_from_dataset_input(
+            dataset,
+            disable_title_bias=args.disable_title_bias,
+        )
+        print(f"Dataset mode for index build: {dataset_mode}")
 
     oracle_source = queryset if queryset is not None else dataset
     for row in oracle_source:
@@ -317,6 +528,57 @@ def _load_prompt_tokenizer(model_path: str) -> Optional[AutoTokenizer]:
     except Exception as exc:
         print(f"[WARN] Failed to load prompt tokenizer for {model_path}: {exc}")
         return None
+
+
+def _load_model_config(model_path: str):
+    try:
+        return AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+    except Exception as exc:
+        print(f"[WARN] Failed to load model config for {model_path}: {exc}")
+        return None
+
+
+def _build_qwen_chat_prompt(
+    tokenizer,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    messages = []
+    if str(system_prompt).strip():
+        messages.append({"role": "system", "content": str(system_prompt).strip()})
+    messages.append({"role": "user", "content": str(user_prompt).strip()})
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def _build_qwen_chat_prompt_segments(
+    tokenizer,
+    system_prompt: str,
+    question: str,
+) -> tuple[str, str]:
+    context_placeholder = "__PATHWEAVER_CONTEXT_PLACEHOLDER__"
+    user_prompt = (
+        "CONTEXT:\n"
+        f"{context_placeholder}\n\n"
+        "QUESTION:\n"
+        f"{question}\n\n"
+        "Final answer:"
+    )
+    prompt = _build_qwen_chat_prompt(
+        tokenizer,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    if context_placeholder not in prompt:
+        raise ValueError("Qwen chat template does not preserve the context placeholder.")
+    prompt_prefix, prompt_suffix = prompt.split(context_placeholder, 1)
+    return prompt_prefix, prompt_suffix
 
 
 def _encode_prompt_tokens(tokenizer, text: str) -> List[int]:
@@ -702,6 +964,11 @@ def _is_qwen_model(model_path: str) -> bool:
     return "qwen" in model_path.lower()
 
 
+def _get_model_type(model_path: str) -> str:
+    config = _load_model_config(model_path)
+    return str(getattr(config, "model_type", "") or "").lower()
+
+
 def _resolve_tensor_parallel_size(args) -> int:
     if args.tensor_parallel_size and args.tensor_parallel_size > 0:
         return args.tensor_parallel_size
@@ -711,6 +978,8 @@ def _resolve_tensor_parallel_size(args) -> int:
 def setup_models(args):
     print(f"Loading model from {args.model_path}...")
     prompt_tokenizer: Optional[AutoTokenizer] = None
+    model_type = _get_model_type(args.model_path)
+    is_qwen_family = model_type in {"qwen3", "qwen3_moe"} or _is_qwen_model(args.model_path)
     base_llm_kwargs = {
         "model": args.model_path,
         "enforce_eager": True,
@@ -727,9 +996,12 @@ def setup_models(args):
     if 'llama' in args.model_path:
     # 使用VLLM加载模型
         llm = LLM(**base_llm_kwargs)
-    elif _is_qwen_model(args.model_path):
+    elif is_qwen_family:
         tp_size = _resolve_tensor_parallel_size(args)
-        print(f"Using tensor_parallel_size={tp_size} for Qwen model")
+        print(
+            f"Using tensor_parallel_size={tp_size} for Qwen model "
+            f"(model_type={model_type or 'unknown'})"
+        )
         qwen_kwargs = {
             **base_llm_kwargs,
             "dtype": "bfloat16",
@@ -823,6 +1095,85 @@ def _count_prompt_input_tokens(tokenizer, prompt_text: str) -> int:
     return non_special if non_special > 0 else len(token_ids)
 
 
+def _count_text_tokens(tokenizer, text: str) -> int:
+    if tokenizer is None or not text:
+        return 0
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        token_ids = tokenizer.encode(text)
+    non_special = _count_non_special_token_ids(token_ids)
+    return non_special if non_special > 0 else len(token_ids)
+
+
+def _dtype_num_bytes(dtype_value) -> Optional[int]:
+    if dtype_value is None:
+        return None
+    if isinstance(dtype_value, torch.dtype):
+        return torch.tensor([], dtype=dtype_value).element_size()
+
+    dtype_str = str(dtype_value).lower().replace("torch.", "")
+    mapping = {
+        "float16": 2,
+        "half": 2,
+        "bfloat16": 2,
+        "float32": 4,
+        "float": 4,
+        "fp16": 2,
+        "bf16": 2,
+        "fp32": 4,
+    }
+    return mapping.get(dtype_str)
+
+
+def _resolve_kv_cache_dtype_num_bytes(args, model_config) -> int:
+    config_dtype_bytes = _dtype_num_bytes(getattr(model_config, "torch_dtype", None))
+    if config_dtype_bytes is not None:
+        return config_dtype_bytes
+
+    model_path_lower = str(args.model_path).lower()
+    if "olmo3-32b" in model_path_lower:
+        return 2
+    if "qwen" in model_path_lower or "deepseek" in model_path_lower:
+        return 2
+    return 2
+
+
+def _estimate_model_kv_cache_bytes_per_token(args) -> Optional[Dict[str, float]]:
+    model_config = _load_model_config(args.model_path)
+    if model_config is None:
+        return None
+
+    num_layers = getattr(model_config, "num_hidden_layers", None)
+    hidden_size = getattr(model_config, "hidden_size", None)
+    num_attention_heads = getattr(model_config, "num_attention_heads", None)
+    num_kv_heads = (
+        getattr(model_config, "num_key_value_heads", None)
+        or getattr(model_config, "multi_query_group_num", None)
+        or num_attention_heads
+    )
+    head_dim = getattr(model_config, "head_dim", None)
+    if head_dim is None and hidden_size and num_attention_heads:
+        head_dim = hidden_size // num_attention_heads
+
+    if not all(v is not None for v in (num_layers, num_kv_heads, head_dim)):
+        return None
+
+    dtype_num_bytes = _resolve_kv_cache_dtype_num_bytes(args, model_config)
+    bytes_per_token = int(2 * int(num_layers) * int(num_kv_heads) * int(head_dim) * int(dtype_num_bytes))
+    gib_per_token = bytes_per_token / float(1024 ** 3)
+    gb_per_token = bytes_per_token / float(1000 ** 3)
+    return {
+        "bytes_per_token": float(bytes_per_token),
+        "gib_per_token": gib_per_token,
+        "gb_per_token": gb_per_token,
+        "num_layers": float(num_layers),
+        "num_kv_heads": float(num_kv_heads),
+        "head_dim": float(head_dim),
+        "dtype_num_bytes": float(dtype_num_bytes),
+    }
+
+
 def _extract_latency_from_request_output(req_out):
     out = {
         "ttft_model_ts": None,
@@ -893,7 +1244,15 @@ def _summarize(name: str, values: List[float], unit: str = "s"):
     print(f"{name}: mean={mean_v:.4f} {unit}, p50={p50_v:.4f} {unit}, p95={p95_v:.4f} {unit}")
 
 
-def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, prompt_tokenizer=None):
+def run_vector_rag(
+    args,
+    llm,
+    retriever,
+    oracle_contexts_per_sample,
+    dataset,
+    prompt_tokenizer=None,
+    lmcache_breakdown_reader: Optional[LMCacheBreakdownReader] = None,
+):
 
     print("Create RAG engine done")
     predictions: List[str] = []
@@ -910,15 +1269,23 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
     stat_retrieval_recall: List[float] = []
     stat_retrieval_hit: List[float] = []
     stat_retrieval_all_hit: List[float] = []
+    stat_lmcache_lookup: List[float] = []
+    stat_lmcache_kv_load: List[float] = []
+    stat_lmcache_recompute: List[float] = []
+    stat_lmcache_residual_prefill: List[float] = []
+    stat_lmcache_prompt_tokens: List[float] = []
+    stat_lmcache_hit_tokens: List[float] = []
+    stat_lmcache_vllm_hit_tokens: List[float] = []
+    stat_lmcache_retrieved_tokens: List[float] = []
+    stat_context_chunk_count: List[int] = []
+    stat_context_tokens_per_chunk: List[float] = []
     warmed_lmcache_segments: Set[tuple[int, ...]] = set()
     any_exact_ttft = False
     any_estimated_ttft = False
     any_exact_decode = False
     any_estimated_decode = False
+    kv_cache_estimate = _estimate_model_kv_cache_bytes_per_token(args)
 
-    if args.n_samples is not None and args.n_samples > 0 and len(dataset) > args.n_samples:
-        dataset=dataset[:args.n_samples]
-    
     sp = SamplingParams(
         temperature=0.0,
         top_p=1.0,
@@ -927,6 +1294,8 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
     )
     if prompt_tokenizer is None:
         prompt_tokenizer = _load_prompt_tokenizer(args.model_path)
+    model_type = _get_model_type(args.model_path)
+    is_qwen_family = model_type in {"qwen3", "qwen3_moe"} or "qwen" in args.model_path.lower()
     dataset_context_instruction = _dataset_context_instruction(args)
 
     for i, row in enumerate(dataset):
@@ -937,6 +1306,7 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
         answers.append(answer)
         gold_titles = get_supporting_fact_titles(row)
         retrieved_titles: List[str] = []
+        raw_context_chunks: List[str] = []
         warmup_chunks: List[str] = []
 
         time_start=time.perf_counter()
@@ -944,8 +1314,9 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
         if args.oracle_retrieval:
             sample_oracle_contexts = oracle_contexts_per_sample[i] if i < len(oracle_contexts_per_sample) else []
             oracle_context_found = bool(sample_oracle_contexts)
+            raw_context_chunks = [str(ctx).strip() for ctx in sample_oracle_contexts if str(ctx).strip()]
             warmup_chunks = _pack_short_context_chunks(
-                sample_oracle_contexts,
+                raw_context_chunks,
                 args,
                 prompt_tokenizer,
             )
@@ -958,6 +1329,7 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
                     for ctx in iter_row_contexts(row)
                     if str(ctx.get("text", "")).strip()
                 ]
+                raw_context_chunks = list(fallback_contexts)
                 warmup_chunks = _pack_short_context_chunks(
                     fallback_contexts,
                     args,
@@ -972,9 +1344,10 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
             context = ""
         else:
             nodes = retriever.retrieve(question)
-            context_chunks = [_normalize_chunk_text(node.get_content()) for node in nodes]
+            context_chunks = [_get_node_text(node, args.disable_title_bias) for node in nodes]
+            raw_context_chunks = [chunk for chunk in context_chunks if chunk]
             warmup_chunks = _pack_short_context_chunks(
-                context_chunks,
+                raw_context_chunks,
                 args,
                 prompt_tokenizer,
             )
@@ -984,6 +1357,16 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
                 for node in nodes
             ]
         retrieval_time=time.perf_counter()-time_start
+
+        if raw_context_chunks:
+            context_token_counts = [
+                _count_text_tokens(prompt_tokenizer, chunk)
+                for chunk in raw_context_chunks
+            ]
+            context_token_counts = [count for count in context_token_counts if count > 0]
+            stat_context_chunk_count.append(len(raw_context_chunks))
+            if context_token_counts:
+                stat_context_tokens_per_chunk.append(statistics.fmean(context_token_counts))
 
         if args.oracle_retrieval:
             oracle_hit = float(oracle_context_found)
@@ -1078,26 +1461,27 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
             if "Answer: " in pred:
                 pred = pred.split("Answer: ")[-1].strip()
 
-        elif "qwen" in args.model_path.lower():
+        elif is_qwen_family:
             system_prompt = (
-                "You answer questions with ONLY the exact answer phrase. "
-                "Never add explanations, prefixes, or punctuation. "
+                "You are a question-answering system.\n"
+                "Use only the given context to answer the question.\n"
+                "Return exactly one short final answer.\n"
+                "Do not explain. Do not write a full sentence.\n"
+                "For yes/no questions, answer only 'yes' or 'no'.\n"
+                "For comparison questions asking which one came first/later/earlier/older/younger/lived longer, "
+                "return only the selected entity name.\n"
+                "For place questions, return the minimal place name that directly answers the question, "
+                "not the full address unless required.\n"
+                "For date questions, return the minimal date required by the question.\n"
+                "For award, nationality, country, cause-of-death, and occupation questions, return only the core answer phrase.\n"
                 f"{dataset_context_instruction}"
-                "Examples:\n"
-                "Question: Who wrote '1984'? → George Orwell\n"
-                "Question: Capital of France? → Paris\n"
-                "Question: When was Einstein born? → 1879\n"
             )
-            prompt_prefix = (
-                "<|system|>\n" + system_prompt + "\n<|end|>\n"
-                "<|user|>\n"
-                "CONTEXT:\n"
+            prompt_prefix, prompt_suffix = _build_qwen_chat_prompt_segments(
+                prompt_tokenizer,
+                system_prompt=system_prompt,
+                question=question,
             )
-            prompt_suffix = (
-                f"\n\nQUESTION:\n{question}\n\nAnswer:\n"
-                "<|end|>\n"
-                "<|assistant|>\n"
-            )
+
             req_out, gen_start, gen_elapsed, prompt = _generate_with_lmcache_segments(
                 args,
                 llm,
@@ -1112,6 +1496,8 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
                 sampling_params=sp,
             )
             pred = str(req_out.outputs[0].text).strip()
+            if "<|im_end|>" in pred:
+                pred = pred.split("<|im_end|>")[0].strip()
             if "<|end|>" in pred:
                 pred = pred.split("<|end|>")[0].strip()
             if "Explanation: " in pred:
@@ -1241,6 +1627,43 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
         # TPOT = decode_time / 输出 token 数
         tpot = decode_time / max(1, num_out)
 
+        if args.use_lmcache and lmcache_breakdown_reader is not None and req_out is not None:
+            breakdown_records = lmcache_breakdown_reader.pop(getattr(req_out, "request_id", None))
+            breakdown = _summarize_lmcache_breakdown_records(breakdown_records)
+
+            lookup_time_s = breakdown.get("lookup_time_s")
+            kv_load_time_s = breakdown.get("kv_load_time_s")
+            recompute_time_s = breakdown.get("recompute_time_s")
+            lmcache_cached_tokens = breakdown.get("lmcache_cached_tokens")
+            vllm_cached_tokens = breakdown.get("vllm_cached_tokens")
+            prompt_tokens = breakdown.get("prompt_tokens")
+            retrieved_tokens = breakdown.get("retrieved_tokens")
+
+            if lookup_time_s is not None:
+                stat_lmcache_lookup.append(float(lookup_time_s))
+            if kv_load_time_s is not None:
+                stat_lmcache_kv_load.append(float(kv_load_time_s))
+            if recompute_time_s is not None:
+                stat_lmcache_recompute.append(float(recompute_time_s))
+            if prompt_tokens is not None:
+                stat_lmcache_prompt_tokens.append(float(prompt_tokens))
+            if lmcache_cached_tokens is not None:
+                stat_lmcache_hit_tokens.append(float(lmcache_cached_tokens))
+            if vllm_cached_tokens is not None:
+                stat_lmcache_vllm_hit_tokens.append(float(vllm_cached_tokens))
+            if retrieved_tokens is not None:
+                stat_lmcache_retrieved_tokens.append(float(retrieved_tokens))
+
+            if ttft_model is not None:
+                residual_prefill = max(
+                    0.0,
+                    ttft_model
+                    - float(lookup_time_s or 0.0)
+                    - float(kv_load_time_s or 0.0)
+                    - float(recompute_time_s or 0.0),
+                )
+                stat_lmcache_residual_prefill.append(residual_prefill)
+
         # ---- 记录统计 ----
         stat_retrieval.append(retrieval_time)
         stat_prefill.append(prefill_model if prefill_model is not None else ttft_model)
@@ -1263,8 +1686,25 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
     _summarize("Prefill time", stat_prefill, "s")
     _summarize("TTFT (retrieval+model TTFT)", stat_ttft, "s")
     _summarize("Num input_tokens", stat_input_tokens, "")
+    if stat_context_chunk_count:
+        _summarize("Num contexts per input", stat_context_chunk_count, "")
+    if stat_context_tokens_per_chunk:
+        _summarize("Avg tokens per context", stat_context_tokens_per_chunk, "")
     _summarize("Num output_tokens", stat_tokens, "")
     _summarize("TPOT (time per output token)", stat_tpot, "s/token")
+    if kv_cache_estimate is not None:
+        print(
+            "Estimated model KV cache size: "
+            f"{kv_cache_estimate['gb_per_token']:.9f} GB/token "
+            f"({int(kv_cache_estimate['bytes_per_token'])} bytes/token, "
+            f"{kv_cache_estimate['gib_per_token']:.9f} GiB/token; "
+            f"layers={int(kv_cache_estimate['num_layers'])}, "
+            f"kv_heads={int(kv_cache_estimate['num_kv_heads'])}, "
+            f"head_dim={int(kv_cache_estimate['head_dim'])}, "
+            f"dtype_bytes={int(kv_cache_estimate['dtype_num_bytes'])})"
+        )
+    else:
+        print("[WARN] Failed to estimate model KV cache GB/token from model config.")
     if any_exact_ttft and not any_estimated_ttft:
         print("TTFT source: exact request first-token timestamp")
     elif any_exact_ttft:
@@ -1277,6 +1717,32 @@ def run_vector_rag(args, llm, retriever, oracle_contexts_per_sample, dataset, pr
         print("Decode/TPOT source: mixed exact decode timestamps and end-to-end estimate")
     else:
         print("Decode/TPOT source: end-to-end estimate (vLLM offline generate hides per-request decode timing in FINAL_ONLY mode)")
+    if args.use_lmcache:
+        print("LMCache TTFT breakdown:")
+        if stat_lmcache_lookup:
+            _summarize("  Lookup time", stat_lmcache_lookup, "s")
+        else:
+            print("  [WARN] No per-request LMCache lookup timings were captured.")
+        if stat_lmcache_kv_load:
+            _summarize("  KV cache loading time", stat_lmcache_kv_load, "s")
+        else:
+            print("  [WARN] No per-request LMCache KV loading timings were captured.")
+        if stat_lmcache_recompute:
+            _summarize("  Recompute time", stat_lmcache_recompute, "s")
+        else:
+            print("  [WARN] No per-request LMCache recompute timings were captured.")
+        if stat_lmcache_residual_prefill:
+            _summarize("  Residual prefill+runtime overhead", stat_lmcache_residual_prefill, "s")
+        else:
+            print("  [WARN] No residual prefill timings were captured.")
+        if stat_lmcache_prompt_tokens:
+            _summarize("  LMCache prompt tokens", stat_lmcache_prompt_tokens, "")
+        if stat_lmcache_hit_tokens:
+            _summarize("  LMCache hit tokens", stat_lmcache_hit_tokens, "")
+        if stat_lmcache_vllm_hit_tokens:
+            _summarize("  vLLM local hit tokens", stat_lmcache_vllm_hit_tokens, "")
+        if stat_lmcache_retrieved_tokens:
+            _summarize("  Loaded hit tokens", stat_lmcache_retrieved_tokens, "")
     if stat_retrieval_hit:
         print(f"Retrieval hit@{args.similarity_top_k}: mean={statistics.fmean(stat_retrieval_hit):.4f}")
     if stat_retrieval_all_hit:
@@ -1316,7 +1782,13 @@ def clean_model(llm, use_lmcache: bool = False):
 
 def main():
     args=parse_args()
+    print(
+        f"Dataset config: type={args.dataset_type}, "
+        f"dataset_path={args.dataset_path}, queryset_path={args.queryset_path}"
+    )
+    lmcache_breakdown_reader: Optional[LMCacheBreakdownReader] = None
     if args.use_lmcache:
+        lmcache_breakdown_reader = _setup_lmcache_breakdown_runtime()
         setup_lmcache_environment(
             chunk_size=args.lmcache_chunk_size,
             blend_special_str=args.lmcache_blend_special_str,
@@ -1325,8 +1797,10 @@ def main():
             blend_check_layers=args.blend_check_layers,
         )
     dataset=load_dataset(args.dataset_path)
+    dataset = _truncate_dataset_rows(dataset, args.dataset_limit)
     queryset=load_queryset(args.queryset_path)
     eval_rows = queryset if queryset is not None else dataset
+    _validate_eval_rows(eval_rows, "queryset" if queryset is not None else "dataset", args.queryset_path)
     selected_eval_indices = None
 
     if args.dataset_type == "mintqa" and args.mintqa_min_hop is not None:
@@ -1345,6 +1819,20 @@ def main():
             for i in selected_eval_indices
             if i < len(oracle_contexts_per_sample)
         ]
+    if args.n_samples is not None and args.n_samples > 0 and len(eval_rows) > args.n_samples:
+        if args.seed is None:
+            eval_rows = eval_rows[:args.n_samples]
+            oracle_contexts_per_sample = oracle_contexts_per_sample[:args.n_samples]
+        else:
+            rng = random.Random(args.seed)
+            sampled_indices = sorted(rng.sample(range(len(eval_rows)), args.n_samples))
+            eval_rows = [eval_rows[i] for i in sampled_indices]
+            oracle_contexts_per_sample = [
+                oracle_contexts_per_sample[i]
+                for i in sampled_indices
+                if i < len(oracle_contexts_per_sample)
+            ]
+            print(f"Randomly selected {args.n_samples} samples with seed={args.seed}")
     llm, prompt_tokenizer = setup_models(args)
 
     predictions, answers = run_vector_rag(
@@ -1354,39 +1842,54 @@ def main():
         oracle_contexts_per_sample,
         eval_rows,
         prompt_tokenizer=prompt_tokenizer,
+        lmcache_breakdown_reader=lmcache_breakdown_reader,
     )
+    questions = [get_question(row) for row in eval_rows]
 
     clean_model(llm, use_lmcache=args.use_lmcache)
+    if lmcache_breakdown_reader is not None:
+        lmcache_breakdown_reader.cleanup()
     if args.dis_out_path is not None:
-        metrics, faith_01_scores = evaluate_model_outputs(predictions, answers)
-        num_scored = min(len(predictions), len(faith_01_scores))
-        if len(faith_01_scores) != len(predictions):
+        metrics, faith_01_scores = evaluate_model_outputs(predictions, answers, questions=questions)
+        if faith_01_scores and len(faith_01_scores) != len(predictions):
             print(
                 f"Warning: got {len(faith_01_scores)} faithfulness scores for "
-                f"{len(predictions)} predictions; only scored samples will be exported."
+                f"{len(predictions)} predictions; missing scores will be exported as null."
             )
 
         #输出前五对 pred-answer 以及对应的 faith_01 分数
         print("\n=== Sample Predictions & Faithfulness Scores ===")
-        for i in range(min(5, num_scored)):
+        for i in range(min(5, len(predictions))):
             print(f"Q: {get_question(eval_rows[i])}")
             print(f"A: {answers[i]}")
             print(f"P: {predictions[i]}")
-            print(f"Faithfulness01 Score: {faith_01_scores[i]}")
+            score = faith_01_scores[i] if i < len(faith_01_scores) else None
+            print(f"Faithfulness01 Score: {score}")
             print("-----------------------------------")
 
-        evaluated_samples_ids=[]
-        for i in range(num_scored):
+        evaluated_samples_ids = []
+        exported_samples = []
+        for i in range(len(predictions)):
             sample_id = get_sample_id(eval_rows[i], i)
-            if faith_01_scores[i] == 0:
-                evaluated_samples_ids.append(sample_id)
+            question = get_question(eval_rows[i])
+            faith_score = faith_01_scores[i] if i < len(faith_01_scores) else None
+
+            exported_samples.append({
+                "sample_id": sample_id,
+                "question": question,
+                "prediction": predictions[i],
+                "answer": answers[i],
+                "faithfulness01_score": faith_score,
+            })
         with open(args.dis_out_path, 'w', encoding='utf-8') as f:
             json.dump({
-                "evaluated_samples": evaluated_samples_ids,
+                "metrics": metrics,
+                "num_samples": len(exported_samples),
+                "samples": exported_samples,
             }, f, ensure_ascii=False, indent=2)
-        print(f"✅ Evaluation {len(evaluated_samples_ids)} results saved to {args.dis_out_path}")
+        print(f"✅ Evaluation results for {len(exported_samples)} samples saved to {args.dis_out_path}")
     else:
-        comparison_str, metrics = full_evaluation(predictions, answers)
+        comparison_str, metrics = full_evaluation(predictions, answers, questions=questions)
         print(metrics)
 
 

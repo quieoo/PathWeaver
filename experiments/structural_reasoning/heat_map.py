@@ -150,11 +150,24 @@ def _pick_middle_layer(records: Sequence[Mapping[str, Any]]) -> int:
     return layers[len(layers) // 2]
 
 
+def _q_len_from_record_item(item: Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]) -> int:
+    return int(item[1].shape[2])
+
+
+def _sort_prefill_record_items(
+    items: Sequence[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]],
+) -> List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]:
+    sorted_items = list(items)
+    sorted_items.sort(key=lambda u: (_q_len_from_record_item(u), u[1].shape[0], u[1].shape[3]), reverse=True)
+    return sorted_items
+
+
 def _pick_record_for_sample(
     records: Sequence[Mapping[str, Any]],
     *,
     prefer_normalized: bool,
     layer_id: Optional[int],
+    pass_mode: str,
 ) -> Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]:
     usable: List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]] = []
     for record in records:
@@ -173,15 +186,16 @@ def _pick_record_for_sample(
     if not same_layer:
         raise ValueError(f"layer_id={layer_id} not found in sample records")
 
-    # Prefer the longest Q to capture the prefill prompt rather than decode Q=1 records.
-    same_layer.sort(key=lambda u: (u[1].shape[2], u[1].shape[0], u[1].shape[3]), reverse=True)
-    return same_layer[0]
+    if pass_mode != "prefill":
+        raise ValueError(f"_pick_record_for_sample only supports pass_mode='prefill', got {pass_mode}")
+    return _sort_prefill_record_items(same_layer)[0]
 
 
 def _pick_best_record_per_layer(
     records: Sequence[Mapping[str, Any]],
     *,
     prefer_normalized: bool,
+    pass_mode: str,
 ) -> List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]:
     by_layer: Dict[int, List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]] = defaultdict(list)
     for record in records:
@@ -194,9 +208,198 @@ def _pick_best_record_per_layer(
     out = []
     for layer_idx in sorted(by_layer):
         candidates = by_layer[layer_idx]
-        candidates.sort(key=lambda u: (u[1].shape[2], u[1].shape[0], u[1].shape[3]), reverse=True)
-        out.append(candidates[0])
+        if pass_mode != "prefill":
+            raise ValueError(f"_pick_best_record_per_layer only supports pass_mode='prefill', got {pass_mode}")
+        out.append(_sort_prefill_record_items(candidates)[0])
     return out
+
+
+def _decode_step_label(context: Mapping[str, Any], fallback_idx: int) -> str:
+    step_value = _context_value(
+        context,
+        ["generation_step", "decode_step", "step_idx", "step", "turn_id"],
+        default=None,
+    )
+    if step_value is None or step_value == "":
+        return f"D{fallback_idx}"
+    return f"D{step_value}"
+
+
+def _decode_record_sort_key(item: Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]) -> Tuple[int, Any]:
+    context = item[0].get("context") or {}
+    if not isinstance(context, Mapping):
+        context = {"context": str(context)}
+    for key in ("generation_step", "decode_step", "step_idx", "step", "turn_id"):
+        value = context.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return (0, int(value))
+        except Exception:
+            return (1, str(value))
+    return (2, 0)
+
+
+def _collect_usable_record_items(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    prefer_normalized: bool,
+) -> List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]:
+    usable: List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]] = []
+    for record in records:
+        alpha, beta, kind = _choose_attention_pair(record, prefer_normalized=prefer_normalized)
+        if alpha is None or beta is None:
+            continue
+        usable.append((record, alpha, beta, kind))
+    return usable
+
+
+def _select_global_k_len(
+    items: Sequence[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]],
+) -> int:
+    if not items:
+        raise ValueError("cannot choose kb_len from empty items")
+    counts: Dict[int, int] = defaultdict(int)
+    for _, alpha, _, _ in items:
+        counts[int(alpha.shape[3])] += 1
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+def _select_last_layer_ids(
+    layer_ids: Sequence[int],
+    *,
+    keep_last_fraction: float,
+) -> List[int]:
+    unique_layers = sorted(set(int(x) for x in layer_ids))
+    if not unique_layers:
+        return []
+    if keep_last_fraction >= 1.0:
+        return unique_layers
+    if keep_last_fraction <= 0.0:
+        raise ValueError(f"keep_last_fraction must be > 0, got {keep_last_fraction}")
+    keep_n = max(1, math.ceil(len(unique_layers) * keep_last_fraction))
+    return unique_layers[-keep_n:]
+
+
+def _build_both_step_view(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    prefer_normalized: bool,
+    layer_keep_last_fraction: float,
+) -> Dict[str, Any]:
+    usable = _collect_usable_record_items(records, prefer_normalized=prefer_normalized)
+    if not usable:
+        raise ValueError("no usable attention tensors found for sample")
+
+    global_k_len = _select_global_k_len(usable)
+    usable = [u for u in usable if int(u[1].shape[3]) == global_k_len]
+    selected_layer_ids = _select_last_layer_ids(
+        [int(item[0].get("layer_idx")) for item in usable],
+        keep_last_fraction=layer_keep_last_fraction,
+    )
+    if not selected_layer_ids:
+        raise ValueError("no layer ids available for both-step view")
+
+    by_layer: Dict[int, List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]] = defaultdict(list)
+    for item in usable:
+        by_layer[int(item[0].get("layer_idx"))].append(item)
+
+    prefill_before_layers: List[torch.Tensor] = []
+    prefill_after_layers: List[torch.Tensor] = []
+    decode_before_by_step: Dict[str, List[torch.Tensor]] = defaultdict(list)
+    decode_after_by_step: Dict[str, List[torch.Tensor]] = defaultdict(list)
+    decode_order: List[str] = []
+    decode_label_map: Dict[str, str] = {}
+    contexts: List[Mapping[str, Any]] = []
+    attn_kind = usable[0][3]
+
+    for layer_idx in selected_layer_ids:
+        candidates = by_layer.get(int(layer_idx), [])
+        if not candidates:
+            continue
+
+        prefill_item = _sort_prefill_record_items(candidates)[0]
+        contexts.append(prefill_item[0].get("context") or {})
+        prefill_before_qk = _mean_over_heads(prefill_item[1], batch_idx=0)
+        prefill_after_qk = _mean_over_heads(prefill_item[2], batch_idx=0)
+        prefill_before_layers.append(prefill_before_qk.max(dim=0).values)
+        prefill_after_layers.append(prefill_after_qk.max(dim=0).values)
+
+        q_lens = [_q_len_from_record_item(item) for item in candidates]
+        target_q_len = 1 if 1 in q_lens else min(q_lens)
+        decode_candidates = [item for item in candidates if _q_len_from_record_item(item) == target_q_len]
+        decode_candidates.sort(key=_decode_record_sort_key)
+
+        for decode_idx, item in enumerate(decode_candidates, start=1):
+            decode_context = item[0].get("context") or {}
+            if not isinstance(decode_context, Mapping):
+                decode_context = {"context": str(decode_context)}
+            label = _decode_step_label(decode_context, decode_idx - 1)
+            if label not in decode_label_map:
+                decode_label_map[label] = str(len(decode_label_map) + 1)
+                decode_order.append(label)
+            before_qk = _mean_over_heads(item[1], batch_idx=0)
+            after_qk = _mean_over_heads(item[2], batch_idx=0)
+            decode_before_by_step[label].append(before_qk.max(dim=0).values)
+            decode_after_by_step[label].append(after_qk.max(dim=0).values)
+
+    if not prefill_before_layers:
+        raise ValueError("no prefill records found for both-step view")
+
+    prefill_before = torch.stack(prefill_before_layers, dim=0).mean(dim=0, keepdim=True)
+    prefill_after = torch.stack(prefill_after_layers, dim=0).mean(dim=0, keepdim=True)
+
+    before_rows = [prefill_before[0]]
+    after_rows = [prefill_after[0]]
+    row_labels = ["0"]
+    decode_step_mapping = [{"row_label": "0", "kind": "prefill"}]
+
+    for original_label in decode_order:
+        before_rows.append(torch.stack(decode_before_by_step[original_label], dim=0).mean(dim=0))
+        after_rows.append(torch.stack(decode_after_by_step[original_label], dim=0).mean(dim=0))
+        mapped_label = decode_label_map[original_label]
+        row_labels.append(mapped_label)
+        decode_step_mapping.append(
+            {
+                "row_label": mapped_label,
+                "kind": "decode",
+                "source_label": original_label,
+            }
+        )
+
+    return {
+        "before": torch.stack(before_rows, dim=0),
+        "after": torch.stack(after_rows, dim=0),
+        "row_labels": row_labels,
+        "row_label_name": "step",
+        "y_axis_label": "Step",
+        "selected_layer_ids": selected_layer_ids,
+        "selected_layer_idx": selected_layer_ids[-1],
+        "record_shape": {
+            "global_k_len": global_k_len,
+            "selected_layers": selected_layer_ids,
+        },
+        "attn_kind": attn_kind,
+        "contexts": [_safe_scalar(ctx) for ctx in contexts],
+        "decode_step_mapping": decode_step_mapping,
+    }
+
+
+def _filter_layer_records(
+    layer_records: Sequence[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]],
+    *,
+    keep_last_fraction: float,
+) -> List[Tuple[Mapping[str, Any], torch.Tensor, torch.Tensor, str]]:
+    if not layer_records:
+        return []
+    if keep_last_fraction >= 1.0:
+        return list(layer_records)
+    if keep_last_fraction <= 0.0:
+        raise ValueError(f"keep_last_fraction must be > 0, got {keep_last_fraction}")
+
+    n = len(layer_records)
+    keep_n = max(1, math.ceil(n * keep_last_fraction))
+    return list(layer_records[-keep_n:])
 
 
 def _load_dataset(dataset_path: Optional[str]) -> Optional[List[Dict[str, Any]]]:
@@ -250,6 +453,179 @@ def _extract_question_from_context(context: Mapping[str, Any]) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return ""
+
+
+def _extract_answer_kv_ids(
+    row: Optional[Mapping[str, Any]],
+    *,
+    kb_len: int,
+) -> List[int]:
+    if row is None or kb_len <= 0:
+        return []
+
+    hop_count = row.get("_hop_count")
+    if hop_count == 1:
+        return [0]
+
+    dag = row.get("dag")
+    if not isinstance(dag, Mapping):
+        return []
+
+    meta = dag.get("meta")
+    if not isinstance(meta, Mapping):
+        return []
+
+    goal_ids = meta.get("goal_ids")
+    if not isinstance(goal_ids, list):
+        return []
+
+    answer_ids: List[int] = []
+    for gid in goal_ids:
+        try:
+            idx = int(gid)
+        except Exception:
+            continue
+        if 0 <= idx < kb_len:
+            answer_ids.append(idx)
+    return sorted(set(answer_ids))
+
+
+def _rank_of_any_answer(scores: torch.Tensor, answer_kv_ids: Sequence[int]) -> Optional[int]:
+    if scores.ndim != 1:
+        raise ValueError(f"expected [K], got {tuple(scores.shape)}")
+    if not answer_kv_ids:
+        return None
+
+    ranking = torch.argsort(scores, descending=True).tolist()
+    answer_set = set(int(x) for x in answer_kv_ids)
+    for rank_idx, kv_idx in enumerate(ranking, start=1):
+        if int(kv_idx) in answer_set:
+            return rank_idx
+    return None
+
+
+def _topk_hits_from_scores(
+    scores: torch.Tensor,
+    *,
+    answer_kv_ids: Sequence[int],
+    topk_list: Sequence[int],
+) -> Dict[str, Any]:
+    if scores.ndim != 1:
+        raise ValueError(f"expected [K], got {tuple(scores.shape)}")
+
+    rank = _rank_of_any_answer(scores, answer_kv_ids)
+    result: Dict[str, Any] = {
+        "answer_kv_ids": [int(x) for x in answer_kv_ids],
+        "best_answer_rank": rank,
+        "answer_scores": {
+            str(int(kv_idx)): float(scores[int(kv_idx)].item())
+            for kv_idx in answer_kv_ids
+            if 0 <= int(kv_idx) < scores.shape[0]
+        },
+        "topk_hits": {},
+    }
+    for k in topk_list:
+        hit = bool(rank is not None and rank <= int(k))
+        result["topk_hits"][f"top_{int(k)}"] = hit
+    return result
+
+
+def _compute_answer_hit_stats(
+    score_matrix: torch.Tensor,
+    *,
+    row_labels: Sequence[str],
+    answer_kv_ids: Sequence[int],
+    topk_list: Sequence[int],
+) -> Dict[str, Any]:
+    if score_matrix.ndim != 2:
+        raise ValueError(f"expected [R,K], got {tuple(score_matrix.shape)}")
+
+    row_stats: List[Dict[str, Any]] = []
+    agg_counts = {f"top_{int(k)}": 0 for k in topk_list}
+    for row_idx in range(score_matrix.shape[0]):
+        stats = _topk_hits_from_scores(
+            score_matrix[row_idx],
+            answer_kv_ids=answer_kv_ids,
+            topk_list=topk_list,
+        )
+        stats["row_label"] = row_labels[row_idx] if row_idx < len(row_labels) else f"row_{row_idx}"
+        row_stats.append(stats)
+        for key, hit in stats["topk_hits"].items():
+            agg_counts[key] += int(bool(hit))
+
+    denom = max(1, len(row_stats))
+    return {
+        "answer_kv_ids": [int(x) for x in answer_kv_ids],
+        "num_rows": len(row_stats),
+        "row_stats": row_stats,
+        "hit_rate": {
+            key: agg_counts[key] / denom
+            for key in agg_counts
+        },
+    }
+
+
+def _sample_topk_summary_template(topk_list: Sequence[int]) -> Dict[str, float]:
+    return {f"top_{int(k)}": 0.0 for k in topk_list}
+
+
+def _extract_prefill_and_decode_best(
+    stats: Mapping[str, Any],
+    *,
+    topk_list: Sequence[int],
+) -> Dict[str, Dict[str, bool]]:
+    row_stats = stats.get("row_stats") or []
+    prefill_hits = {f"top_{int(k)}": False for k in topk_list}
+    decode_best_hits = {f"top_{int(k)}": False for k in topk_list}
+
+    for row in row_stats:
+        if not isinstance(row, Mapping):
+            continue
+        label = str(row.get("row_label", ""))
+        hits = row.get("topk_hits") or {}
+        if label == "0":
+            for k in topk_list:
+                key = f"top_{int(k)}"
+                prefill_hits[key] = bool(hits.get(key, False))
+        else:
+            for k in topk_list:
+                key = f"top_{int(k)}"
+                decode_best_hits[key] = decode_best_hits[key] or bool(hits.get(key, False))
+
+    return {
+        "prefill": prefill_hits,
+        "decode_best": decode_best_hits,
+    }
+
+
+def _extract_decode_mean(
+    stats: Mapping[str, Any],
+    *,
+    topk_list: Sequence[int],
+) -> Dict[str, float]:
+    row_stats = stats.get("row_stats") or []
+    decode_rows = []
+    for row in row_stats:
+        if not isinstance(row, Mapping):
+            continue
+        label = str(row.get("row_label", ""))
+        if label == "0":
+            continue
+        decode_rows.append(row)
+
+    if not decode_rows:
+        return {f"top_{int(k)}": 0.0 for k in topk_list}
+
+    out: Dict[str, float] = {}
+    denom = len(decode_rows)
+    for k in topk_list:
+        key = f"top_{int(k)}"
+        hits = sum(
+            int(bool((row.get("topk_hits") or {}).get(key, False)))
+            for row in decode_rows
+        )
+        out[key] = hits / denom
+    return out
 
 
 def _format_prompt(question: str, model_format: str, tokenizer) -> str:
@@ -475,6 +851,8 @@ def _adjacency_from_row(
         if not isinstance(row_vals, list):
             continue
         for j, val in enumerate(row_vals[:limit]):
+            if i == j:
+                continue
             try:
                 edge_val = float(val)
             except Exception:
@@ -675,6 +1053,10 @@ def render_heatmaps(
     max_samples: Optional[int],
     sample_ids: Optional[Sequence[str]],
     cmap: str,
+    pass_mode: str,
+    answer_topk: Sequence[int],
+    layer_keep_last_fraction: float,
+    enable_sample_details: bool,
 ) -> None:
     records, payload_meta = _load_trace(trace_path)
     dataset = _load_dataset(dataset_path)
@@ -696,82 +1078,146 @@ def render_heatmaps(
     out_root.mkdir(parents=True, exist_ok=True)
 
     index_rows: List[Dict[str, Any]] = []
+    answer_summary = {
+        "pass_mode": pass_mode,
+        "topk_list": [int(k) for k in answer_topk],
+        "num_samples": 0,
+        "samples_with_answer_kv": 0,
+        "summary_semantics": {
+            "before_after": "mean row-level hit rate across included samples",
+        },
+        "before": {f"top_{int(k)}": 0 for k in answer_topk},
+        "after": {f"top_{int(k)}": 0 for k in answer_topk},
+    }
+    if pass_mode == "both":
+        answer_summary["summary_semantics"]["prefill"] = "sample-level top-k hit using step 0"
+        answer_summary["summary_semantics"]["decode_best"] = "sample-level top-k hit if any decode step reaches top-k"
+        answer_summary["summary_semantics"]["decode_mean"] = "sample-level mean top-k hit rate across decode steps only"
+        answer_summary["prefill"] = {
+            "before": _sample_topk_summary_template(answer_topk),
+            "after": _sample_topk_summary_template(answer_topk),
+        }
+        answer_summary["decode_best"] = {
+            "before": _sample_topk_summary_template(answer_topk),
+            "after": _sample_topk_summary_template(answer_topk),
+        }
+        answer_summary["decode_mean"] = {
+            "before": _sample_topk_summary_template(answer_topk),
+            "after": _sample_topk_summary_template(answer_topk),
+        }
 
     for sample_id in selected_sample_ids:
         sample_records = grouped[sample_id]
         batch_idx = 0
+        sample_dir = None
+        if enable_sample_details:
+            sample_dir = out_root / _safe_name(sample_id)
+            sample_dir.mkdir(parents=True, exist_ok=True)
 
-        if y_axis_mode == "query":
-            record, alpha, beta, attn_kind = _pick_record_for_sample(
-                sample_records,
-                prefer_normalized=prefer_normalized,
-                layer_id=layer_id,
-            )
-            context = record.get("context") or {}
-            if not isinstance(context, Mapping):
-                context = {"context": str(context)}
-
-            before = _mean_over_heads(alpha, batch_idx=batch_idx)
-            after = _mean_over_heads(beta, batch_idx=batch_idx)
-            q_len, k_len = before.shape
-
-            row = _find_dataset_row(dataset, context)
-            question = _extract_question_from_context(context) or _extract_question(row)
-            row_labels = _query_labels_from_context(context, q_len)
-            if row_labels is None:
-                row_labels = _tokenize_query_tokens(
-                    question,
-                    tokenizer=tokenizer,
-                    model_format=model_format,
-                    expected_q=q_len,
+        if pass_mode == "prefill":
+            if y_axis_mode == "query":
+                record, alpha, beta, attn_kind = _pick_record_for_sample(
+                    sample_records,
+                    prefer_normalized=prefer_normalized,
+                    layer_id=layer_id,
+                    pass_mode="prefill",
                 )
-            row_labels = [f"Q{i}" for i in range(q_len)]
-            y_axis_label = "Query tokens"
-            selected_layer_idx = int(record.get("layer_idx"))
+                context = record.get("context") or {}
+                if not isinstance(context, Mapping):
+                    context = {"context": str(context)}
+                before = _mean_over_heads(alpha, batch_idx=batch_idx)
+                after = _mean_over_heads(beta, batch_idx=batch_idx)
+                q_len, k_len = before.shape
+                row = _find_dataset_row(dataset, context)
+                question = _extract_question_from_context(context) or _extract_question(row)
+                row_labels = _query_labels_from_context(context, q_len)
+                if row_labels is None:
+                    row_labels = _tokenize_query_tokens(
+                        question,
+                        tokenizer=tokenizer,
+                        model_format=model_format,
+                        expected_q=q_len,
+                    )
+                row_labels = [f"Q{i}" for i in range(q_len)]
+                row_label_name = "query_token"
+                y_axis_label = "Query tokens"
+                selected_layer_idx = int(record.get("layer_idx"))
+                record_shape: Any = tuple(alpha.shape)
+            else:
+                layer_records = _pick_best_record_per_layer(
+                    sample_records,
+                    prefer_normalized=prefer_normalized,
+                    pass_mode="prefill",
+                )
+                if not layer_records:
+                    raise ValueError(f"no usable records found for sample={sample_id}")
+                if layer_id is not None:
+                    layer_records = [x for x in layer_records if int(x[0].get("layer_idx")) == int(layer_id)]
+                    if not layer_records:
+                        raise ValueError(f"layer_id={layer_id} not found for sample={sample_id}")
+                else:
+                    layer_records = _filter_layer_records(layer_records, keep_last_fraction=layer_keep_last_fraction)
+                context = layer_records[0][0].get("context") or {}
+                if not isinstance(context, Mapping):
+                    context = {"context": str(context)}
+                before_rows = []
+                after_rows = []
+                row_labels = []
+                k_len = None
+                attn_kind = layer_records[0][3]
+                for record, alpha, beta, _attn_kind in layer_records:
+                    before_qk = _mean_over_heads(alpha, batch_idx=batch_idx)
+                    after_qk = _mean_over_heads(beta, batch_idx=batch_idx)
+                    before_k = _reduce_query_dim(before_qk, query_reduce)
+                    after_k = _reduce_query_dim(after_qk, query_reduce)
+                    if k_len is None:
+                        k_len = before_k.shape[0]
+                    if before_k.shape[0] != k_len:
+                        raise ValueError(
+                            f"inconsistent kb_len across layers for sample={sample_id}: "
+                            f"{k_len} vs {before_k.shape[0]}"
+                        )
+                    before_rows.append(before_k)
+                    after_rows.append(after_k)
+                    row_labels.append(f"L{int(record.get('layer_idx'))}")
+                before = torch.stack(before_rows, dim=0)
+                after = torch.stack(after_rows, dim=0)
+                q_len = before.shape[0]
+                row = _find_dataset_row(dataset, context)
+                question = _extract_question_from_context(context) or _extract_question(row)
+                row_label_name = "layer"
+                y_axis_label = f"Layers (query={query_reduce})"
+                selected_layer_idx = -1
+                record_shape = [tuple(x[1].shape) for x in layer_records]
+            metadata_extra = {}
         else:
-            layer_records = _pick_best_record_per_layer(
+            both_view = _build_both_step_view(
                 sample_records,
                 prefer_normalized=prefer_normalized,
+                layer_keep_last_fraction=layer_keep_last_fraction,
             )
-            if not layer_records:
-                raise ValueError(f"no usable records found for sample={sample_id}")
-
-            if layer_id is not None:
-                layer_records = [x for x in layer_records if int(x[0].get("layer_idx")) == int(layer_id)]
-                if not layer_records:
-                    raise ValueError(f"layer_id={layer_id} not found for sample={sample_id}")
-
-            context = layer_records[0][0].get("context") or {}
+            before = both_view["before"]
+            after = both_view["after"]
+            row_labels = both_view["row_labels"]
+            row_label_name = both_view["row_label_name"]
+            y_axis_label = both_view["y_axis_label"]
+            selected_layer_idx = both_view["selected_layer_idx"]
+            attn_kind = both_view["attn_kind"]
+            record_shape = both_view["record_shape"]
+            q_len, k_len = before.shape
+            context = sample_records[0].get("context") or {}
             if not isinstance(context, Mapping):
                 context = {"context": str(context)}
-
-            before_rows = []
-            after_rows = []
-            row_labels = []
-            k_len = None
-            for record, alpha, beta, attn_kind in layer_records:
-                before_qk = _mean_over_heads(alpha, batch_idx=batch_idx)
-                after_qk = _mean_over_heads(beta, batch_idx=batch_idx)
-                before_k = _reduce_query_dim(before_qk, query_reduce)
-                after_k = _reduce_query_dim(after_qk, query_reduce)
-                if k_len is None:
-                    k_len = before_k.shape[0]
-                if before_k.shape[0] != k_len:
-                    raise ValueError(
-                        f"inconsistent kb_len across layers for sample={sample_id}: "
-                        f"{k_len} vs {before_k.shape[0]}"
-                    )
-                before_rows.append(before_k)
-                after_rows.append(after_k)
-                row_labels.append(f"L{int(record.get('layer_idx'))}")
-
-            before = torch.stack(before_rows, dim=0)
-            after = torch.stack(after_rows, dim=0)
-            q_len = before.shape[0]
             row = _find_dataset_row(dataset, context)
             question = _extract_question_from_context(context) or _extract_question(row)
-            y_axis_label = f"Layers (query={query_reduce})"
-            selected_layer_idx = -1
+            metadata_extra = {
+                "selected_layer_ids": both_view["selected_layer_ids"],
+                "decode_step_mapping": both_view["decode_step_mapping"],
+                "contexts": both_view["contexts"],
+                "query_reduce_applied": "max",
+                "layer_aggregation": "mean_over_selected_layers",
+                "y_axis_mode_effective": "step",
+            }
 
         kv_items_all = _merge_kv_items(
             _kv_items_from_context(context),
@@ -780,81 +1226,186 @@ def render_heatmaps(
         kv_items = kv_items_all[:k_len] if kv_items_all else []
         dag_edges = _adjacency_from_row(row, max_kv_len=k_len)
         kv_labels = [f"KV{i}" for i in range(k_len)]
-
-        sample_dir = out_root / _safe_name(sample_id)
-        sample_dir.mkdir(parents=True, exist_ok=True)
-
-        _draw_heatmap_pair(
+        answer_kv_ids = _extract_answer_kv_ids(row, kb_len=k_len)
+        before_answer_stats = _compute_answer_hit_stats(
             before,
+            row_labels=row_labels,
+            answer_kv_ids=answer_kv_ids,
+            topk_list=answer_topk,
+        )
+        after_answer_stats = _compute_answer_hit_stats(
             after,
             row_labels=row_labels,
-            kv_labels=kv_labels,
-            title_prefix=_sample_title(sample_id, selected_layer_idx, attn_kind),
-            save_path=sample_dir / f"attention_before_after_{y_axis_mode}.png",
-            cmap=cmap,
-            y_axis_label=y_axis_label,
-        )
-        _save_matrix_csv(
-            sample_dir / f"attention_before_{y_axis_mode}.csv",
-            before,
-            kv_labels=kv_labels,
-            row_labels=row_labels,
-            row_label_name="query_token" if y_axis_mode == "query" else "layer",
-        )
-        _save_matrix_csv(
-            sample_dir / f"attention_after_{y_axis_mode}.csv",
-            after,
-            kv_labels=kv_labels,
-            row_labels=row_labels,
-            row_label_name="query_token" if y_axis_mode == "query" else "layer",
-        )
-        _write_kv_contents(sample_dir / "kv_contents.jsonl", kv_items)
-        _draw_dag_graph(
-            kv_items=kv_items,
-            edges=dag_edges,
-            save_path=sample_dir / "dag_graph.png",
-            title=f"sample={sample_id} DAG",
+            answer_kv_ids=answer_kv_ids,
+            topk_list=answer_topk,
         )
 
-        metadata = {
-            "sample_id": sample_id,
-            "selected_layer_idx": selected_layer_idx,
-            "attention_kind": attn_kind,
-            "record_shape": tuple(alpha.shape) if y_axis_mode == "query" else [tuple(x[1].shape) for x in layer_records],
-            "query_len": q_len,
-            "kb_len": k_len,
-            "y_axis_mode": y_axis_mode,
-            "query_reduce": query_reduce if y_axis_mode == "layer" else None,
-            "row_labels": row_labels,
-            "kv_items": kv_items,
-            "model_output_raw": context.get("model_output_raw", ""),
-            "model_output_final": context.get("model_output_final", ""),
-            "answer_final": context.get("answer_final", ""),
-            "context": _safe_scalar(context),
-            "payload_meta": payload_meta,
-            "question": question,
-        }
-        with open(sample_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        if enable_sample_details and sample_dir is not None:
+            suffix = f"_{pass_mode}"
+            effective_y_axis_mode = y_axis_mode if pass_mode == "prefill" else "step"
+            _draw_heatmap_pair(
+                before,
+                after,
+                row_labels=row_labels,
+                kv_labels=kv_labels,
+                title_prefix=f"{_sample_title(sample_id, selected_layer_idx, attn_kind)} [{pass_mode}]",
+                save_path=sample_dir / f"attention_before_after_{effective_y_axis_mode}{suffix}.png",
+                cmap=cmap,
+                y_axis_label=y_axis_label,
+            )
+            _save_matrix_csv(
+                sample_dir / f"attention_before_{effective_y_axis_mode}{suffix}.csv",
+                before,
+                kv_labels=kv_labels,
+                row_labels=row_labels,
+                row_label_name=row_label_name,
+            )
+            _save_matrix_csv(
+                sample_dir / f"attention_after_{effective_y_axis_mode}{suffix}.csv",
+                after,
+                kv_labels=kv_labels,
+                row_labels=row_labels,
+                row_label_name=row_label_name,
+            )
+            _write_kv_contents(sample_dir / "kv_contents.jsonl", kv_items)
+            _draw_dag_graph(
+                kv_items=kv_items,
+                edges=dag_edges,
+                save_path=sample_dir / "dag_graph.png",
+                title=f"sample={sample_id} DAG",
+            )
 
-        index_rows.append(
-            {
+            metadata = {
                 "sample_id": sample_id,
-                "layer_idx": selected_layer_idx,
+                "pass_mode": pass_mode,
+                "selected_layer_idx": selected_layer_idx,
                 "attention_kind": attn_kind,
+                "record_shape": record_shape,
                 "query_len": q_len,
                 "kb_len": k_len,
                 "y_axis_mode": y_axis_mode,
-                "query_reduce": query_reduce if y_axis_mode == "layer" else None,
-                "sample_dir": str(sample_dir),
+                "y_axis_mode_effective": y_axis_mode if pass_mode == "prefill" else "step",
+                "query_reduce": query_reduce if pass_mode == "prefill" and y_axis_mode == "layer" else None,
+                "layer_keep_last_fraction": layer_keep_last_fraction,
+                "row_labels": row_labels,
+                "kv_items": kv_items,
+                "model_output_raw": context.get("model_output_raw", ""),
+                "model_output_final": context.get("model_output_final", ""),
+                "answer_final": context.get("answer_final", ""),
+                "context": _safe_scalar(context),
+                "payload_meta": payload_meta,
                 "question": question,
+                "answer_kv_stats": {
+                    "before": before_answer_stats,
+                    "after": after_answer_stats,
+                },
             }
-        )
+            metadata.update(metadata_extra)
+            with open(sample_dir / f"metadata{suffix}.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    with open(out_root / "index.json", "w", encoding="utf-8") as f:
-        json.dump(index_rows, f, ensure_ascii=False, indent=2)
+        answer_summary["num_samples"] += 1
+        if answer_kv_ids:
+            answer_summary["samples_with_answer_kv"] += 1
+            for side, stats in (("before", before_answer_stats), ("after", after_answer_stats)):
+                for key, value in stats["hit_rate"].items():
+                    answer_summary[side][key] += float(value)
+            if pass_mode == "both":
+                before_targets = _extract_prefill_and_decode_best(
+                    before_answer_stats,
+                    topk_list=answer_topk,
+                )
+                after_targets = _extract_prefill_and_decode_best(
+                    after_answer_stats,
+                    topk_list=answer_topk,
+                )
+                for key, value in before_targets["prefill"].items():
+                    answer_summary["prefill"]["before"][key] += float(bool(value))
+                for key, value in after_targets["prefill"].items():
+                    answer_summary["prefill"]["after"][key] += float(bool(value))
+                for key, value in before_targets["decode_best"].items():
+                    answer_summary["decode_best"]["before"][key] += float(bool(value))
+                for key, value in after_targets["decode_best"].items():
+                    answer_summary["decode_best"]["after"][key] += float(bool(value))
 
-    print(f"Saved {len(index_rows)} sample heatmap folders to {out_root}")
+                before_decode_mean = _extract_decode_mean(
+                    before_answer_stats,
+                    topk_list=answer_topk,
+                )
+                after_decode_mean = _extract_decode_mean(
+                    after_answer_stats,
+                    topk_list=answer_topk,
+                )
+                for key, value in before_decode_mean.items():
+                    answer_summary["decode_mean"]["before"][key] += float(value)
+                for key, value in after_decode_mean.items():
+                    answer_summary["decode_mean"]["after"][key] += float(value)
+
+        if enable_sample_details and sample_dir is not None:
+            index_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "pass_mode": pass_mode,
+                    "layer_idx": selected_layer_idx,
+                    "attention_kind": attn_kind,
+                    "query_len": q_len,
+                    "kb_len": k_len,
+                    "y_axis_mode": y_axis_mode if pass_mode == "prefill" else "step",
+                    "query_reduce": query_reduce if pass_mode == "prefill" and y_axis_mode == "layer" else None,
+                    "layer_keep_last_fraction": layer_keep_last_fraction,
+                    "sample_dir": str(sample_dir),
+                    "question": question,
+                    "answer_kv_ids": answer_kv_ids,
+                    "answer_hit_rate_before": before_answer_stats["hit_rate"],
+                    "answer_hit_rate_after": after_answer_stats["hit_rate"],
+                }
+            )
+
+    if enable_sample_details:
+        with open(out_root / "index.json", "w", encoding="utf-8") as f:
+            json.dump(index_rows, f, ensure_ascii=False, indent=2)
+
+    denom = max(1, answer_summary["samples_with_answer_kv"])
+    answer_summary["before"] = {
+        key: value / denom
+        for key, value in answer_summary["before"].items()
+    }
+    answer_summary["after"] = {
+        key: value / denom
+        for key, value in answer_summary["after"].items()
+    }
+    if pass_mode == "both":
+        answer_summary["prefill"]["before"] = {
+            key: value / denom
+            for key, value in answer_summary["prefill"]["before"].items()
+        }
+        answer_summary["prefill"]["after"] = {
+            key: value / denom
+            for key, value in answer_summary["prefill"]["after"].items()
+        }
+        answer_summary["decode_best"]["before"] = {
+            key: value / denom
+            for key, value in answer_summary["decode_best"]["before"].items()
+        }
+        answer_summary["decode_best"]["after"] = {
+            key: value / denom
+            for key, value in answer_summary["decode_best"]["after"].items()
+        }
+        answer_summary["decode_mean"]["before"] = {
+            key: value / denom
+            for key, value in answer_summary["decode_mean"]["before"].items()
+        }
+        answer_summary["decode_mean"]["after"] = {
+            key: value / denom
+            for key, value in answer_summary["decode_mean"]["after"].items()
+        }
+    with open(out_root / "answer_kv_topk_summary.json", "w", encoding="utf-8") as f:
+        json.dump(answer_summary, f, ensure_ascii=False, indent=2)
+
+    if enable_sample_details:
+        print(f"Saved {len(index_rows)} sample heatmap folders to {out_root}")
+    else:
+        print(f"Saved summary statistics to {out_root}")
 
 
 def _compact_kv_label(idx: int, item: Mapping[str, Any], max_chars: int = 36) -> str:
@@ -885,19 +1436,44 @@ def parse_args() -> argparse.Namespace:
         "--y-axis-mode",
         choices=["query", "layer"],
         default="query",
-        help="Use query tokens or layers on the y-axis.",
+        help="Use query tokens or layers on the y-axis. Ignored when --pass-mode=both, which always uses step on the y-axis.",
     )
     parser.add_argument(
         "--query-reduce",
         choices=["last", "mean", "max", "sum"],
         default="mean",
-        help="How to reduce query tokens when --y-axis-mode=layer.",
+        help="How to reduce query tokens when --y-axis-mode=layer. Ignored when --pass-mode=both.",
+    )
+    parser.add_argument(
+        "--layer-keep-last-fraction",
+        type=float,
+        default=1.0,
+        help="When --y-axis-mode=layer and --layer-id is unset, keep only the last fraction of layers, e.g. 0.333333 for the last 1/3.",
     )
     parser.add_argument("--layer-id", type=int, default=None, help="Specific layer to visualize. Default picks the middle available layer per sample.")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on number of samples to render")
     parser.add_argument("--sample-id", action="append", default=None, help="Restrict to one or more sample ids")
     parser.add_argument("--raw", action="store_true", help="Use raw alpha_kb/beta_kb instead of KB-normalized tensors")
     parser.add_argument("--cmap", default="viridis", help="Matplotlib colormap for heatmaps")
+    parser.add_argument(
+        "--pass-mode",
+        choices=["prefill", "both"],
+        default="prefill",
+        help="Which pass view to render. 'prefill' keeps the original behavior. 'both' builds a step view with step 0=prefill and later rows=decode steps, using mean over selected layers and max over query positions.",
+    )
+    parser.add_argument(
+        "--enable-sample-details",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to export per-sample heatmaps/CSVs/metadata/index. Off by default for faster summary-only runs.",
+    )
+    parser.add_argument(
+        "--answer-topk",
+        type=int,
+        nargs="+",
+        default=[1, 3, 5, 10],
+        help="Top-k cutoffs used for answer-KV hit-rate statistics.",
+    )
     return parser.parse_args()
 
 
@@ -916,6 +1492,10 @@ def main() -> None:
         max_samples=args.max_samples,
         sample_ids=args.sample_id,
         cmap=args.cmap,
+        pass_mode=args.pass_mode,
+        answer_topk=args.answer_topk,
+        layer_keep_last_fraction=args.layer_keep_last_fraction,
+        enable_sample_details=args.enable_sample_details,
     )
 
 

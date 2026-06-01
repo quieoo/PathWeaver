@@ -49,6 +49,7 @@ from kblam.dag_kv_retriever import DAGKVKBRetriever
 # from eval import eval_main_process
 from eval_generation import eval_main_process
 from kblam.metrics_evaluator import simple_evaluation, full_evaluation, fa_evaluate
+from kblam.utils.dataset import get_question
 from kblam.utils.eval_utils import (
     format_QA_llama,
     format_QA_phi3,
@@ -1291,9 +1292,10 @@ class Trainer:
             results_pair = results_pair_list[0]
             scale_factor = scale_factor_list[0]
 
-            model_outputs, answers = results_pair[:2]
+            model_outputs, answers, source_indices = results_pair
+            questions = [get_question(dataset[idx]) or "" for idx in source_indices]
             if os.environ.get("DASHSCOPE_API_KEY"):
-                score, _ = fa_evaluate(model_outputs, answers)
+                score, _ = fa_evaluate(model_outputs, answers, questions=questions)
                 self.logger.info(
                     f"------- Test dataset: {dataset_name}, num_samples: {len(dataset)}, "
                     f"scale_factor: {scale_factor}, FA01 Score: {score}"

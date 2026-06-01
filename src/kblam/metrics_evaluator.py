@@ -96,83 +96,204 @@ def compute_faithfulness_local(model_outputs, references):
 # ======================
 # 🔹 Faithfulness 检测 - 阿里云百炼 API 版
 # ======================
-def compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus", absolute=False):
+# def compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus", absolute=False):
 
+#     import re, os
+#     from openai import OpenAI
+
+#     api_key = os.getenv("DASHSCOPE_API_KEY")
+#     if not api_key:
+#         print("⚠️ No DASHSCOPE_API_KEY found in environment. Using local faithfulness instead.")
+#         return compute_faithfulness_local(model_outputs, references)
+
+#     # print(f"Calculating Faithfulness using Bailian ({model_name}) in batch mode...")
+
+#     client = OpenAI(
+#         api_key=api_key,
+#         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+#     )
+
+#     # --- Step 1: 构造批量 prompt ---
+#     prompt_lines = []
+#     for i, (pred, ref) in enumerate(zip(model_outputs, references)):
+#         prompt_lines.append(f"{i+1}. 模型输出: {pred}\n参考答案: {ref}\n评分:")
+#     prompt = "\n".join(prompt_lines)
+
+#     # --- Step 2: 一次性请求模型 ---
+#     try:
+#         if absolute:
+#             output_format="输出格式：如果语义一致则输出1，否则输出0。不要解释。"
+#         else:
+#             output_format="输出格式：每一行仅输出一个小数（0.0~1.0），与输入编号对应。不要解释。"
+#         completion = client.chat.completions.create(
+#             model=model_name,
+#             messages=[
+#                 {"role": "system", "content": (
+#                     "你是一名文本一致性评估助手。请判断每对文本在事实层面的语义一致程度。\n"
+#                     f"{output_format}"
+#                 )},
+#                 {"role": "user", "content": prompt},
+#             ],
+#             temperature=0,
+#         )
+#         content = completion.choices[0].message.content.strip()
+#         # print(f"🔹 {i} Raw model output:{content}")
+#     except Exception as e:
+#         print(f"⚠️ DashScope request error: {e}")
+#         return 0.0
+
+#     lines = [l.strip() for l in content.splitlines() if l.strip()]
+#     scores = []
+
+#     for line in lines:
+#         # 匹配 0 ~ 1 之间的小数或整数
+#         match = re.search(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", line)
+#         if match:
+#             try:
+#                 val = float(match.group(1))
+#                 if 0.0 <= val <= 1.0:
+#                     scores.append(val)
+#             except ValueError:
+#                 continue
+
+#     if not scores:
+#         print("⚠️ No valid scores found in model output.")
+#         return 0.0
+        
+#     # --- Step 4: 数量对齐 ---
+#     if len(scores) != len(model_outputs):
+#         print(f"⚠️ Warning: Expected {len(model_outputs)} scores, got {len(scores)}")
+#         # 如果分数太少，补齐均值
+#         if len(scores) < len(model_outputs):
+#             mean_val = _mean(scores)
+#             scores += [mean_val] * (len(model_outputs) - len(scores))
+#         else:
+#             scores = scores[: len(model_outputs)]
+
+#     avg_score = _mean(scores)
+#     return avg_score, scores
+
+
+def _prepare_questions(questions, num_items: int) -> list[str]:
+    if questions is None:
+        return [""] * num_items
+    questions = list(questions)
+    if len(questions) != num_items:
+        raise ValueError(
+            f"Number of questions ({len(questions)}) does not match expected size ({num_items})"
+        )
+    return ["" if q is None else str(q) for q in questions]
+
+
+def compute_faithfulness_bailian(
+    questions,
+    model_outputs=None,
+    references=None,
+    model_name="qwen-plus",
+    batch_size=10,
+):
     import re, os
     from openai import OpenAI
 
+    # Backward compatibility:
+    # old style: compute_faithfulness_bailian(model_outputs, references, ...)
+    # new style: compute_faithfulness_bailian(questions, model_outputs, references, ...)
+    if references is None:
+        if model_outputs is None:
+            raise ValueError("references must be provided")
+        references = model_outputs
+        model_outputs = questions
+        questions = None
+
+    model_outputs = list(model_outputs)
+    references = list(references)
+    if len(model_outputs) != len(references):
+        raise ValueError(
+            f"Number of model outputs ({len(model_outputs)}) does not match number of references ({len(references)})"
+        )
+    if not model_outputs:
+        raise ValueError("model_outputs and references must not be empty")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    questions = _prepare_questions(questions, len(model_outputs))
+
     api_key = os.getenv("DASHSCOPE_API_KEY")
     if not api_key:
-        print("⚠️ No DASHSCOPE_API_KEY found in environment. Using local faithfulness instead.")
-        return compute_faithfulness_local(model_outputs, references)
-
-    # print(f"Calculating Faithfulness using Bailian ({model_name}) in batch mode...")
+        raise RuntimeError("No DASHSCOPE_API_KEY found.")
 
     client = OpenAI(
         api_key=api_key,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
 
-    # --- Step 1: 构造批量 prompt ---
-    prompt_lines = []
-    for i, (pred, ref) in enumerate(zip(model_outputs, references)):
-        prompt_lines.append(f"{i+1}. 模型输出: {pred}\n参考答案: {ref}\n评分:")
-    prompt = "\n".join(prompt_lines)
+    all_scores = []
 
-    # --- Step 2: 一次性请求模型 ---
-    try:
-        if absolute:
-            output_format="输出格式：如果语义一致则输出1，否则输出0。不要解释。"
-        else:
-            output_format="输出格式：每一行仅输出一个小数（0.0~1.0），与输入编号对应。不要解释。"
+    for start in range(0, len(model_outputs), batch_size):
+        batch = list(zip(
+            questions[start:start + batch_size],
+            model_outputs[start:start + batch_size],
+            references[start:start + batch_size],
+        ))
+
+        items = []
+        for i, (q, pred, ref) in enumerate(batch):
+            items.append(
+                f"{i+1}. Question: {q or '[Question unavailable]'}\n"
+                f"Prediction: {pred}\n"
+                f"Reference: {ref}\n"
+            )
+
+        prompt = "\n".join(items)
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an answer-equivalence evaluator for question answering.\n"
+                    "For each item, decide whether the Prediction should be accepted as a correct answer "
+                    "to the Question, using the Reference as the gold answer.\n\n"
+                    "Rules:\n"
+                    "- Output 1 if the prediction is exactly correct or semantically equivalent.\n"
+                    "- Output 1 if the prediction is a more specific form of the reference but still directly answers the question, "
+                    "such as 'Brooklyn, New York' for reference 'Brooklyn'.\n"
+                    "- Output 1 if names differ only by capitalization, punctuation, accents, abbreviations, or harmless title expansion.\n"
+                    "- Output 1 if dates are compatible and the prediction contains the required date granularity.\n"
+                    "- Output 0 if the prediction answers a different question, gives supporting evidence instead of the final answer, "
+                    "or contradicts the reference.\n"
+                    "- For yes/no questions, only yes/no or a semantically explicit equivalent should be accepted.\n\n"
+                    "Return one line per item. Each line must contain only 0 or 1."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
         completion = client.chat.completions.create(
             model=model_name,
-            messages=[
-                {"role": "system", "content": (
-                    "你是一名文本一致性评估助手。请判断每对文本在事实层面的语义一致程度。\n"
-                    f"{output_format}"
-                )},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             temperature=0,
         )
+
         content = completion.choices[0].message.content.strip()
-        # print(f"🔹 {i} Raw model output:{content}")
-    except Exception as e:
-        print(f"⚠️ DashScope request error: {e}")
-        return 0.0
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
 
-    lines = [l.strip() for l in content.splitlines() if l.strip()]
-    scores = []
+        batch_scores = []
+        for line in lines:
+            matches = re.findall(r"(?<!\d)(?:0|1)(?!\d)", line)
+            if matches:
+                batch_scores.append(float(matches[-1]))
 
-    for line in lines:
-        # 匹配 0 ~ 1 之间的小数或整数
-        match = re.search(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", line)
-        if match:
-            try:
-                val = float(match.group(1))
-                if 0.0 <= val <= 1.0:
-                    scores.append(val)
-            except ValueError:
-                continue
+        if len(batch_scores) != len(batch):
+            print("Judge output mismatch.")
+            print("Expected:", len(batch), "Got:", len(batch_scores))
+            print(content)
+            # 不要用均值补齐；宁可标记为 0 或重试
+            batch_scores = batch_scores[:len(batch)]
+            batch_scores += [0.0] * (len(batch) - len(batch_scores))
 
-    if not scores:
-        print("⚠️ No valid scores found in model output.")
-        return 0.0
-        
-    # --- Step 4: 数量对齐 ---
-    if len(scores) != len(model_outputs):
-        print(f"⚠️ Warning: Expected {len(model_outputs)} scores, got {len(scores)}")
-        # 如果分数太少，补齐均值
-        if len(scores) < len(model_outputs):
-            mean_val = _mean(scores)
-            scores += [mean_val] * (len(model_outputs) - len(scores))
-        else:
-            scores = scores[: len(model_outputs)]
+        all_scores.extend(batch_scores)
 
-    avg_score = _mean(scores)
-    return avg_score, scores
-
+    return _mean(all_scores), all_scores
 
 def compute_faithfulness_gpt(model_outputs, references):
     """Use GPT model to judge factual consistency."""
@@ -213,13 +334,22 @@ def compute_faithfulness_gpt(model_outputs, references):
 # ======================
 # 🔹 综合评估函数
 # ======================
-def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang: str = "en", bert_device: str = "cpu", skip_bert: bool = False, skip_faithfulness: bool = False) -> dict:
+def evaluate_model_outputs(
+    model_outputs: list[str],
+    references: list[str],
+    lang: str = "en",
+    bert_device: str = "cpu",
+    skip_bert: bool = True,
+    skip_faithfulness: bool = True,
+    questions: list[str] | None = None,
+) -> dict:
     if len(model_outputs) != len(references):
         raise ValueError(
             f"Number of model outputs ({len(model_outputs)}) does not match number of references ({len(references)})"
         )
     if not model_outputs:
         raise ValueError("model_outputs and references must not be empty")
+    questions = _prepare_questions(questions, len(model_outputs))
 
     results_dict = {}
 
@@ -264,19 +394,19 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
                 all_scores = []
                 for i in range(0, len(model_outputs), 20):
                     batch_score, batch_scores = compute_faithfulness_bailian(
+                        questions[i:i+20],
                         model_outputs[i:i+20],
                         references[i:i+20],
                         model_name="qwen-plus",
-                        absolute=True
                     )
                     all_scores.extend(batch_scores)
                 faith = _mean(all_scores)
             else:
                 faith, all_scores = compute_faithfulness_bailian(
+                    questions,
                     model_outputs,
                     references,
                     model_name="qwen-plus",
-                    absolute=True,
                 )
 
             faith_01_scores.extend(all_scores)
@@ -397,6 +527,7 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
                     all_scores = []
                     for i in range(0, len(model_outputs), 20):
                         batch_score,_ = compute_faithfulness_bailian(
+                            questions[i:i+20],
                             model_outputs[i:i+20],
                             references[i:i+20],
                             model_name="qwen-plus"
@@ -404,7 +535,12 @@ def evaluate_model_outputs(model_outputs: list[str], references: list[str], lang
                         all_scores.append(batch_score)
                     faith = _mean(all_scores)
                 else:
-                    faith,_ = compute_faithfulness_bailian(model_outputs, references, model_name="qwen-plus")
+                    faith,_ = compute_faithfulness_bailian(
+                        questions,
+                        model_outputs,
+                        references,
+                        model_name="qwen-plus",
+                    )
             else:
                 print("🔸 No API key found for Faithfulness, using local model...")
                 faith=None
@@ -434,14 +570,31 @@ def print_comparison(model_outputs: list[str], references: list[str]) -> str:
 # ======================
 # 🔹 总控函数
 # ======================
-def full_evaluation(model_outputs: list[str], references: list[str], lang: str = "en", bert_device: str = "cpu", return_score: bool = False) -> tuple[str, dict]:
+def full_evaluation(
+    model_outputs: list[str],
+    references: list[str],
+    lang: str = "en",
+    bert_device: str = "cpu",
+    return_score: bool = False,
+    questions: list[str] | None = None,
+) -> tuple[str, dict]:
     # 打印前5个样本
     N=5
     print(f"===== First {N} Samples =====")
     print(print_comparison(model_outputs[:N], references[:N]))
 
     comparison_str = print_comparison(model_outputs, references)
-    metrics, faith01 = evaluate_model_outputs(model_outputs, references, lang, bert_device, skip_bert=True, skip_faithfulness=True)
+    metrics, faith01 = evaluate_model_outputs(
+        model_outputs,
+        references,
+        questions=questions,
+        lang=lang,
+        bert_device=bert_device,
+        skip_bert=True,
+        skip_faithfulness=True,
+    )
+    # metrics, faith01 = evaluate_model_outputs(model_outputs, references, lang, bert_device, skip_bert=False, skip_faithfulness=True)
+    
     
     if return_score:
         return comparison_str, metrics, faith01
@@ -455,6 +608,7 @@ def fa_evaluate(
     model_name: str = "qwen-plus",
     batch_size: int = 20,
     max_workers: int = 5,
+    questions: list[str] | None = None,
 ):
     """Evaluate faithfulness with Bailian using absolute binary scoring."""
     if len(model_outputs) != len(references):
@@ -467,19 +621,20 @@ def fa_evaluate(
         raise ValueError("batch_size must be positive")
     if max_workers <= 0:
         raise ValueError("max_workers must be positive")
+    questions = _prepare_questions(questions, len(model_outputs))
 
     if len(model_outputs) <= batch_size:
         return compute_faithfulness_bailian(
+            questions,
             model_outputs,
             references,
             model_name=model_name,
-            absolute=True,
         )
 
     batches = []
     for start in range(0, len(model_outputs), batch_size):
         end = min(start + batch_size, len(model_outputs))
-        batches.append((start, model_outputs[start:end], references[start:end]))
+        batches.append((start, questions[start:end], model_outputs[start:end], references[start:end]))
 
     ordered_scores = [None] * len(batches)
 
@@ -487,12 +642,12 @@ def fa_evaluate(
         future_to_idx = {
             executor.submit(
                 compute_faithfulness_bailian,
+                batch_questions,
                 batch_outputs,
                 batch_references,
                 model_name,
-                True,
             ): idx
-            for idx, (_, batch_outputs, batch_references) in enumerate(batches)
+            for idx, (_, batch_questions, batch_outputs, batch_references) in enumerate(batches)
         }
 
         for future in as_completed(future_to_idx):

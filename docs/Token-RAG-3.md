@@ -7034,4 +7034,27 @@ python /mnt/n0/PathWeaver/docs/scripts/embedding_v2.py \
   --progress
 ````
 
-t
+# QwenLong+MultiGPUTraining
+
+accelerate FSDP: 多卡训练，把参数、梯度和优化器状态分片，避免单卡爆显存
+
+
+````bash
+cd /mnt/n0/PathWeaver
+PYTHONPATH=/mnt/n0/PathWeaver/src:/mnt/n0/PathWeaver/experiments \
+accelerate launch experiments/train_qwenlong_dag.py \
+  --dataset_type dag \
+  --llm_type qwen_moe \
+  --hf_model_spec Tongyi-Zhiwen/QwenLong-L1.5-30B-A3B \
+  --train_data_path /path/to/train.jsonl \
+  --train_precomputed_embed_keys_path /path/to/key.npy \
+  --train_precomputed_embed_values_path /path/to/value.npy \
+  --base_embeder_path /path/to/base_embedder \
+  --B 1 \
+  --gradient_accm_step 8 \
+  --total_steps 10 \
+  --save_period 10 \
+  --model_save_dir /path/to/output
+
+
+````

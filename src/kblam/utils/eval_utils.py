@@ -170,6 +170,22 @@ model_prune_format_mapping = {
 }
 
 
+def _is_qwen_family_model(model) -> bool:
+    return getattr(model.config, "model_type", None) in {"qwen3", "qwen3_moe"}
+
+
+def _get_model_input_device(model) -> torch.device:
+    if hasattr(model, "get_input_embeddings"):
+        try:
+            return model.get_input_embeddings().weight.device
+        except Exception:
+            pass
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def answer_question(
     tokenizer: transformers.PreTrainedTokenizer,
     model: KBLaMPhi3ForCausalLM | KblamLlamaForCausalLM,
@@ -180,9 +196,11 @@ def answer_question(
     save_attention_weights: bool = False,
     attention_file_base_name: Optional[str] = None,
 ):
-    if getattr(model.config, "model_type", None) == "qwen3":
+    model_device = _get_model_input_device(model)
+
+    if _is_qwen_family_model(model):
         input_str = format_Q_qwen3(Q, tokenizer)
-        tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+        tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to(model_device)
         outputs = model.generate(
             input_ids=tokenizer_output["input_ids"],
             attention_mask=tokenizer_output["attention_mask"],
@@ -205,7 +223,7 @@ def answer_question(
     for m in model_question_format_mapping:
         if isinstance(model, m):
             input_str = model_question_format_mapping[m](Q)
-    tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to("cuda")
+    tokenizer_output = tokenizer(input_str, return_tensors="pt", padding=True).to(model_device)
     input_ids, attention_masks = (
         tokenizer_output["input_ids"],
         tokenizer_output["attention_mask"],
@@ -495,7 +513,7 @@ def answer_question_deterministic(
     attention_file_base_name: Optional[str] = None,
     save_attn_weights_policy: str = "prefill-all-layer",
 ):
-    device = next(model.parameters()).device
+    device = _get_model_input_device(model)
 
     def _update_trace_prompt_metadata(prompt_text: str, input_ids: torch.Tensor) -> None:
         if not is_path_attn_trace_enabled():
@@ -543,7 +561,7 @@ def answer_question_deterministic(
 
         return answer
 
-    if getattr(model.config, "model_type", None) == "qwen3":
+    if _is_qwen_family_model(model):
         prompt = format_QA_qwen3(Q, None, tokenizer)
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         _update_trace_prompt_metadata(prompt, inputs.input_ids)
