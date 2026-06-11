@@ -178,6 +178,19 @@ def _summarize_lmcache_breakdown_records(records: List[Dict[str, Any]]) -> Dict[
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Llama RAG with MuSiQue (TTFT & TPOT)')
+    dataset_type_aliases = {
+        "2wiki": "2wikimultihopqa",
+        "hotpot": "hotpotqa",
+    }
+    dataset_type_choices = (
+        "musique",
+        "squad",
+        "hotpotqa",
+        "hotpot",
+        "2wikimultihopqa",
+        "2wiki",
+        "mintqa",
+    )
     # 数据集参数（建议直接给到 jsonl 路径）
     parser.add_argument('--dataset-path', type=str,
                         default='/mnt/n0/datasets/MuSiQue/musique_ans_v1.0_dev.jsonl',
@@ -190,8 +203,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=None,
                         help='随机抽样种子；默认 None 表示按原顺序取前 N 条，否则按 seed 随机选择样本')
     parser.add_argument('--dataset-type', type=str, default='musique',
-                        choices=('musique', 'squad', 'hotpotqa', '2wikimultihopqa', 'mintqa'),
-                        help='数据集类型（musique/squad/hotpotqa/2wikimultihopqa/mintqa）')
+                        choices=dataset_type_choices,
+                        help='数据集类型（musique/squad/hotpotqa|hotpot/2wikimultihopqa|2wiki/mintqa）')
 
     # 数据集处理
     parser.add_argument('--mintqa_min_hop', type=int, default=None, help='MintQA 最小跳数')
@@ -208,6 +221,10 @@ def parse_args():
                         help='vLLM max model length')
     parser.add_argument('--max-output-len', type=int, default=16,
                         help='vLLM max output length')
+    parser.add_argument('--enable-chunked-prefill', action='store_true',
+                        help='显式启用 vLLM chunked prefill；默认在 LMCache 模式下关闭以避免长上下文只部分复用')
+    parser.add_argument('--max-num-batched-tokens', type=int, default=None,
+                        help='vLLM scheduler token budget；默认在 LMCache 模式下跟随 max-model-len')
 
     # 检索参数
     parser.add_argument('--similarity-top-k', type=int, default=5, help='相似度检索 Top-K')
@@ -242,11 +259,12 @@ def parse_args():
     parser.add_argument('--blend-check-layers', type=str, default='1',
                         help='LMCache blending check layers, comma-separated (e.g. "1" or "1,2,3")')
     parser.add_argument('--lmcache-warmup-mode', type=str, default='chunk', choices=('chunk', 'full', 'reuse'),
-                        help='LMCache warmup mode: chunk keeps current segment warmup; full warms a synthetic full prompt with shuffled chunks; reuse warms the exact same prompt')
+                        help='LMCache warmup mode: chunk keeps current segment warmup; full warms the exact same prompt; reuse warms a synthetic full prompt with shuffled chunks')
 
 
 
     args = parser.parse_args()
+    args.dataset_type = dataset_type_aliases.get(args.dataset_type, args.dataset_type)
 
     return args
 
@@ -885,6 +903,13 @@ def _generate_with_lmcache_segments(
             label=f"{label} shareable prefix",
         )
     elif args.lmcache_warmup_mode == "full":
+        _warmup_reuse_prompt(
+            args,
+            llm,
+            prompt_token_ids,
+            label=f"{label} exact full prompt",
+        )
+    elif args.lmcache_warmup_mode == "reuse":
         _warmup_full_prompt(
             args,
             llm,
@@ -894,13 +919,6 @@ def _generate_with_lmcache_segments(
             prompt_suffix,
             question,
             label=f"{label} synthetic full prompt",
-        )
-    elif args.lmcache_warmup_mode == "reuse":
-        _warmup_reuse_prompt(
-            args,
-            llm,
-            prompt_token_ids,
-            label=f"{label} exact full prompt",
         )
     else:
         raise ValueError(f"Unsupported LMCache warmup mode: {args.lmcache_warmup_mode}")
@@ -980,11 +998,36 @@ def setup_models(args):
     prompt_tokenizer: Optional[AutoTokenizer] = None
     model_type = _get_model_type(args.model_path)
     is_qwen_family = model_type in {"qwen3", "qwen3_moe"} or _is_qwen_model(args.model_path)
+    lmcache_scheduler_kwargs = {}
+    if args.use_lmcache:
+        # vLLM V1 enables chunked prefill for long-context offline inference by
+        # default. In practice this can fragment a single long prefill request
+        # into ~8k-token scheduling windows, which makes LMCache reuse appear
+        # to stop after the first window for exact same-prompt reruns.
+        #
+        # We disable chunked prefill by default for LMCache experiments and set
+        # the scheduler token budget to the full prompt length so one request is
+        # prefetched as a whole. This matches the connector's own warning and
+        # restores the expected "exact prompt reuse" behavior on long contexts.
+        max_num_batched_tokens = args.max_num_batched_tokens or args.max_model_len
+        lmcache_scheduler_kwargs = {
+            "enable_chunked_prefill": args.enable_chunked_prefill,
+            "max_num_batched_tokens": max_num_batched_tokens,
+            "max_seq_len_to_capture": max_num_batched_tokens,
+        }
+        print(
+            "LMCache scheduler config: "
+            f"enable_chunked_prefill={lmcache_scheduler_kwargs['enable_chunked_prefill']}, "
+            f"max_num_batched_tokens={lmcache_scheduler_kwargs['max_num_batched_tokens']}, "
+            f"max_seq_len_to_capture={lmcache_scheduler_kwargs['max_seq_len_to_capture']}"
+        )
+
     base_llm_kwargs = {
         "model": args.model_path,
         "enforce_eager": True,
         "disable_log_stats": False,
         "enable_prefix_caching": False,
+        **lmcache_scheduler_kwargs,
     }
     if args.use_lmcache:
         base_llm_kwargs["kv_transfer_config"] = KVTransferConfig(

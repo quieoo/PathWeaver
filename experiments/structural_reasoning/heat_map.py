@@ -895,6 +895,29 @@ def _save_matrix_csv(
             f.write(",".join(_csv_escape(x) for x in row) + "\n")
 
 
+def _save_origin_heatmap_csv(
+    path: Path,
+    matrix: torch.Tensor,
+    *,
+    kv_labels: Sequence[str],
+    row_labels: Sequence[str],
+    row_label_name: str,
+) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        header = ["Attention"]
+        for row_idx in range(matrix.shape[0]):
+            row_label = row_labels[row_idx] if row_idx < len(row_labels) else f"{row_label_name}_{row_idx}"
+            header.append(str(row_label))
+        f.write(",".join(_csv_escape(x) for x in header) + "\n")
+
+        for kv_idx in range(matrix.shape[1]):
+            kv_label = kv_labels[kv_idx] if kv_idx < len(kv_labels) else f"KV{kv_idx}"
+            row = [kv_label]
+            for row_idx in range(matrix.shape[0]):
+                row.append(f"{float(matrix[row_idx, kv_idx].item()):.8f}")
+            f.write(",".join(_csv_escape(x) for x in row) + "\n")
+
+
 def _csv_escape(x: Any) -> str:
     s = str(x)
     if "," in s or '"' in s or "\n" in s:
@@ -902,33 +925,33 @@ def _csv_escape(x: Any) -> str:
     return s
 
 
-def _draw_heatmap_pair(
-    before: torch.Tensor,
-    after: torch.Tensor,
+def _draw_single_heatmap(
+    matrix: torch.Tensor,
     *,
     row_labels: Sequence[str],
     kv_labels: Sequence[str],
-    title_prefix: str,
+    title: str,
     save_path: Path,
     cmap: str,
     y_axis_label: str,
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(kv_labels) * 0.45), max(6, len(row_labels) * 0.28)), constrained_layout=True)
+    fig, ax = plt.subplots(
+        1,
+        1,
+        figsize=(max(12, len(kv_labels) * 0.45), max(6, len(row_labels) * 0.28)),
+        constrained_layout=True,
+    )
 
-    vmax = float(max(before.max().item(), after.max().item(), 1e-12))
-    titles = [f"{title_prefix} - Before", f"{title_prefix} - After"]
-    matrices = [before, after]
-
-    for ax, matrix, title in zip(axes, matrices, titles):
-        im = ax.imshow(matrix.numpy(), aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=vmax)
-        ax.set_title(title)
-        ax.set_xlabel("KB tokens")
-        ax.set_ylabel(y_axis_label)
-        ax.set_xticks(range(len(kv_labels)))
-        ax.set_xticklabels(kv_labels, rotation=90, fontsize=8)
-        ax.set_yticks(range(len(row_labels)))
-        ax.set_yticklabels(row_labels, fontsize=8)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    vmax = float(max(matrix.max().item(), 1e-12))
+    im = ax.imshow(matrix.numpy(), aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("KB tokens")
+    ax.set_ylabel(y_axis_label)
+    ax.set_xticks(range(len(kv_labels)))
+    ax.set_xticklabels(kv_labels, rotation=90, fontsize=8)
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels, fontsize=8)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
@@ -1057,6 +1080,8 @@ def render_heatmaps(
     answer_topk: Sequence[int],
     layer_keep_last_fraction: float,
     enable_sample_details: bool,
+    figure_format: str,
+    export_mode: str,
 ) -> None:
     records, payload_meta = _load_trace(trace_path)
     dataset = _load_dataset(dataset_path)
@@ -1243,37 +1268,63 @@ def render_heatmaps(
         if enable_sample_details and sample_dir is not None:
             suffix = f"_{pass_mode}"
             effective_y_axis_mode = y_axis_mode if pass_mode == "prefill" else "step"
-            _draw_heatmap_pair(
-                before,
-                after,
-                row_labels=row_labels,
-                kv_labels=kv_labels,
-                title_prefix=f"{_sample_title(sample_id, selected_layer_idx, attn_kind)} [{pass_mode}]",
-                save_path=sample_dir / f"attention_before_after_{effective_y_axis_mode}{suffix}.png",
-                cmap=cmap,
-                y_axis_label=y_axis_label,
-            )
-            _save_matrix_csv(
-                sample_dir / f"attention_before_{effective_y_axis_mode}{suffix}.csv",
-                before,
-                kv_labels=kv_labels,
-                row_labels=row_labels,
-                row_label_name=row_label_name,
-            )
-            _save_matrix_csv(
-                sample_dir / f"attention_after_{effective_y_axis_mode}{suffix}.csv",
-                after,
-                kv_labels=kv_labels,
-                row_labels=row_labels,
-                row_label_name=row_label_name,
-            )
+            title_prefix = f"{_sample_title(sample_id, selected_layer_idx, attn_kind)} [{pass_mode}]"
+            if export_mode in {"default", "all"}:
+                _draw_single_heatmap(
+                    before,
+                    row_labels=row_labels,
+                    kv_labels=kv_labels,
+                    title=f"{title_prefix} - Before",
+                    save_path=sample_dir / f"attention_before_{effective_y_axis_mode}{suffix}.{figure_format}",
+                    cmap=cmap,
+                    y_axis_label=y_axis_label,
+                )
+                _draw_single_heatmap(
+                    after,
+                    row_labels=row_labels,
+                    kv_labels=kv_labels,
+                    title=f"{title_prefix} - After",
+                    save_path=sample_dir / f"attention_after_{effective_y_axis_mode}{suffix}.{figure_format}",
+                    cmap=cmap,
+                    y_axis_label=y_axis_label,
+                )
+                _save_matrix_csv(
+                    sample_dir / f"attention_before_{effective_y_axis_mode}{suffix}.csv",
+                    before,
+                    kv_labels=kv_labels,
+                    row_labels=row_labels,
+                    row_label_name=row_label_name,
+                )
+                _save_matrix_csv(
+                    sample_dir / f"attention_after_{effective_y_axis_mode}{suffix}.csv",
+                    after,
+                    kv_labels=kv_labels,
+                    row_labels=row_labels,
+                    row_label_name=row_label_name,
+                )
+            if export_mode in {"export-origin", "all"}:
+                _save_origin_heatmap_csv(
+                    sample_dir / f"origin_attention_before_{effective_y_axis_mode}{suffix}.csv",
+                    before,
+                    kv_labels=kv_labels,
+                    row_labels=row_labels,
+                    row_label_name=row_label_name,
+                )
+                _save_origin_heatmap_csv(
+                    sample_dir / f"origin_attention_after_{effective_y_axis_mode}{suffix}.csv",
+                    after,
+                    kv_labels=kv_labels,
+                    row_labels=row_labels,
+                    row_label_name=row_label_name,
+                )
             _write_kv_contents(sample_dir / "kv_contents.jsonl", kv_items)
-            _draw_dag_graph(
-                kv_items=kv_items,
-                edges=dag_edges,
-                save_path=sample_dir / "dag_graph.png",
-                title=f"sample={sample_id} DAG",
-            )
+            if export_mode in {"default", "all"}:
+                _draw_dag_graph(
+                    kv_items=kv_items,
+                    edges=dag_edges,
+                    save_path=sample_dir / f"dag_graph.{figure_format}",
+                    title=f"sample={sample_id} DAG",
+                )
 
             metadata = {
                 "sample_id": sample_id,
@@ -1295,6 +1346,7 @@ def render_heatmaps(
                 "context": _safe_scalar(context),
                 "payload_meta": payload_meta,
                 "question": question,
+                "export_mode": export_mode,
                 "answer_kv_stats": {
                     "before": before_answer_stats,
                     "after": after_answer_stats,
@@ -1456,6 +1508,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw", action="store_true", help="Use raw alpha_kb/beta_kb instead of KB-normalized tensors")
     parser.add_argument("--cmap", default="viridis", help="Matplotlib colormap for heatmaps")
     parser.add_argument(
+        "--figure-format",
+        choices=["png", "pdf"],
+        default="png",
+        help="Image format used for exported figures.",
+    )
+    parser.add_argument(
+        "--export-mode",
+        choices=["default", "export-origin", "all"],
+        default="default",
+        help="Export standard figures/CSVs, Origin-friendly long-table CSVs, or both.",
+    )
+    parser.add_argument(
         "--pass-mode",
         choices=["prefill", "both"],
         default="prefill",
@@ -1496,6 +1560,8 @@ def main() -> None:
         answer_topk=args.answer_topk,
         layer_keep_last_fraction=args.layer_keep_last_fraction,
         enable_sample_details=args.enable_sample_details,
+        figure_format=args.figure_format,
+        export_mode=args.export_mode,
     )
 
 

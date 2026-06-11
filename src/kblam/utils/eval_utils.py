@@ -38,6 +38,19 @@ QWEN3_SHORT_ANSWER_PROMPT = (
 )
 
 
+def strip_thinking_blocks(text: str) -> str:
+    text = str(text)
+    if not text:
+        return text
+
+    # Prefer the post-reasoning answer span if the model emitted a complete think block.
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+
+    text = re.sub(r"<think>.*?(?:</think>|$)", " ", text, flags=re.DOTALL)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _prune_for_llama(S: str) -> str:
     S = S.replace("<|eot_id|>", "")
     S = S.replace("<|start_header_id|>assistant<|end_header_id|>", "\n\n")
@@ -66,7 +79,7 @@ def _prune_for_qwen3(S: str) -> str:
     S = S.replace("<|im_start|>user", "")
     S = S.replace("<|im_start|>system", "")
     S = S.replace("<|endoftext|>", "")
-    return S
+    return strip_thinking_blocks(S)
 
 def softmax(x: np.array, axis: int) -> np.array:
     """Compute softmax values for each sets of scores in x."""
@@ -251,7 +264,7 @@ def answer_question(
     return pruned_output
 
 def format_output_for_synthetic(model_output: str) -> str:
-    text = str(model_output).strip()
+    text = strip_thinking_blocks(model_output).strip()
     if not text:
         return ""
 

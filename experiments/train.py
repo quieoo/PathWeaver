@@ -56,6 +56,7 @@ from kblam.utils.eval_utils import (
     format_QA_llama_short,
     format_QA_olmo3,
     format_QA_qwen3,
+    strip_thinking_blocks,
 )
 import re
 import shutil
@@ -380,6 +381,14 @@ def _create_labels_for_qwen3(
         "<|im_end|>",
         add_special_tokens=False,
     ).input_ids
+    think_start = tokenizer(
+        "<think>",
+        add_special_tokens=False,
+    ).input_ids
+    think_end = tokenizer(
+        "</think>",
+        add_special_tokens=False,
+    ).input_ids
     qwen_pad_id = tokenizer.pad_token_id
 
     for b in range(input_ids.size(0)):
@@ -408,6 +417,25 @@ def _create_labels_for_qwen3(
                 end_idx = len(seq)
 
         labels[b, start_idx:end_idx] = input_ids[b, start_idx:end_idx]
+
+        cursor = start_idx
+        while cursor < end_idx:
+            think_begin = None
+            for i in range(cursor, end_idx - len(think_start) + 1):
+                if seq[i : i + len(think_start)] == think_start:
+                    think_begin = i
+                    break
+            if think_begin is None:
+                break
+
+            think_finish = end_idx
+            for i in range(think_begin + len(think_start), end_idx - len(think_end) + 1):
+                if seq[i : i + len(think_end)] == think_end:
+                    think_finish = i + len(think_end)
+                    break
+
+            labels[b, think_begin:think_finish] = -100
+            cursor = think_finish
 
         if qwen_pad_id is not None:
             pad_positions = input_ids[b] == qwen_pad_id
@@ -1302,6 +1330,7 @@ class Trainer:
                 )
             else:
                 simple_score_dict = simple_evaluation(model_outputs, answers)
+                score = float(simple_score_dict.get("exact_match", 0.0))
                 self.logger.info(
                     f"------- Test dataset: {dataset_name}, num_samples: {len(dataset)}, "
                     f"scale_factor: {scale_factor}, Simple scores: {simple_score_dict}"
@@ -1556,6 +1585,8 @@ class Trainer:
                             sel_labels,
                             skip_special_tokens=False,
                         )
+                        decoded_pred = strip_thinking_blocks(decoded_pred)
+                        decoded_gt = strip_thinking_blocks(decoded_gt)
                         self.logger.info(f"KB SHAPE: {kb_embedding[0].shape}")
                         self.logger.info(f"GT: {decoded_gt}")
                         self.logger.info(f"PRED: {decoded_pred}")
