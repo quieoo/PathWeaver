@@ -1,114 +1,307 @@
-# KBLaM - Knowledge Base Augmented Language Models [ICLR 2025]
+# PathWeaver
 
-This repo contains the official implementation of [KBLaM: Knowledge Base Augmented Language Models](https://arxiv.org/abs/2410.10450).
+PathWeaver is a research codebase for path-aware knowledge injection and DAG-KV
+retrieval-augmented generation. It is built from KBLaM's knowledge-token
+training stack, and extends it with graph-structured knowledge units, path
+attention, multi-hop reasoning experiments, and multi-round knowledge-editable
+evaluation.
 
-Authors: Xi Wang, Liana Mikaelyan, Taketomo Isazawa, Mathew Salvaris, James Hensman.
+The repository still uses the Python package name `kblam`, but the active
+experiment workflow is PathWeaver:
 
-KBLaM is a new method for augmentating LLMs with external knowledge.
-Unlike Retrieval-Augmented Generation, KBLaM eliminates external
-retrieval modules, and unlike in-context learning, its computational overhead scales linearly with KB size rather than quadratically.
+- represent each sample as a DAG of key/value knowledge nodes;
+- precompute key/value embeddings offline and keep them row-aligned with the
+  dataset;
+- train adapters that convert embeddings into KB tokens injected into the LLM;
+- optionally enable path attention so graph edges can influence attention over
+  KB tokens;
+- evaluate generation quality, path-attention traces, DAG distractor settings,
+  and knowledge updates across rounds.
 
-## Supported Models
-The following models from Hugging Face hub are currently supported:
-    
-- [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
-- [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
-- [Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
+## Repository Layout
 
-To add support for new model types, you will need to update the model processing scripts to incorporate an adapter similar to `llama_model.py` in `src/kblam/models`.
+```text
+src/kblam/
+  kb_encoder.py                    # embedding-to-KB-token adapter
+  dag_kv_retriever.py              # DAG-KV dataset parser and retriever
+  kblam_attention/kblam_path.py    # path-attention propagation and tracing
+  models/                          # Llama, Phi, OLMo, Qwen model adapters
+  metrics_evaluator.py             # exact match, F1, ROUGE, faithfulness helpers
 
-## Setting up
+experiments/
+  train.py                         # main adapter training entrypoint
+  eval_generation.py               # generation/debug evaluation entrypoint
+  eval_generation_knowledge_editable.py
+                                   # round-0 baseline knowledge-editable eval
+  Knowledge_editable/              # multi-round edit dataset utilities
 
-Install the kblam package with
+docs/scripts/
+  embedding_v2.py                  # offline key/value embedding generation
+  graph_gen/                       # DAG construction and graph-RAG baselines
+  triple_gen/                      # triple extraction utilities
 
+docs/EXPs/
+  *.md                             # experiment notes and runnable command logs
+
+tests/
+  test_*.py                        # lightweight module and data tests
 ```
+
+For a broader source map, see `docs/codebase_overview.md`. For experiment
+commands, start from `docs/Startup.md` and `docs/EXPs/`.
+
+## Environment
+
+Python 3.10 or 3.11 is expected by `pyproject.toml`.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
-To use Llama models, you will need to generate a token from Hugging Face and use it to log in:
+Optional experiment dependencies can be installed with:
 
-```
-pip install huggingface_hub
-huggingface-cli login
-```
-
-The experiments in the paper can be replicated by running the scripts in `./experiments`.
-
-## Dataset Construction
-
-To run the synthetic dataset construction, you will need a valid Azure OpenAI endpoint.
-
-To construct a synthetic KB and question-answer pairs use `dataset_generation/gen_synthetic_data.py`
-
-The question-answer pairs are constructed in the form:
-
-```
-What is the description of {entity_name}?
-The description of {entity_name} is {description}.
+```bash
+pip install -e ".[experiment]"
 ```
 
-To generate KB embeddings, use `dataset_generation/generate_kb_embeddings.py`.
-The embeddings we current support are [text-embedding-ada-002](https://openai.com/index/new-and-improved-embedding-model/) and [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
+Most training and evaluation runs assume CUDA, local Hugging Face model
+directories, and precomputed embedding `.npy` files. Some data-generation and
+LLM-judge flows also require OpenAI-compatible or DashScope-compatible API
+credentials; keep those in environment variables rather than in committed
+commands.
 
-## Training
+## Data Contracts
 
-As an example of model training, see the following:
+PathWeaver supports several legacy dataset formats, but the current DAG-KV path
+uses `--dataset_type dag`. Each sample should contain a question/answer pair and
+a `dag` object:
 
+```json
+{
+  "id": "sample-id",
+  "question": "question text",
+  "answer": "gold answer",
+  "dag": {
+    "kv_nodes": [
+      {
+        "key": "the relation/property prompt",
+        "value": "knowledge value",
+        "score": 0.92
+      }
+    ],
+    "adj": [[0.0]]
+  }
+}
 ```
-python train.py --dataset_dir <Your dataset directory> --train_dataset synthetic --N 120000 --B 20 --total_steps 601  --encoder_spec OAI --use_oai_embd --key_embd_src key --use_data_aug --use_cached_embed
+
+Important invariant: precomputed key/value embeddings are aligned to the
+flattened `dag.kv_nodes` order over the full dataset. Do not physically filter,
+shuffle, or rewrite rows when reusing existing `.npy` files. If an experiment
+needs a subset, filter by sample IDs or query indices at inference time.
+
+For `DAGKVKBRetriever`, the total number of rows in both embedding files must
+equal `sum(len(sample["dag"]["kv_nodes"]) for sample in dataset)`. A mismatch is
+treated as an error because it means the dataset and embedding files no longer
+refer to the same nodes.
+
+## Generate Embeddings
+
+Use `docs/scripts/embedding_v2.py` after DAG construction or whenever the
+dataset's `dag.kv_nodes` change.
+
+```bash
+python docs/scripts/embedding_v2.py \
+  --model_name qwen3-embedding-0.6B \
+  --local_model_path /path/to/qwen-embedding-0.6B \
+  --dataset_type dag \
+  --dataset_path /path/to/round0_dag_aa.jsonl \
+  --batch_size 1024 \
+  --progress
 ```
 
-Note in particular the `--use_cached_embed` argument. This should be set to prevent recomputation of embeddings, which can take significant time especially when using APIs such as OpenAI's text embeddings.
-There are a number of optional arguments in `train.py` that you may want to consult.
+This writes files next to the dataset:
 
-## Contributing
+```text
+round0_dag_aa_qwen-embedding-0.6B_embd_key.npy
+round0_dag_aa_qwen-embedding-0.6B_embd_value.npy
+```
 
-This project welcomes contributions and suggestions. Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+The script also supports legacy formats such as `2wiki`, `all_triples`,
+`at2qa_2wiki`, `autoschemakg_2wiki`, `musique`, and `synthetic`.
 
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
+## Train
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+The main training entrypoint is `experiments/train.py`. A typical DAG-KV
+adapter training command looks like:
 
-## Trademarks
+```bash
+python experiments/train.py \
+  --seed 1 \
+  --B 5 \
+  --lr 5e-4 \
+  --use_lr_decay \
+  --gradient_accm_step 20 \
+  --dataset_type dag \
+  --sep_query_head \
+  --duplicate_true_kb \
+  --dynamic_kb_size 10 50 \
+  --outlier_num -999999 \
+  --kb_token_layer_frequency 3 \
+  --path_attn \
+  --encoder_spec qwen-embedding-0.6B \
+  --key_embd_src key \
+  --use_cached_embd \
+  --train_data_path /path/to/train_dag.jsonl \
+  --train_precomputed_embed_keys_path /path/to/train_embd_key.npy \
+  --train_precomputed_embed_values_path /path/to/train_embd_value.npy \
+  --test_data_path /path/to/dev_dag.jsonl \
+  --test_precomputed_embed_keys_path /path/to/dev_embd_key.npy \
+  --test_precomputed_embed_values_path /path/to/dev_embd_value.npy \
+  --hf_model_spec /path/to/base-llm \
+  --llm_type qwen3 \
+  --test_kb_size 10 \
+  --test_query_size 100 \
+  --test_kb_scale_factor 4 \
+  --eval_step 100 \
+  --total_steps 8000 \
+  --model_save_dir experiments/train/pathweaver_dag \
+  --base_embeder_path /path/to/qwen-embedding-0.6B
+```
 
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft
-trademarks or logos is subject to and must follow
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
+Common knobs:
 
-## FAQ
+- `--path_attn` enables graph/path-aware attention over KB tokens.
+- `--kb_token_layer_frequency` controls how often KB tokens are injected.
+- `--dynamic_kb_size MIN MAX` samples KB sizes during training.
+- `--use_cached_embd` uses offline `.npy` embeddings instead of recomputing
+  embeddings inside training.
+- `--sep_query_head` trains a separate query head when supported by the model
+  adapter.
 
-### What is KBLaM?
+## Evaluate Generation
 
-KBLaM is a method to enhance a transformer-based LLM to augment it with knowledge. It consists of a base LLM, and some adapters that we train to transform the knowledge base to special knowledge tokens that the LLM ingests. In particular, because we only train adapters over the knowledge part, the base LLM is completely unmodified with regards to text input. If given no knowledge base, the model outputs the exact same thing as the base model for any given input.
+Use `experiments/eval_generation.py generation` for normal generation
+evaluation:
 
-### What can KBLaM do?
+```bash
+python experiments/eval_generation.py generation \
+  --dataset_dir /path/to/datasets \
+  --test_dataset round0_dag_aa.jsonl \
+  --model_dir /path/to/checkpoint \
+  --encoder_dir /path/to/checkpoint_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /path/to/base-llm \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --precomputed_embed_keys_path /path/to/round0_embd_key.npy \
+  --precomputed_embed_values_path /path/to/round0_embd_value.npy \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --kb_scale_factor 4 \
+  --dag_kb_size 1 \
+  --save_dir experiments/gen_tmp
+```
 
-KBLaM can, in addition to the base LLM’s capabilities, also attend over the knowledge base to answer questions in a grounded manner.
+Useful evaluation flags:
 
-### What is/are KBLaM’s intended use(s)?
+- `--dag_kb_size N` concatenates multiple DAG samples into one inference KB for
+  distractor experiments (`1` means no extra DAG samples).
+- `--enable_trace --path_attn_trace_path trace.pt` dumps path-attention trace
+  records when path attention is enabled.
+- `--kb_scale_factor_range START END` sweeps multiplicative KB scaling factors.
+- `--full_eval` controls whether full ROUGE/F1/faithfulness evaluation is used.
 
-The model is intended to be used for research.
+The script reports exact match, F1 overlap, ROUGE, and faithfulness-style
+metrics depending on the selected evaluation mode and installed dependencies.
 
-### How was KBLaM evaluated? What metrics are used to measure performance?
+## Knowledge-Editable Evaluation
 
-KBLaM was evaluated on accuracy of retrieval from the knowledge base, its refusal rate (how often it correctly said that it didn’t have the requisite information to answer the question), and precision and recall on how well the answers aligned with the correct answers given the knowledge base.
+`experiments/eval_generation_knowledge_editable.py` wraps the legacy generation
+pipeline and adds fixed round-0 baseline metrics for multi-round edits.
 
-### What are the limitations of KBLaM? How can users minimize the impact of KBLaM’s limitations when using the system?
+The intended semantics are:
 
-When used with knowledge bases that are very different from the knowledge base it was trained on, KBLaM will give incomplete answers, and the answers can be reworded from the original value in the knowledge base or at times entirely incorrect. As a result, KBLaM is not currently intended for use as a complete system in a production setting, but is a research project that we are sharing.
+1. evaluate round 0 once;
+2. evaluate one or more target rounds;
+3. compare target-round correctness against the same round-0 baseline;
+4. decompose dropped baseline accuracy into stale-answer leakage and other
+   errors.
 
-### What operational factors and settings allow for effective and responsible use of KBLaM?
+Example:
 
-KBLaM with no knowledge base will perform the exact same as the base model. With a knowledge base, for effective use, one should make sure that the training dataset and the usecase have sufficiently similar knowledge bases
+```bash
+python experiments/eval_generation_knowledge_editable.py generation \
+  --dataset_dir /path/to/rounds \
+  --round0_test_dataset round0_dag_aa.jsonl \
+  --round0_precomputed_embed_keys_path /path/to/round0_embd_key.npy \
+  --round0_precomputed_embed_values_path /path/to/round0_embd_value.npy \
+  --target_datasets round1_dag_aa.jsonl round2_dag_aa.jsonl \
+  --target_precomputed_embed_keys_paths /path/to/round1_embd_key.npy /path/to/round2_embd_key.npy \
+  --target_precomputed_embed_values_paths /path/to/round1_embd_value.npy /path/to/round2_embd_value.npy \
+  --model_dir /path/to/checkpoint \
+  --encoder_dir /path/to/checkpoint_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_base_dir /path/to/base-llm \
+  --llm_type qwen3 \
+  --dataset_type dag \
+  --kb_layer_frequency 3 \
+  --kb_size 10 \
+  --query_size 100 \
+  --path_attn \
+  --kb_scale_factor 4 \
+  --use_id_intersection
+```
 
-### How do I provide feedback on KBLaM?
+`--use_id_intersection` evaluates only sample IDs present in round 0 and all
+target rounds, while preserving the original datasets and embedding row order.
 
-Please add issues to this repository to provide feedback on KBLaM.
+For a KV-only cumulative baseline, first materialize cumulative datasets:
+
+```bash
+python experiments/Knowledge_editable/build_kv_only_cumulative.py \
+  --main-round-files round0_dag_aa.jsonl round1_dag_aa.jsonl round2_dag_aa.jsonl \
+  --target-files round1_dag_aa.jsonl round2_dag_aa.jsonl
+```
+
+Then regenerate embeddings for the generated `*_kv_only_cumulative.jsonl`
+files and evaluate without `--path_attn`.
+
+## Baselines and Utilities
+
+- Vector RAG and graph RAG baselines live under `experiments/` and
+  `docs/scripts/graph_gen/`.
+- Triple extraction utilities are in `tools/` and `docs/scripts/triple_gen/`.
+- `experiments/msa.py` contains the MSA baseline workflow.
+- `experiments/parse_log.py`, `docs/scripts/parse_log_metrics.py`, and
+  `eval_acc.ipynb` are useful for log and metric inspection.
+
+## Development Checks
+
+Run lightweight tests with:
+
+```bash
+pytest tests
+```
+
+For script-only changes in an environment with missing optional packages, a
+static syntax check is often the quickest sanity check:
+
+```bash
+python -m py_compile experiments/eval_generation.py
+python -m py_compile experiments/eval_generation_knowledge_editable.py
+```
+
+## Project Notes
+
+This repository is derived from the KBLaM implementation:
+`KBLaM: Knowledge Base Augmented Language Models` (ICLR 2025). The original
+license is MIT; see `LICENSE`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, and
+`SUPPORT.md`.
+
+When adding new experiment variants, prefer small wrapper scripts or new
+standalone utilities over changing legacy entrypoints. This keeps old command
+logs reproducible while allowing PathWeaver-specific workflows to evolve.
