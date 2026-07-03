@@ -205,3 +205,4 @@ experiments/Knowledge_editable/editable_eval_results/
 experiments/Knowledge_editable/update_amp_*
 experiments/Knowledge_editable/editable_eval_results_kv_only/
 
+experiments/stores/

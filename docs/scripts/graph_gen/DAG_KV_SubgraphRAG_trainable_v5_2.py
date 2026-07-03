@@ -3548,11 +3548,6 @@ def main():
 
     args = ap.parse_args()
 
-    input_basename = os.path.basename(args.input)
-    if input_basename == '2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl' and not args.local_propogation:
-        args.local_propogation = True
-        print('[INFO] Auto-enabled --local_propogation for merged tripled 2wiki input.')
-
     print(args)
     samples = read_json_or_jsonl(args.input)
     if args.limit:

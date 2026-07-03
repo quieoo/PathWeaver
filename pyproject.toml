@@ -33,6 +33,7 @@ dependencies = [
 
     # ---- Retrieval / embeddings ----
     "sentence_transformers",
+    "hnswlib",
 
     # ---- Azure ML stack (unchanged) ----
     "azure-ai-ml",
