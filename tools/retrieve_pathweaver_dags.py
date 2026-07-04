@@ -183,6 +183,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subgraph-hops", type=int, default=2)
     parser.add_argument("--max-triples-per-seed", type=int, default=None)
     parser.add_argument("--search-backend", choices=["auto", "hnsw", "exact"], default="auto")
+    parser.add_argument("--seed-strategy", choices=["vector", "hybrid"], default="vector")
+    parser.add_argument("--mention-min-chars", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--answerable-only", action="store_true")
@@ -207,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-alpha", type=float, default=0.60)
     parser.add_argument("--end-beta", type=float, default=0.35)
     parser.add_argument("--end-gamma", type=float, default=0.25)
+    parser.add_argument("--selection-mode", choices=["legacy"], default="legacy")
+    parser.add_argument("--terminal-reranker", choices=["joint", "heuristic"], default="joint")
     return parser
 
 
@@ -248,6 +252,8 @@ def main() -> None:
         end_alpha=args.end_alpha,
         end_beta=args.end_beta,
         end_gamma=args.end_gamma,
+        selection_mode=args.selection_mode,
+        terminal_reranker=args.terminal_reranker,
     )
     extractor = TrainableDAGExtractor(
         args.dag_script,
@@ -256,6 +262,7 @@ def main() -> None:
         config=config,
         cpu=args.cpu,
     )
+    print(f"DAG extractor backend: {extractor.backend}")
     with DAGKVStoreRetriever(
         args.store_dir,
         embedder,
@@ -264,6 +271,8 @@ def main() -> None:
         max_triples_per_seed=args.max_triples_per_seed,
         search_backend=args.search_backend,
         query_prompt_name=args.query_prompt_name,
+        seed_strategy=args.seed_strategy,
+        mention_min_chars=args.mention_min_chars,
     ) as retriever:
         output = retrieve_rows(
             rows,

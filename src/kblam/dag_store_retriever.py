@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import sys
 from argparse import Namespace
@@ -14,6 +15,7 @@ from typing import Any, Protocol, Sequence
 import numpy as np
 
 from kblam.stores import GraphStore, GraphTriple, KVStore
+from kblam.stores.common import canonical_entity_key
 
 
 class TextEmbedder(Protocol):
@@ -25,6 +27,7 @@ class EntityHit:
     node_id: int
     name: str
     score: float
+    source: str = "vector"
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,12 @@ class CandidateGraph:
     def metadata(self) -> dict[str, Any]:
         return {
             "entity_hits": [
-                {"node_id": hit.node_id, "name": hit.name, "score": hit.score}
+                {
+                    "node_id": hit.node_id,
+                    "name": hit.name,
+                    "score": hit.score,
+                    "source": hit.source,
+                }
                 for hit in self.entity_hits
             ],
             "subgraph_nodes": len(self.node_ids),
@@ -48,7 +56,7 @@ class CandidateGraph:
 
 @dataclass(frozen=True)
 class DAGExtractionConfig:
-    """Arguments consumed by the trainable v5.2 DAG inference functions."""
+    """Common arguments consumed by the compatible DAG inference backends."""
 
     infer_batch_size: int = 1024
     topic_top_k: int = 8
@@ -69,6 +77,13 @@ class DAGExtractionConfig:
     end_beta: float = 0.35
     end_gamma: float = 0.25
     supporting_only: bool = False
+    embedding_batch_size: int | None = None
+    feature_batch_size: int = 4096
+    selection_mode: str = "legacy"
+    terminal_reranker: str = "joint"
+    terminal_end_weight: float = 0.35
+    terminal_path_weight: float = 0.25
+    terminal_value_weight: float = 0.20
 
     def as_namespace(self) -> Namespace:
         return Namespace(
@@ -91,6 +106,8 @@ class DAGKVStoreRetriever:
         max_triples_per_seed: int | None = None,
         search_backend: str = "auto",
         query_prompt_name: str | None = None,
+        seed_strategy: str = "vector",
+        mention_min_chars: int = 8,
     ) -> None:
         if entity_top_k <= 0:
             raise ValueError("entity_top_k must be positive")
@@ -98,6 +115,10 @@ class DAGKVStoreRetriever:
             raise ValueError("subgraph_hops must be non-negative")
         if max_triples_per_seed is not None and max_triples_per_seed <= 0:
             raise ValueError("max_triples_per_seed must be positive when provided")
+        if seed_strategy not in {"vector", "hybrid"}:
+            raise ValueError("seed_strategy must be 'vector' or 'hybrid'")
+        if mention_min_chars <= 0:
+            raise ValueError("mention_min_chars must be positive")
 
         root = Path(store_dir)
         self.graph_store = GraphStore(root / "graph", create=False)
@@ -108,6 +129,9 @@ class DAGKVStoreRetriever:
         self.max_triples_per_seed = max_triples_per_seed
         self.search_backend = search_backend
         self.query_prompt_name = query_prompt_name
+        self.seed_strategy = seed_strategy
+        self.mention_min_chars = mention_min_chars
+        self._entity_names = self.graph_store.entity_nodes() if seed_strategy == "hybrid" else []
 
     def __enter__(self) -> "DAGKVStoreRetriever":
         return self
@@ -126,7 +150,10 @@ class DAGKVStoreRetriever:
         if not queries:
             return []
         vectors = self._encode_queries(queries)
-        return self.retrieve_embeddings(vectors)
+        return [
+            self._retrieve_from_vector(vector, query=str(query))
+            for vector, query in zip(vectors, queries)
+        ]
 
     def retrieve_embeddings(self, embeddings: np.ndarray) -> list[CandidateGraph]:
         vectors = np.asarray(embeddings, dtype=np.float32)
@@ -144,6 +171,10 @@ class DAGKVStoreRetriever:
     ) -> dict[str, Any]:
         """Replace only the extractor's triple input; callers retain the original row."""
         prepared = dict(sample)
+        # Some datasets retain triples inside context. The online extractor must
+        # consume only the subgraph recovered from GraphStore, not those gold-row
+        # leftovers. The original row is restored after extraction by the caller.
+        prepared["context"] = []
         prepared["triple_list"] = [self._triple_to_raw(triple) for triple in candidate.triples]
         return prepared
 
@@ -162,15 +193,18 @@ class DAGKVStoreRetriever:
             raise ValueError("Embedder output must be a 2-D array aligned with queries")
         return vectors
 
-    def _retrieve_from_vector(self, query_vector: np.ndarray) -> CandidateGraph:
-        hits = tuple(
-            EntityHit(node_id=node_id, name=self.graph_store.get_node_name(node_id), score=score)
+    def _retrieve_from_vector(
+        self,
+        query_vector: np.ndarray,
+        query: str | None = None,
+    ) -> CandidateGraph:
+        vector_hits = [
+            EntityHit(node_id, self.graph_store.get_node_name(node_id), score)
             for node_id, score in self.graph_store.search_entities(
-                query_vector,
-                top_k=self.entity_top_k,
-                backend=self.search_backend,
+                query_vector, top_k=self.entity_top_k, backend=self.search_backend
             )
-        )
+        ]
+        hits = tuple(self._merge_entity_hits(query, vector_hits))
         node_ids: set[int] = set()
         triples: dict[int, GraphTriple] = {}
 
@@ -191,6 +225,34 @@ class DAGKVStoreRetriever:
             triples=tuple(triples[triple_id] for triple_id in sorted(triples)),
         )
 
+    def _merge_entity_hits(
+        self,
+        query: str | None,
+        vector_hits: list[EntityHit],
+    ) -> list[EntityHit]:
+        if self.seed_strategy == "vector" or not query:
+            return vector_hits
+
+        query_key = f" {canonical_entity_key(query)} "
+        mentions = []
+        for node_id, name in self._entity_names:
+            name_key = canonical_entity_key(name)
+            if len(name_key) < self.mention_min_chars or f" {name_key} " not in query_key:
+                continue
+            mentions.append((len(name_key), EntityHit(node_id, name, 1.0, "mention")))
+        mentions.sort(key=lambda item: (-item[0], item[1].node_id))
+
+        merged: list[EntityHit] = []
+        seen: set[int] = set()
+        for hit in [item[1] for item in mentions] + vector_hits:
+            if hit.node_id in seen:
+                continue
+            seen.add(hit.node_id)
+            merged.append(hit)
+            if len(merged) == self.entity_top_k:
+                break
+        return merged
+
     def _triple_to_raw(self, triple: GraphTriple) -> dict[str, Any]:
         records = self.kv_store.get_many(triple.kv_offsets)
         return {
@@ -200,14 +262,18 @@ class DAGKVStoreRetriever:
             "description": triple.object,
             "title": triple.title,
             "kv_lists": [
-                {"key_string": record.key_text, "value_string": record.value_text}
+                {
+                    "key_string": record.key_text,
+                    "value_string": record.value_text,
+                    "kv_offset": record.offset,
+                }
                 for record in records
             ],
         }
 
 
 class TrainableDAGExtractor:
-    """Thin adapter around the existing v5.2 trainable DAG implementation."""
+    """Adapter for legacy v5.2 and standalone answer-blind v8 inference."""
 
     def __init__(
         self,
@@ -221,13 +287,35 @@ class TrainableDAGExtractor:
         self.module = load_dag_module(script_path)
         self.embedder = embedder
         self.config = config or DAGExtractionConfig()
-        self.edge_model, self.node_model, self.checkpoint, self.device = self.module.load_model(
+        if hasattr(self.module, "load_models") and hasattr(self.module, "infer"):
+            self.backend = "v8-answer-blind"
+            loader = self.module.load_models
+        elif hasattr(self.module, "load_model") and hasattr(self.module, "create_dag_with_model"):
+            self.backend = "v5.2-legacy"
+            loader = self.module.load_model
+        else:
+            raise TypeError(
+                "Unsupported DAG script: expected load_models()+infer() or "
+                "load_model()+create_dag_with_model()"
+            )
+        self.edge_model, self.node_model, self.checkpoint, self.device = loader(
             str(model_checkpoint), cpu=cpu
         )
 
     def extract(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        args = self.config.as_namespace()
+        if self.backend == "v8-answer-blind":
+            return self.module.infer(
+                args,
+                samples,
+                self.embedder,
+                self.edge_model,
+                self.node_model,
+                self.checkpoint,
+                self.device,
+            )
         output, _, _ = self.module.create_dag_with_model(
-            self.config.as_namespace(),
+            args,
             samples,
             self.embedder,
             self.edge_model,
@@ -237,13 +325,13 @@ class TrainableDAGExtractor:
         )
         return output
 
-
 def load_dag_module(script_path: str | Path) -> ModuleType:
     """Load the research script without copying its evolving DAG algorithm."""
     path = Path(script_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
-    module_name = "_pathweaver_trainable_dag_v5_2"
+    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:10]
+    module_name = f"_pathweaver_dag_{path.stem}_{digest}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load DAG module from {path}")

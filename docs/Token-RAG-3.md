@@ -3847,7 +3847,7 @@ nohup python experiments/train.py \
 ```bash
 conda activate kblam-rag
 export CUDA_VISIBLE_DEVICES=2
-export DASHSCOPE_API_KEY=sk-459cec30805e4538ac2c086a65d32b16
+export DASHSCOPE_API_KEY=sk-xx
 
 python experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/  --n-samples 100  --similarity-top-k 16 --without-knowledge --dis_out_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_dev_without_knowledge.json
 
@@ -3962,7 +3962,7 @@ baseline重跑v1数据集：
 ```bash
 conda activate kblam-rag
 export CUDA_VISIBLE_DEVICES=2
-export DASHSCOPE_API_KEY=sk-459cec30805e4538ac2c086a65d32b16
+export DASHSCOPE_API_KEY=sk-xx
 
 # wo knowledge
 python experiments/vector_rag.py  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/source_data/hotpot_clean/hotpot_dev_v1.json     --dataset-type 2wiki     --model-path /home/sdu/zhu/models/llama3_8B_instruct     --embedding-model /home/sdu/zhu/models/bge-en-v1.5/  --n-samples 100  --similarity-top-k 16 --without-knowledge
@@ -4332,7 +4332,7 @@ nohup python experiments/train.py \
 
 ```bash
 export CUDA_VISIBLE_DEVICES=1
-export DASHSCOPE_API_KEY=sk-459cec30805e4538ac2c086a65d32b16
+export DASHSCOPE_API_KEY=sk-xx
 
 python experiments/eval_generation.py generation \
     --kb_size=10 \

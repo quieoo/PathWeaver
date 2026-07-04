@@ -77,8 +77,89 @@ Sink relevance rank stats (merged across final sink counts):
 }
 ```
 
+## 在线检索
+
+当前最优配置为 top-1 / 2-hop、hybrid entity seed、heuristic terminal reranker
+和 `max_sinks=3`。下面的命令在数据集前 100 条样本上同时执行实体检索、局部图
+恢复、V8 answer-blind DAG 提取、KVStore 读取、KBEncoder 和 Qwen3-14B 推理：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+source /mnt/n0/uv_envs/kblam/bin/activate
+cd /mnt/n0/PathWeaver
+
+DATA_DIR=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set
+MODEL_DIR=/mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800
+ENCODER=/mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800_encoder/encoder.pt
+
+python experiments/eval_generation_dag_kv.py \
+  --data_path "$DATA_DIR/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl" \
+  --model_path "$MODEL_DIR" \
+  --encoder_path "$ENCODER" \
+  --encoder_spec qwen-embedding-0.6B \
+  --base_model_name_or_path /mnt/n0/models/qwen3-14B-Instruct \
+  --llm_type qwen3 \
+  --kb_layer_frequency 3 \
+  --kb_scale_factor 4 \
+  --path_attn \
+  --path_attn_mix_ratio 0.8 \
+  --step 7999 \
+  --t_step 8000 \
+  --max_samples 100 \
+  --seed 0 \
+  --eval_batch_size 10 \
+  --online_store_dir experiments/stores/2wiki-dev-v5 \
+  --online_dag_script docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py \
+  --online_dag_model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --online_st_model /mnt/n0/models/bge-en-v1.5/ \
+  --online_entity_top_k 1 \
+  --online_subgraph_hops 2 \
+  --online_search_backend hnsw \
+  --online_seed_strategy hybrid \
+  --online_mention_min_chars 8 \
+  --online_infer_batch_size 1024 \
+  --online_topic_top_k 8 \
+  --online_dde_hops 3 \
+  --online_mention_bonus 0.2 \
+  --online_seed_edge_topk 18 \
+  --online_expansion_hops 2 \
+  --online_per_src_cap 3 \
+  --online_max_nodes 30 \
+  --online_max_edges 40 \
+  --online_max_sinks 3 \
+  --online_reverse_sink_edge_topk 2 \
+  --online_reverse_sink_hops 4 \
+  --online_reverse_sink_beam_width 4 \
+  --online_selection_mode legacy \
+  --online_terminal_reranker heuristic \
+  --save_json experiments/results/online_dag_eval/online_store_v8_hybrid_top1_hop2_sink3_heuristic_100.json
+```
+
+实测结果（GPU 0，本地 EM/F1/ROUGE，不调用外部 LLM judge）：
+
+```text
+EM:                         0.4400
+F1-overlap:                 0.5925
+ROUGE-L:                    0.6118
+Model TTFT:                 81.26 ms
+Online retrieval:           80.18 ms
+End-to-end TTFT:           161.44 ms
+Average request latency:   431.85 ms
+QPS:                         2.316
+
+Retrieval breakdown:
+  entity + candidate graph: 22.09 ms
+  V8 DAG extraction:        57.14 ms
+  KV read + projection:      0.90 ms
+```
+
+结果保存于
+`experiments/results/online_dag_eval/online_store_v8_hybrid_top1_hop2_sink3_heuristic_100.json`。
+去掉 `--max_samples 100` 即可评测完整输入文件。更详细的精度差距分析和消融结果见
+本文“在线精度差距分析与修复”一节。
+
 # KVStore 与 GraphStore
-、
+
 第一版 Store 实现采用本地、可增量追加的知识管理方案：
 
 - `KVStore` 为每个唯一的 key/value 对分配稳定的、从 0 开始的 offset。
@@ -357,69 +438,56 @@ seed，默认是 1；后者保留原 DAG 提取器的含义，在已经恢复的
 逻辑已经移除。现在旧脚本和新工具都只在显式传入该参数时进入完整图无环导出路径；
 普通 `--mode infer` 会真正加载并调用模型 checkpoint。
 
-## 实体 Top-K 与子图 Hop 扫描
+## Answer-Blind V8 DAG Retriever
 
-使用 2Wiki dev 的 237 个问题扫描 `entity_top_k={1,2,4,8}` 和
-`subgraph_hops={1,2,3}`：
+V5.2 即使没有启用 `--answer-aware`，terminal KV 限额仍会保护与标准答案匹配的
+边，因此不满足真实在线查询的要求。V8 inference-only 实现不读取 `answer` 或
+`supporting_facts`，但保持原 checkpoint 的特征维度、边打分和节点打分兼容。
 
-```bash
-/mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_retrieval.py \
-  --input "$DATA_DIR/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl" \
-  --store-dir experiments/stores/2wiki-dev-v5 \
-  --st-model /mnt/n0/models/bge-en-v1.5/ \
-  --entity-top-k-values 1,2,4,8 \
-  --subgraph-hop-values 1,2,3 \
-  --search-backend hnsw \
-  --query-batch-size 128 \
-  --warmup-queries 10 \
-  --output experiments/stores/2wiki-dev-v5/retrieval_sweep.json
+实现文件：
+
+```text
+docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py
 ```
 
-测试使用 `/mnt/n0/uv_envs/kblam` 中的 `hnswlib`。每组参数先预热 10 个 query，
-下表采用第二次完整运行的数据；两次运行的答案命中数和候选图规模完全一致。
-候选图 recall 表示在 DAG 剪枝之前，候选 KV 的 value 是否包含标准答案。
-延迟包含 HNSW 查询、GraphStore 扩展和 KVStore 文本回读，不包含 query embedding
-和后续 MLP DAG 提取。
+`TrainableDAGExtractor` 根据脚本接口选择后端：V5.2 使用 `load_model()` 和
+`create_dag_with_model()`，V8 使用 `load_models()` 和 `infer()`。在线模式强制要求
+V8 后端，并只向 DAG Retriever 传递 `question` 与 GraphStore 恢复的三元组。
 
-| Entity top-k | Hops | Answer recall | 节点 mean/p95 | 三元组 mean/p95 | KV mean/p95 | 延迟 mean/p95/p99 (ms) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 7.59% | 9.2 / 18.0 | 9.2 / 17.2 | 18.5 / 36.0 | 0.89 / 1.26 / 1.55 |
-| 1 | 2 | 88.61% | 21.9 / 37.0 | 24.5 / 43.0 | 49.2 / 86.0 | 1.74 / 2.68 / 3.33 |
-| 1 | 3 | 93.25% | 39.0 / 104.2 | 45.5 / 115.4 | 91.2 / 230.8 | 2.86 / 6.15 / 10.62 |
-| 2 | 1 | 23.63% | 13.4 / 26.0 | 13.5 / 30.2 | 27.3 / 60.4 | 1.12 / 1.83 / 2.18 |
-| 2 | 2 | 91.14% | 32.9 / 56.2 | 36.8 / 66.0 | 73.9 / 132.0 | 2.55 / 4.08 / 4.62 |
-| 2 | 3 | 94.51% | 59.1 / 129.8 | 68.9 / 159.0 | 138.0 / 318.0 | 4.51 / 9.18 / 13.40 |
-| 4 | 1 | 35.86% | 21.3 / 42.0 | 21.1 / 43.0 | 42.5 / 86.0 | 1.51 / 2.42 / 2.77 |
-| 4 | 2 | 92.41% | 56.1 / 97.0 | 62.9 / 109.4 | 126.0 / 218.8 | 4.19 / 6.55 / 7.17 |
-| 4 | 3 | 94.94% | 102.5 / 191.8 | 120.6 / 230.0 | 241.6 / 460.0 | 8.03 / 14.70 / 19.09 |
-| 8 | 1 | 44.30% | 37.6 / 65.2 | 36.8 / 69.6 | 73.8 / 139.2 | 2.27 / 3.65 / 4.35 |
-| 8 | 2 | 94.09% | 101.9 / 151.2 | 114.7 / 174.2 | 229.7 / 348.4 | 8.06 / 11.04 / 13.15 |
-| 8 | 3 | 95.78% | 184.7 / 313.0 | 219.2 / 382.4 | 439.0 / 764.8 | 15.00 / 25.22 / 30.11 |
+候选样本会清空原始 `context`，避免数据集内残留三元组绕过在线 GraphStore。
+V8 导出的每个 KV node 携带 `kv_offset`，后续可以直接读取 KVStore tensor。
 
-Query embedding 在 CPU 上以 batch size 128 编码，总计约 2.16 秒，摊销约
-9.09 ms/query。该时间对所有参数组合相同，因此没有计入表中的 retrieval latency。
-真实单请求 embedding 延迟不能直接用此批处理摊销值代替。
+在相同的 2Wiki store 候选图上，V8 与 V5.2 NAA 的 223/237 张 DAG 结构完全一致，
+macro KV-set Jaccard 为 0.9839；V8 的 answer-any recall 仅低 0.42 个百分点。详细的
+答案泄漏分析和独立运行方法见
+`docs/scripts/graph_gen/DAG_KV_SubgraphRAG_V8_ANSWER_BLIND.md`。
 
-结果表明：
+## 在线 DAG-KV 查询流程
 
-- `hops=1` 不适合该多跳数据集。即使 top-k 增加到 8，候选答案召回仍只有
-  44.30%；从 1-hop 增加到 2-hop 才是主要召回增益。
-- `(top_k=1, hops=2)` 是低开销配置：召回 88.61%，平均 24.5 条三元组，
-  retrieval 平均延迟 1.74 ms。
-- `(top_k=2, hops=2)` 是推荐的均衡配置：召回提高到 91.14%，平均候选三元组
-  增加到 36.8，平均延迟为 2.55 ms。
-- 若更重视召回，`(top_k=1, hops=3)` 达到 93.25%，平均只有 45.5 条三元组；
-  它比 `(top_k=4, hops=2)` 的召回更高，同时候选图和延迟都更小。
-- `(top_k=8, hops=3)` 的最高召回为 95.78%，但平均候选三元组达到 219.2，
-  平均延迟为 15.00 ms。相对 `(1,3)` 只增加 2.53 个百分点，不适合作为默认值。
+在线链路只接入 `experiments/eval_generation_dag_kv.py`，不修改通用的
+`experiments/eval_generation.py`：
 
-因此下一轮完整 DAG 和推理精度实验建议至少比较 `(1,2)`、`(2,2)` 和 `(1,3)`
-三组配置，分别代表低开销、均衡和召回优先。
+1. 使用实体索引对应的 embedding 模型编码 query；
+2. hybrid seed 优先匹配问题中的长实体名称，其余名额由 HNSW 补齐；
+3. 从 GraphStore 恢复 top-1 实体的 2-hop 局部图；
+4. V8 answer-blind DAG Retriever 对候选图剪枝；
+5. 根据 DAG node 的 `kv_offset` 从 KVStore 批量读取 key/value embedding；
+6. KBEncoder 投影 tensor，并根据 DAG adjacency 构造 `kb_adj`；
+7. 将 query、KV tensors 和 `kb_adj` 输入 Qwen3 DAG-KV 模型。
 
-`--reference-output` 用于将新生成的 DAG 与已有 _dag_aa 文件进行离线对比，不参与检索或 DAG 生成。
-它会按 _id/id 对齐共同样本，并统计：
-完整 DAG 相同率
-非空 DAG 比例
-答案覆盖率
-平均 KV 节点数
-KV 集合的 macro precision、recall 和 F1
+在线输入使用原始 `tripled_v5` 文件，不依赖预生成的 `dag_naa` 或逐样本 embedding
+数组。完整命令位于本文开头的“在线检索”Quick Start。
+
+## 在线结果
+
+当前保留配置为 `entity_top_k=1`、`subgraph_hops=2`、hybrid seed、heuristic
+terminal reranker 和 `max_sinks=3`。GPU 0 上评测前 100 条 2Wiki dev 样本：
+
+| 配置 | EM | F1 | ROUGE-L | 检索 | 端到端 TTFT | 平均延迟 |
+|---|---:|---:|---:|---:|---:|---:|
+| 离线 `dag_naa` | 0.510 | 0.661 | 0.675 | 0 ms | 70.93 ms | 320.12 ms |
+| 在线 Store + V8 | 0.440 | 0.592 | 0.612 | 80.18 ms | 161.44 ms | 431.85 ms |
+
+在线检索耗时包含 query embedding、HNSW、局部图恢复、V8 DAG、KVStore 读取和
+KBEncoder。端到端 TTFT 为在线检索与模型 prefill 之和。本次结果使用本地
+EM/F1/ROUGE 指标，没有调用外部 LLM judge。

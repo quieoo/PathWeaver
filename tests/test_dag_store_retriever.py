@@ -2,8 +2,10 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import torch
 
-from kblam.dag_store_retriever import DAGKVStoreRetriever
+from kblam.dag_store_retriever import DAGExtractionConfig, DAGKVStoreRetriever, TrainableDAGExtractor
+from kblam.online_dag_kv_retriever import OnlineDAGKBRetriever
 from kblam.stores import GraphStore, KVStore
 
 
@@ -24,6 +26,44 @@ class FakeExtractor:
             sample["dag"] = {"kv_nodes": kv_nodes, "adj": [], "meta": {"scorer": "fake"}}
             output.append(sample)
         return output
+
+
+class OffsetExtractor:
+    backend = "v8-answer-blind"
+
+    def extract(self, samples):
+        output = []
+        for sample in samples:
+            assert "answer" not in sample
+            nodes = [
+                {
+                    "key": kv["key_string"],
+                    "value": kv["value_string"],
+                    "kv_offset": kv["kv_offset"],
+                }
+                for triple in sample["triple_list"]
+                for kv in triple["kv_lists"]
+            ]
+            adj = [[0] * len(nodes) for _ in nodes]
+            for index in range(len(nodes) - 1):
+                adj[index][index + 1] = 1
+            row = dict(sample)
+            row["dag"] = {"kv_nodes": nodes, "adj": adj, "meta": {"answer_free_inference": True}}
+            output.append(row)
+        return output
+
+
+class FakeEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.out_dim = 2
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def encode_key(self, base_emb):
+        return torch.from_numpy(base_emb) + 1
+
+    def encode_val(self, base_emb):
+        return torch.from_numpy(base_emb) + 2
 
 
 def _add_relation(kv_store, graph_store, subject, predicate, object_value, start_offset):
@@ -64,6 +104,10 @@ def _build_store(root):
             node_ids,
             np.asarray([vectors_by_name[entities[node_id]] for node_id in node_ids], dtype=np.float32),
         )
+        rows = len(kv_store)
+        key_tensors = np.arange(rows * 2, dtype=np.float32).reshape(rows, 2)
+        value_tensors = key_tensors + 100
+        kv_store.write_tensors(key_tensors, value_tensors)
     return alice_triple, dave_triple
 
 
@@ -78,15 +122,36 @@ def test_retriever_expands_each_entity_and_recovers_kv_offsets(tmp_path):
         search_backend="exact",
     ) as retriever:
         candidate = retriever.retrieve("Who knows whom?")
-        prepared = retriever.build_candidate_sample({"question": "Who knows whom?"}, candidate)
+        prepared = retriever.build_candidate_sample(
+            {"question": "Who knows whom?", "context": [{"triple_list": [{"stale": True}]}]},
+            candidate,
+        )
 
     assert {triple.triple_id for triple in candidate.triples} == {alice_triple, dave_triple}
     assert len(candidate.entity_hits) == 2
+    assert prepared["context"] == []
     assert [hit.name for hit in candidate.entity_hits] == ["Alice", "Dave"]
     assert [triple["kv_lists"][0]["key_string"] for triple in prepared["triple_list"]] == [
         "Alice knows",
         "Dave knows",
     ]
+
+
+def test_hybrid_seed_prefers_long_exact_entity_mention(tmp_path):
+    _build_store(tmp_path)
+    with DAGKVStoreRetriever(
+        tmp_path,
+        FakeEmbedder(),
+        entity_top_k=1,
+        subgraph_hops=1,
+        search_backend="exact",
+        seed_strategy="hybrid",
+        mention_min_chars=4,
+    ) as retriever:
+        candidate = retriever.retrieve("What does Dave know?")
+
+    assert [(hit.name, hit.source) for hit in candidate.entity_hits] == [("Dave", "mention")]
+    assert {(triple.subject, triple.object) for triple in candidate.triples} == {("Dave", "Eve")}
 
 
 def test_batch_wrapper_restores_original_triples_and_adds_retrieval_metadata(tmp_path):
@@ -133,6 +198,78 @@ def test_compare_outputs_ignores_retrieval_metadata():
     assert report["exact_dag_ratio"] == 1.0
     assert report["macro_kv_f1"] == 1.0
     assert report["generated_answer_coverage"] == 1.0
+
+
+def test_trainable_extractor_adapts_v8_load_and_infer_api(tmp_path):
+    script = tmp_path / "fake_v8.py"
+    script.write_text(
+        """
+def load_models(path, cpu):
+    return 'edge', 'node', {'is_joint': False}, 'cpu'
+
+def infer(args, samples, embedder, edge_model, node_model, checkpoint, device):
+    output = []
+    for sample in samples:
+        row = dict(sample)
+        row['dag'] = {
+            'kv_nodes': [],
+            'adj': [],
+            'meta': {
+                'answer_free_inference': True,
+                'selection_mode': args.selection_mode,
+                'terminal_reranker': args.terminal_reranker,
+            },
+        }
+        output.append(row)
+    return output
+""",
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.touch()
+    extractor = TrainableDAGExtractor(
+        script,
+        checkpoint,
+        FakeEmbedder(),
+        config=DAGExtractionConfig(selection_mode="legacy", terminal_reranker="heuristic"),
+        cpu=True,
+    )
+
+    output = extractor.extract([{"_id": "q1", "question": "Question"}])
+
+    assert extractor.backend == "v8-answer-blind"
+    assert output[0]["dag"]["meta"] == {
+        "answer_free_inference": True,
+        "selection_mode": "legacy",
+        "terminal_reranker": "heuristic",
+    }
+
+
+def test_online_retriever_aligns_offsets_tensors_and_adjacency(tmp_path):
+    _build_store(tmp_path)
+    online = OnlineDAGKBRetriever(
+        encoder=FakeEncoder(),
+        store_dir=str(tmp_path),
+        entity_embedder=FakeEmbedder(),
+        dag_extractor=OffsetExtractor(),
+        entity_top_k=1,
+        subgraph_hops=1,
+        search_backend="exact",
+        use_multihop_adj=True,
+        max_hops=10,
+        hop_decay=1.0,
+        dynamic_hops_by_longest_path=True,
+    )
+    try:
+        result = online.get_kb_for_queries(["Who knows whom?"], device="cpu")[0]
+    finally:
+        online.close()
+
+    assert [node["kv_offset"] for node in result.dag["kv_nodes"]] == [0, 1]
+    np.testing.assert_allclose(result.kb_keys.numpy(), [[1, 2], [3, 4]])
+    np.testing.assert_allclose(result.kb_values.numpy(), [[102, 103], [104, 105]])
+    np.testing.assert_allclose(result.kb_adj.to_dense().numpy(), [[0, 1], [0, 0]])
+    assert result.dag["meta"]["answer_free_inference"] is True
 
 
 def _load_tool_module():

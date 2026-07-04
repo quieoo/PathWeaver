@@ -1,6 +1,8 @@
 import argparse
 import json
 import random
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -10,14 +12,20 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from kblam.dag_kv_retriever import DAGKVKBRetriever
+from kblam.dag_store_retriever import (
+    DAGExtractionConfig,
+    TrainableDAGExtractor,
+    entity_embedding_model_path,
+)
 from kblam.kb_encoder import KBEncoder
-from kblam.metrics_evaluator import full_evaluation, simple_evaluation
+from kblam.online_dag_kv_retriever import OnlineDAGKBRetriever
+from kblam.metrics_evaluator import full_evaluation
 from kblam.models.kblam_config import KBLaMConfig
 from kblam.models.llama3_model import KblamLlamaForCausalLM
 from kblam.models.phi3_model import KBLaMPhi3ForCausalLM
+from kblam.models.qwen3.kblam_qwen3_attention import load_kblam_qwen3_model, load_qwen3_query_head
 from kblam.utils.eval_utils import answer_question_deterministic, format_output_for_synthetic
-
-import re
+from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
 
 def _postprocess_generation(raw_output: str, question: str) -> str:
     """
@@ -85,6 +93,8 @@ def prepare_model_and_tokenizer(
         trust_remote_code=True,
         token=hf_token if llm_type == "llama3" else None,
     )
+    if llm_type == "qwen3":
+        tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -102,11 +112,20 @@ def prepare_model_and_tokenizer(
             torch_dtype="auto",
             trust_remote_code=True,
         )
+    elif llm_type == "qwen3":
+        model = load_kblam_qwen3_model(
+            base_model_dir=base_model_name_or_path,
+            checkpoint_dir=model_path,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        if query_head_path:
+            load_qwen3_query_head(model, query_head_path)
     else:
         raise ValueError(f"Unsupported llm_type={llm_type}; choose llama3 or phi3")
 
-    model.to("cuda" if torch.cuda.is_available() else "cpu")
-    if query_head_path:
+    if llm_type != "qwen3":
+        model.to("cuda" if torch.cuda.is_available() else "cpu")
+    if query_head_path and llm_type != "qwen3":
         qh = torch.load(query_head_path, map_location=next(model.parameters()).device)
         missing, unexpected = model.load_state_dict(qh, strict=False)
         print(
@@ -119,21 +138,81 @@ def prepare_model_and_tokenizer(
     return tokenizer, model
 
 
+def get_encoder_out_dim(model_config, kb_layer_frequency: int) -> int:
+    slots = model_config.num_hidden_layers // kb_layer_frequency + 1
+    head_dim = getattr(model_config, "head_dim", None)
+    num_heads = getattr(model_config, "num_attention_heads", None)
+    per_slot_dim = head_dim * num_heads if head_dim is not None and num_heads is not None else model_config.hidden_size
+    return per_slot_dim * slots
+
+
+def prepare_online_retriever(args, encoder) -> OnlineDAGKBRetriever:
+    if not args.online_dag_model_ckpt:
+        raise ValueError("--online_dag_model_ckpt is required with --online_store_dir")
+    from sentence_transformers import SentenceTransformer
+
+    st_model = args.online_st_model or entity_embedding_model_path(args.online_store_dir)
+    embedder = SentenceTransformer(st_model)
+    config = DAGExtractionConfig(
+        infer_batch_size=args.online_infer_batch_size,
+        topic_top_k=args.online_topic_top_k,
+        dde_hops=args.online_dde_hops,
+        mention_bonus=args.online_mention_bonus,
+        seed_edge_topk=args.online_seed_edge_topk,
+        expansion_hops=args.online_expansion_hops,
+        per_src_cap=args.online_per_src_cap,
+        max_nodes=args.online_max_nodes,
+        max_edges=args.online_max_edges,
+        max_sinks=args.online_max_sinks,
+        answer_aware=False,
+        keep_score=True,
+        reverse_sink_edge_topk=args.online_reverse_sink_edge_topk,
+        reverse_sink_hops=args.online_reverse_sink_hops,
+        reverse_sink_beam_width=args.online_reverse_sink_beam_width,
+        selection_mode=args.online_selection_mode,
+        terminal_reranker=args.online_terminal_reranker,
+    )
+    extractor = TrainableDAGExtractor(
+        args.online_dag_script,
+        args.online_dag_model_ckpt,
+        embedder,
+        config=config,
+    )
+    return OnlineDAGKBRetriever(
+        encoder=encoder,
+        store_dir=args.online_store_dir,
+        entity_embedder=embedder,
+        dag_extractor=extractor,
+        entity_top_k=args.online_entity_top_k,
+        subgraph_hops=args.online_subgraph_hops,
+        search_backend=args.online_search_backend,
+        seed_strategy=args.online_seed_strategy,
+        mention_min_chars=args.online_mention_min_chars,
+        use_multihop_adj=True,
+        max_hops=args.max_hops,
+        hop_decay=args.hop_decay,
+        dynamic_hops_by_longest_path=args.dynamic_hops_by_longest_path,
+        require_answer_blind=True,
+    )
+
+
 @torch.no_grad()
 def evaluate_generation(
     *,
     dataset: Sequence[Dict[str, Any]],
     tokenizer,
     model,
-    retriever: DAGKVKBRetriever,
+    retriever: DAGKVKBRetriever | OnlineDAGKBRetriever,
     kb_config: KBLaMConfig,
     max_samples: Optional[int] = None,
     seed: int = 42,
-    simple_eval: bool = False,
+    eval_batch_size: int = 10,
 ) -> Dict[str, Any]:
     n = len(dataset)
     if max_samples is None or max_samples <= 0 or max_samples > n:
         eval_indices = list(range(n))
+    elif seed == 0:
+        eval_indices = list(range(max_samples))
     else:
         rng = random.Random(seed)
         eval_indices = list(range(n))
@@ -142,44 +221,95 @@ def evaluate_generation(
 
     preds: List[str] = []
     refs: List[str] = []
+    questions: List[str] = []
+    source_indices: List[int] = []
+    model_ttfts: List[float] = []
+    tpots: List[float] = []
+    retrieval_seconds = 0.0
+    empty_kb_samples = 0
 
     device = next(model.parameters()).device
-    for sid in tqdm(eval_indices, desc="Evaluating"):
-        sample = dataset[sid]
-        q, a = get_qa(sample)
-        kb_keys, kb_vals, kb_adj = retriever.get_kb_embedding(sid, device=device)
+    eval_started = time.perf_counter()
+    for start in tqdm(range(0, len(eval_indices), eval_batch_size), desc="Evaluating"):
+        batch_indices = eval_indices[start : start + eval_batch_size]
+        batch = [dataset[index] for index in batch_indices]
+        batch_questions = [get_qa(sample)[0] for sample in batch]
 
-        if kb_keys.shape[0] == 0:
-            continue
+        if getattr(retriever, "is_online_retriever", False):
+            retrieval_started = time.perf_counter()
+            online_results = retriever.get_kb_for_queries(batch_questions, device=device)
+            retrieval_seconds += time.perf_counter() - retrieval_started
+            kb_results = [
+                (result.kb_keys, result.kb_values, result.kb_adj)
+                for result in online_results
+            ]
+        else:
+            kb_results = [retriever.get_kb_embedding(index, device=device) for index in batch_indices]
 
-        output = answer_question_deterministic(
-            tokenizer=tokenizer,
-            model=model,
-            Q=q,
-            kb=(kb_keys, kb_vals),
-            kb_adj=kb_adj,
-            kb_config=kb_config,
-        )
-        print(f"Q: {q}, A: {a}, Pred: {output}")
-        # pred = format_output_for_synthetic(output)
-        pred = format_output_for_synthetic(_postprocess_generation(output, q))
-        ref = format_output_for_synthetic(a)
-        preds.append(pred)
-        refs.append(ref)
+        for sid, sample, (kb_keys, kb_vals, kb_adj) in zip(batch_indices, batch, kb_results):
+            q, a = get_qa(sample)
+            if kb_keys.shape[0] == 0:
+                kb = None
+                kb_adj = None
+                empty_kb_samples += 1
+            else:
+                kb = (kb_keys, kb_vals)
 
-    if simple_eval:
-        simple_score_dict = simple_evaluation(preds, refs)
-        return {
-            "num_samples": len(eval_indices),
-            "scores": simple_score_dict,
-        }
-    else:
-        gen_report, score_report = full_evaluation(preds, refs)
-        return {
-            "num_samples": len(eval_indices),
-            "scores": score_report,
-            "report_text": gen_report,
-        }
+            kblam_profile_reset()
+            generation_started = time.perf_counter()
+            output = answer_question_deterministic(
+                tokenizer=tokenizer,
+                model=model,
+                Q=q,
+                kb=kb,
+                kb_adj=kb_adj,
+                kb_config=kb_config,
+            )
+            generation_elapsed = time.perf_counter() - generation_started
+            profile = kblam_profile_get()
+            prefill = float(profile.get("prefill_s", 0.0))
+            decode = float(profile.get("decode_s", 0.0))
+            decode_tokens = max(1, int(profile.get("decode_tokens", 0)))
+            model_ttfts.append(prefill if prefill > 0 else generation_elapsed)
+            tpots.append(decode / decode_tokens)
+
+            pred = format_output_for_synthetic(_postprocess_generation(output, q))
+            ref = format_output_for_synthetic(a)
+            print(f"Q: {q}, A: {a}, Pred: {output}")
+            preds.append(pred)
+            refs.append(ref)
+            questions.append(q)
+            source_indices.append(sid)
+
+    elapsed = time.perf_counter() - eval_started
+    average_retrieval = retrieval_seconds / max(1, len(eval_indices))
+    performance = {
+        "queries": len(eval_indices),
+        "generated_samples": len(preds),
+        "empty_kb_samples": empty_kb_samples,
+        "qps": len(eval_indices) / max(elapsed, 1e-12),
+        "average_latency_seconds": elapsed / max(1, len(eval_indices)),
+        "average_model_ttft_seconds": float(np.mean(model_ttfts)),
+        "average_retrieval_seconds": average_retrieval,
+        "average_end_to_end_ttft_seconds": float(np.mean(model_ttfts)) + average_retrieval,
+        "average_tpot_seconds": float(np.mean(tpots)),
+    }
+    print(json.dumps({"performance": performance}, ensure_ascii=False, indent=2))
+    if getattr(retriever, "is_online_retriever", False):
+        retriever.print_metrics()
+
+    report_text, scores = full_evaluation(preds, refs, questions=questions)
+    return {
+        "num_samples": len(eval_indices),
+        "scores": scores,
+        "report_text": report_text,
+        "performance": performance,
+        "online_retrieval": retriever.stats() if getattr(retriever, "is_online_retriever", False) else None,
+        "predictions": preds,
+        "references": refs,
+        "questions": questions,
+        "source_indices": source_indices,
+    }
 
 
 def main() -> None:
@@ -192,12 +322,16 @@ def main() -> None:
     parser.add_argument("--precomputed_embed_keys_path", type=str, default="")
     parser.add_argument("--precomputed_embed_values_path", type=str, default="")
     parser.add_argument("--encoder_spec", type=str, default="OAI")
-    parser.add_argument("--llm_type", type=str, default="llama3", choices=["llama3", "phi3"])
+    parser.add_argument("--llm_type", type=str, default="llama3", choices=["llama3", "phi3", "qwen3"])
     parser.add_argument("--kb_layer_frequency", type=int, default=3)
+    parser.add_argument("--kb_scale_factor", type=float, default=None)
+    parser.add_argument("--step", type=int, default=1)
+    parser.add_argument("--t_step", type=int, default=1)
     parser.add_argument("--path_attn", action="store_true", default=False)
     parser.add_argument("--path_attn_mix_ratio", type=float, default=1.0)
     parser.add_argument("--max_samples", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--eval_batch_size", type=int, default=10)
     parser.add_argument("--max_kv_per_sample", type=int, default=0)
     parser.add_argument("--use_multihop_adj", action="store_true", default=False)
     parser.add_argument("--max_hops", type=int, default=1)
@@ -206,6 +340,37 @@ def main() -> None:
     parser.add_argument("--save_json", type=str, default="")
     parser.add_argument("--hf_token", type=str, default="")
     parser.add_argument("--query_head_path", type=str, default="")
+    parser.add_argument("--online_store_dir", type=str, default="")
+    parser.add_argument(
+        "--online_dag_script",
+        type=str,
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py"
+        ),
+    )
+    parser.add_argument("--online_dag_model_ckpt", type=str, default="")
+    parser.add_argument("--online_st_model", type=str, default="")
+    parser.add_argument("--online_entity_top_k", type=int, default=1)
+    parser.add_argument("--online_subgraph_hops", type=int, default=2)
+    parser.add_argument("--online_search_backend", choices=["hnsw", "exact"], default="hnsw")
+    parser.add_argument("--online_seed_strategy", choices=["vector", "hybrid"], default="vector")
+    parser.add_argument("--online_mention_min_chars", type=int, default=8)
+    parser.add_argument("--online_infer_batch_size", type=int, default=1024)
+    parser.add_argument("--online_topic_top_k", type=int, default=8)
+    parser.add_argument("--online_dde_hops", type=int, default=3)
+    parser.add_argument("--online_mention_bonus", type=float, default=0.2)
+    parser.add_argument("--online_seed_edge_topk", type=int, default=18)
+    parser.add_argument("--online_expansion_hops", type=int, default=2)
+    parser.add_argument("--online_per_src_cap", type=int, default=3)
+    parser.add_argument("--online_max_nodes", type=int, default=30)
+    parser.add_argument("--online_max_edges", type=int, default=40)
+    parser.add_argument("--online_max_sinks", type=int, default=3)
+    parser.add_argument("--online_reverse_sink_edge_topk", type=int, default=2)
+    parser.add_argument("--online_reverse_sink_hops", type=int, default=4)
+    parser.add_argument("--online_reverse_sink_beam_width", type=int, default=4)
+    parser.add_argument("--online_selection_mode", choices=["legacy"], default="legacy")
+    parser.add_argument("--online_terminal_reranker", choices=["joint", "heuristic"], default="joint")
     args = parser.parse_args()
 
     dataset = read_json_or_jsonl(args.data_path)
@@ -221,33 +386,41 @@ def main() -> None:
         encoder_name=args.encoder_spec,
         projector_type="linear",
         endpoint_url="",
-        out_dim=model.config.hidden_size * (model.config.num_hidden_layers // args.kb_layer_frequency + 1),
+        out_dim=get_encoder_out_dim(model.config, args.kb_layer_frequency),
         frozen_base_model=True,
         device=next(model.parameters()).device,
     )
-    encoder.load_state_dict(torch.load(args.encoder_path, map_location=next(model.parameters()).device))
+    encoder.load_state_dict(
+        torch.load(args.encoder_path, map_location=next(model.parameters()).device, weights_only=True)
+    )
     encoder.eval()
 
     kb_config = KBLaMConfig(
         kb_layer_frequency=args.kb_layer_frequency,
+        kb_scale_factor=args.kb_scale_factor,
         path_attn=args.path_attn,
         sep_query_head=True,
+        current_step=args.step,
+        total_steps=args.t_step,
     )
     kb_config.path_attn_mix_ratio = args.path_attn_mix_ratio
 
-    retriever = DAGKVKBRetriever(
-        encoder=encoder,
-        dataset=dataset,
-        base_embeder_path=args.base_embeder_path or None,
-        precomputed_embed_keys_path=args.precomputed_embed_keys_path or None,
-        precomputed_embed_values_path=args.precomputed_embed_values_path or None,
-        max_kv_per_sample=args.max_kv_per_sample if args.max_kv_per_sample > 0 else None,
-        use_multihop_adj=args.use_multihop_adj,
-        max_hops=args.max_hops,
-        hop_decay=args.hop_decay,
-        dynamic_hops_by_longest_path=args.dynamic_hops_by_longest_path,
-        device=str(next(model.parameters()).device),
-    )
+    if args.online_store_dir:
+        retriever = prepare_online_retriever(args, encoder)
+    else:
+        retriever = DAGKVKBRetriever(
+            encoder=encoder,
+            dataset=dataset,
+            base_embeder_path=args.base_embeder_path or None,
+            precomputed_embed_keys_path=args.precomputed_embed_keys_path or None,
+            precomputed_embed_values_path=args.precomputed_embed_values_path or None,
+            max_kv_per_sample=args.max_kv_per_sample if args.max_kv_per_sample > 0 else None,
+            use_multihop_adj=args.use_multihop_adj,
+            max_hops=args.max_hops,
+            hop_decay=args.hop_decay,
+            dynamic_hops_by_longest_path=args.dynamic_hops_by_longest_path,
+            device=str(next(model.parameters()).device),
+        )
 
     result = evaluate_generation(
         dataset=dataset,
@@ -257,14 +430,18 @@ def main() -> None:
         kb_config=kb_config,
         max_samples=args.max_samples if args.max_samples > 0 else None,
         seed=args.seed,
+        eval_batch_size=args.eval_batch_size,
     )
 
     print(json.dumps(result["scores"], indent=2, ensure_ascii=False))
     if args.save_json:
         out = Path(args.save_json)
         out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"scores": result["scores"], "num_samples": result["num_samples"]}
+        payload = {key: value for key, value in result.items() if key != "report_text"}
         out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if getattr(retriever, "is_online_retriever", False):
+        retriever.close()
 
 
 if __name__ == "__main__":
