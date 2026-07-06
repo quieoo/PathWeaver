@@ -49,6 +49,7 @@ class KVStore:
         self.tensor_meta_path = self.root / self.TENSOR_META_NAME
         self._conn = open_sqlite(self.db_path)
         self._create_schema()
+        self._next_offset: int | None = None
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -82,6 +83,13 @@ class KVStore:
     def close(self) -> None:
         self._conn.close()
 
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+        self._next_offset = None
+
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS n FROM kv_records").fetchone()
         return int(row["n"])
@@ -97,6 +105,7 @@ class KVStore:
         triple_index: int | None = None,
         kv_index: int | None = None,
         dedupe_key: str | None = None,
+        commit: bool = True,
     ) -> int:
         key_text = normalize_text(key_text)
         value_text = normalize_text(value_text)
@@ -108,7 +117,12 @@ class KVStore:
             "SELECT offset FROM kv_records WHERE content_key = ?", (record_key,)
         ).fetchone()
         if row is None:
-            next_offset = len(self)
+            if self._next_offset is None:
+                next_offset_row = self._conn.execute(
+                    "SELECT COALESCE(MAX(offset), -1) + 1 AS next_offset FROM kv_records"
+                ).fetchone()
+                self._next_offset = int(next_offset_row["next_offset"])
+            next_offset = self._next_offset
             self._conn.execute(
                 """
                 INSERT INTO kv_records(offset, content_key, key_text, value_text, metadata_json)
@@ -123,6 +137,7 @@ class KVStore:
                 ),
             )
             offset = next_offset
+            self._next_offset = next_offset + 1
         else:
             offset = int(row["offset"])
 
@@ -135,7 +150,8 @@ class KVStore:
                 """,
                 (offset, *source),
             )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         return offset
 
     def get(self, offset: int) -> KVRecord:
@@ -150,9 +166,15 @@ class KVStore:
     def get_many(self, offsets: Iterable[int]) -> list[KVRecord]:
         return [self.get(offset) for offset in offsets]
 
-    def iter_records(self) -> Iterable[KVRecord]:
+    def iter_records(self, *, start_offset: int = 0) -> Iterable[KVRecord]:
+        if start_offset < 0:
+            raise ValueError("start_offset must be non-negative")
         rows = self._conn.execute(
-            "SELECT offset, key_text, value_text, metadata_json FROM kv_records ORDER BY offset"
+            """
+            SELECT offset, key_text, value_text, metadata_json
+            FROM kv_records WHERE offset >= ? ORDER BY offset
+            """,
+            (int(start_offset),),
         )
         yield from map(self._record_from_row, rows)
 

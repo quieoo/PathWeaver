@@ -1,6 +1,7 @@
 # Quick Start Commands
 
 ## 建图
+
 ```bash
 export CUDA_VISIBLE_DEVICES=0
 cd /mnt/n0/PathWeaver
@@ -17,7 +18,13 @@ python tools/build_pathweaver_stores.py \
   --build-hnsw
 ```
 
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/2wiki\_dev\_2hop\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/hotpot\_dev\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/musique\_dev\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/training\_set/merged\_multi\_hop\_train\_tripled\_v5\_qwen2.5-72B\_4bit.jsonl
+
 ## 离线检索
+
 ```bash
 DATA_DIR=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set
 
@@ -48,6 +55,7 @@ DATA_DIR=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set
   --reverse-sink-beam-width 4 \
   --reference-output "$DATA_DIR/2wiki_dev_2hop_tripled_v5-qwen3.5-27B_dag_aa.jsonl"
 ```
+
 输出
 
 ```
@@ -135,22 +143,58 @@ python experiments/eval_generation_dag_kv.py \
   --save_json experiments/results/online_dag_eval/online_store_v8_hybrid_top1_hop2_sink3_heuristic_100.json
 ```
 
-实测结果（GPU 0，本地 EM/F1/ROUGE，不调用外部 LLM judge）：
-
 ```text
-EM:                         0.4400
-F1-overlap:                 0.5925
-ROUGE-L:                    0.6118
-Model TTFT:                 81.26 ms
-Online retrieval:           80.18 ms
-End-to-end TTFT:           161.44 ms
-Average request latency:   431.85 ms
-QPS:                         2.316
-
-Retrieval breakdown:
-  entity + candidate graph: 22.09 ms
-  V8 DAG extraction:        57.14 ms
-  KV read + projection:      0.90 ms
+{
+  "performance": {
+    "queries": 100,
+    "generated_samples": 100,
+    "empty_kb_samples": 0,
+    "qps": 2.3279230924275156,
+    "average_latency_seconds": 0.4295674557518214,
+    "average_model_ttft_seconds": 0.08161682387813926,
+    "average_retrieval_seconds": 0.08186377678997815,
+    "average_end_to_end_ttft_seconds": 0.16348060066811743,
+    "average_tpot_seconds": 0.06687027030498155
+  }
+}
+[OnlineDAG] samples=100 empty_dags=0 candidate=21.56ms dag=59.36ms tensor=0.91ms total=81.83ms
+===== First 5 Samples =====
+Sample 0:
+  Model output: Mannai Award
+  Ground truth: Myanmar Motion Picture Academy Awards
+  --------------------------------------------------
+Sample 1:
+  Model output: Zuzanna Brzeżanka
+  Ground truth: Małgorzata Braunek
+  --------------------------------------------------
+Sample 2:
+  Model output: 12 June 1516
+  Ground truth: 12 June 1516
+  --------------------------------------------------
+Sample 3:
+  Model output: Alain Poiré
+  Ground truth: Alain Poiré
+  --------------------------------------------------
+Sample 4:
+  Model output: Julius Caesar
+  Ground truth: Pompey
+  --------------------------------------------------
+Calculating ROUGE scores...
+✅ ROUGE computed successfully.
+✅ Exact Match (EM): 0.4400
+✅ F1-Overlap: 0.5925
+🔸 Large input detected (100 samples), splitting into batches of 20...
+✅ Faithfulness01: 0.5800
+{
+  "rouge1": 0.6094523809523809,
+  "rouge2": 0.26283333333333336,
+  "rougeL": 0.6094285714285714,
+  "rougeLsum": 0.6058333333333333,
+  "exact_match": 0.44,
+  "f1_overlap": 0.592452380952381,
+  "faithfulness01": 0.58
+}
+(kblam)
 ```
 
 结果保存于
@@ -483,11 +527,293 @@ macro KV-set Jaccard 为 0.9839；V8 的 answer-any recall 仅低 0.42 个百分
 当前保留配置为 `entity_top_k=1`、`subgraph_hops=2`、hybrid seed、heuristic
 terminal reranker 和 `max_sinks=3`。GPU 0 上评测前 100 条 2Wiki dev 样本：
 
-| 配置 | EM | F1 | ROUGE-L | 检索 | 端到端 TTFT | 平均延迟 |
-|---|---:|---:|---:|---:|---:|---:|
-| 离线 `dag_naa` | 0.510 | 0.661 | 0.675 | 0 ms | 70.93 ms | 320.12 ms |
-| 在线 Store + V8 | 0.440 | 0.592 | 0.612 | 80.18 ms | 161.44 ms | 431.85 ms |
+| 配置            |    EM |    F1 | ROUGE-L |       检索 |  端到端 TTFT |      平均延迟 |
+| ------------- | ----: | ----: | ------: | -------: | --------: | --------: |
+| 离线 `dag_naa`  | 0.510 | 0.661 |   0.675 |     0 ms |  70.93 ms | 320.12 ms |
+| 在线 Store + V8 | 0.440 | 0.592 |   0.612 | 80.18 ms | 161.44 ms | 431.85 ms |
 
 在线检索耗时包含 query embedding、HNSW、局部图恢复、V8 DAG、KVStore 读取和
 KBEncoder。端到端 TTFT 为在线检索与模型 prefill 之和。本次结果使用本地
 EM/F1/ROUGE 指标，没有调用外部 LLM judge。
+
+# Store 规模扫描（2026-07-06）
+
+本节单独测量本地 Store 的空间占用和候选图恢复开销。它不包含 V8 DAG 提取、
+KBEncoder 投影和 LLM 推理；因此不要将本节的 `total` 与上面的约 80 ms 完整在线
+检索耗时直接比较。
+
+大数据集命令
+
+```bash
+cd /mnt/n0/PathWeaver
+
+nohup ./tools/run_pathweaver_store_training_scale_sweep.sh \
+  > experiments/stores/scale-sweep-20260706/training_scale_build_v2.log 2>&1 &
+
+echo $! > experiments/stores/scale-sweep-20260706/training_scale_build_v2.pid
+```
+
+## 实验口径
+
+为了将知识库规模和 query 集合解耦，所有档位固定使用 2Wiki 前 100 条 query。这
+100 条对应的知识已经包含在最小 Store 中；后续档位只增加额外知识，因此召回变化
+表示新增知识造成的实体检索干扰，而不是 query 对应知识尚未写入 Store。
+
+| 档位       | 累计样本组成                        | Entity | Triple | Unique KV |
+| -------- | ----------------------------- | -----: | -----: | --------: |
+| `000100` | 2Wiki `[0, 100)`              |  1,016 |  2,229 |     4,478 |
+| `000237` | 2Wiki `[0, 237)`              |  3,006 |  6,328 |    12,698 |
+| `000537` | `000237` + Hotpot `[0, 300)`  |  6,325 | 13,688 |    27,452 |
+| `000837` | `000537` + MuSiQue `[0, 300)` |  9,253 | 21,176 |    42,473 |
+
+Store 目录位于：
+
+```text
+experiments/stores/scale-sweep-20260706/tiers/000100-2wiki
+experiments/stores/scale-sweep-20260706/tiers/000237-2wiki
+experiments/stores/scale-sweep-20260706/tiers/000537-2wiki-hotpot
+experiments/stores/scale-sweep-20260706/tiers/000837-2wiki-hotpot-musique
+```
+
+训练集前缀档位在 `000837` 的基础上继续追加训练集切片，使累计样本数达到约
+16k、32k 和 64k：
+
+| 档位       | 追加训练集切片                |   累计样本 |  Entity |  Triple | Unique KV |
+| -------- | ---------------------- | -----: | ------: | ------: | --------: |
+| `016000` | train `[0, 15163)`     | 16,000 | 110,101 | 255,333 |   513,140 |
+| `032000` | train `[15163, 31163)` | 32,000 | 177,228 | 460,810 |   928,051 |
+| `064000` | train `[31163, 63163)` | 64,000 | 272,775 | 809,983 | 1,636,837 |
+
+训练集前缀 Store 目录位于：
+
+```text
+experiments/stores/scale-sweep-20260706/training-tiers-v2/016000-with-train
+experiments/stores/scale-sweep-20260706/training-tiers-v2/032000-with-train
+experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train
+```
+
+构建 manifest 和完整扫描结果分别保存在：
+
+```text
+experiments/stores/scale-sweep-20260706/tiers/build_manifest.json
+experiments/stores/scale-sweep-20260706/store_scaling_report.json
+experiments/stores/scale-sweep-20260706/training-tiers-v2/build_manifest.json
+experiments/stores/scale-sweep-20260706/training_store_scaling_report_v2.json
+```
+
+固定配置为 BGE entity embedding、Qwen 0.6B KV embedding、1024 维 FP32、
+HNSW `M=16/ef_construction=200`、`entity_top_k=1` 和 `subgraph_hops=2`。
+查询统计先 warmup 10 条，再对 100 条 query 重复 3 次，共 300 个 observation。
+`p50/p95` 是进程内 warm-cache 结果；没有 drop OS page cache。报告另外保留了
+process-cold first query，但该值仍可能命中 OS page cache，不应解释为物理磁盘冷读。
+
+## 可复现构建
+
+首先用 2Wiki 前 100 条建立最小 Store：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+/mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_stores.py \
+  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --dataset-id 2wiki-dev-v5 \
+  --sample-start 0 \
+  --sample-limit 100 \
+  --store-dir experiments/stores/scale-sweep-20260706/base-000100-2wiki \
+  --hnsw-embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --kv-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --hnsw-embedding-batch-size 1024 \
+  --kv-embedding-batch-size 1024 \
+  --kv-encoding-profile qwen3-embedding-v2 \
+  --build-hnsw
+```
+
+之后逐档复制前一 Store，只编码新增 KV/entity，并重建 HNSW：
+
+```bash
+/mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_scale_sweep.py \
+  --base-store experiments/stores/scale-sweep-20260706/base-000100-2wiki \
+  --output-root experiments/stores/scale-sweep-20260706/tiers \
+  --base-label 000100-2wiki \
+  --append-tier '000237-2wiki::2wiki-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl::100::137' \
+  --append-tier '000537-2wiki-hotpot::hotpot-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl' \
+  --append-tier '000837-2wiki-hotpot-musique::musique-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl' \
+  --hnsw-embedding-model /mnt/n0/models/bge-en-v1.5/ \
+  --kv-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --hnsw-embedding-batch-size 1024 \
+  --kv-embedding-batch-size 1024 \
+  --kv-encoding-profile qwen3-embedding-v2
+```
+
+工具拒绝覆盖已有档位。重复实验时应使用新的 `--output-root`，保留旧结果用于对比。
+三个输入文件的 SHA256 分别为：
+
+```text
+2Wiki   c88598b97eff96bc0a63b6db7a2608cb4c83ea52519fa04ab7d84b0add3f4811
+Hotpot  4f67ce23aa24e0a262c28307bb4404d80118aec0fb72e9b653ab492109cce907
+MuSiQue 4e9a3970d40f78e4a99b9c987ced6aa6d4b826c0e8a632f1ed4cb7f0a1e71687
+```
+
+逐档构建时间中，主要成本是新增 KV embedding 和 `.npy` 扩展：
+
+| 新档位      |  新增 KV | 新增 Entity |  Ingest | KV encode + append | Entity encode | HNSW rebuild |      总计 |
+| -------- | -----: | --------: | ------: | -----------------: | ------------: | -----------: | ------: |
+| `000237` |  8,220 |     1,990 |  2.00 s |            16.25 s |        0.50 s |       0.11 s | 18.93 s |
+| `000537` | 14,754 |     3,319 |  5.84 s |            26.48 s |        0.74 s |       0.16 s | 33.55 s |
+| `000837` | 15,021 |     2,928 | 12.85 s |            28.80 s |        0.79 s |       0.28 s | 42.94 s |
+
+训练集前缀构建继续复用上一档 Store，只编码新增 KV/entity：
+
+| 新档位      | 训练切片             |   新增样本 |   新增 KV | 新增 Entity |   Ingest | KV encode + append | Entity encode | HNSW rebuild |        总计 |
+| -------- | ---------------- | -----: | ------: | --------: | -------: | -----------------: | ------------: | -----------: | --------: |
+| `016000` | `[0, 15163)`     | 15,163 | 470,667 |   100,848 |  61.47 s |          1710.47 s |       33.81 s |       6.13 s | 1817.20 s |
+| `032000` | `[15163, 31163)` | 16,000 | 414,911 |    67,127 |  72.23 s |          1378.84 s |       20.19 s |      11.68 s | 1488.18 s |
+| `064000` | `[31163, 63163)` | 32,000 | 708,786 |    95,547 | 134.31 s |          2690.89 s |       31.55 s |      22.02 s | 2890.10 s |
+
+## 空间开销
+
+下表只统计每个档位 `graph/` 和 `kv/` 内的 Store 文件，不包括 benchmark report。
+`追加峰值` 是当前 `_atomic_concat()` 扩展 key 或 value 数组时所需的一份额外完整
+数组的估计值，不是稳定状态空间。
+
+| 档位       |          总空间 | Key+Value tensor | Entity vectors |        HNSW |  KV SQLite | Graph SQLite | KiB/unique KV |    追加峰值额外空间 |
+| -------- | -----------: | ---------------: | -------------: | ----------: | ---------: | -----------: | ------------: | ----------: |
+| `000100` |    46.30 MiB |        34.98 MiB |       3.97 MiB |    4.11 MiB |   2.02 MiB |     1.20 MiB |         10.59 |   17.49 MiB |
+| `000237` |   132.04 MiB |        99.20 MiB |      11.74 MiB |   12.17 MiB |   5.67 MiB |     3.23 MiB |         10.65 |   49.60 MiB |
+| `000537` |   283.63 MiB |       214.47 MiB |      24.71 MiB |   25.60 MiB |  12.05 MiB |     6.75 MiB |         10.58 |  107.23 MiB |
+| `000837` |   434.59 MiB |       331.82 MiB |      36.14 MiB |   37.46 MiB |  18.81 MiB |    10.28 MiB |         10.48 |  165.91 MiB |
+| `016000` |  5270.03 MiB |      4008.91 MiB |     430.92 MiB |  445.67 MiB | 246.83 MiB |   137.71 MiB |         10.52 | 2004.45 MiB |
+| `032000` |  9375.06 MiB |      7250.40 MiB |     693.65 MiB |  717.40 MiB | 461.32 MiB |   252.29 MiB |         10.34 | 3625.20 MiB |
+| `064000` | 16267.27 MiB |     12787.79 MiB |    1067.61 MiB | 1104.16 MiB | 851.95 MiB |   455.76 MiB |         10.18 | 6393.89 MiB |
+
+空间几乎随 unique KV 线性增长，而不是随样本数严格线性增长。`000100 → 000837`
+样本数扩大 8.37 倍，unique KV 扩大 9.48 倍，总空间扩大 9.39 倍。不同数据集的
+每样本 triple/KV 密度不同，因此仅用样本数预测容量会有明显误差。
+
+小规模四档中 KV tensor 始终占约 75%–76%；训练集前缀中 KV tensor 占比继续保持
+约 76%–79%。entity vectors 与 HNSW 合计约 13%–18%；两个 SQLite 合计约
+5%–7%。当前布局的经验容量可以写为：
+
+```text
+Store 稳定空间约为 10.5 KiB × unique_KV
+```
+
+这是当前几个数据集实体/KV 比例下的经验值，不是普适常数。更准确的解析式仍是：
+
+```text
+2 × KV × 1024 × 4B                  # key/value FP32 tensor
++ Entity × 1024 × 4B                # exact entity vectors
++ HNSW（当前实测约 4.1 KiB/entity）
++ SQLite text/provenance/B-tree
+```
+
+## 检索开销 breakdown
+
+扫描命令：
+
+```bash
+/mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_store_scaling.py \
+  --store 000100=experiments/stores/scale-sweep-20260706/tiers/000100-2wiki \
+  --store 000237=experiments/stores/scale-sweep-20260706/tiers/000237-2wiki \
+  --store 000537=experiments/stores/scale-sweep-20260706/tiers/000537-2wiki-hotpot \
+  --store 000837=experiments/stores/scale-sweep-20260706/tiers/000837-2wiki-hotpot-musique \
+  --queries /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --st-model /mnt/n0/models/bge-en-v1.5/ \
+  --seed-strategies vector,hybrid \
+  --entity-top-k 1 \
+  --subgraph-hops 2 \
+  --query-batch-size 100 \
+  --warmup-queries 10 \
+  --repeats 3 \
+  --limit 100 \
+  --output experiments/stores/scale-sweep-20260706/store_scaling_report.json
+```
+
+训练集前缀扫描命令：
+
+```bash
+/mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_store_scaling.py \
+  --store 016000=experiments/stores/scale-sweep-20260706/training-tiers-v2/016000-with-train \
+  --store 032000=experiments/stores/scale-sweep-20260706/training-tiers-v2/032000-with-train \
+  --store 064000=experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train \
+  --queries /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --st-model /mnt/n0/models/bge-en-v1.5/ \
+  --seed-strategies vector,hybrid \
+  --entity-top-k 1 \
+  --subgraph-hops 2 \
+  --query-batch-size 100 \
+  --warmup-queries 10 \
+  --repeats 3 \
+  --limit 100 \
+  --output experiments/stores/scale-sweep-20260706/training_store_scaling_report_v2.json
+```
+
+100 条 query 的 BGE embedding 总计 547.34 ms，即 batch-100 摊销 5.47 ms/query。
+该时间与 Store 大小无关，下面的 Store breakdown 不重复包含它。
+训练集前缀扫描是在 Codex sandbox 中执行，CUDA 不可见，因此 query embedding 改为
+CPU 执行：100 条总计 1115.69 ms，即 11.16 ms/query。下面的 Store breakdown 同样
+不包含 query embedding。
+
+### 仅使用 vector seed
+
+表内各阶段为 warm `p50`；`Total p95` 来自逐 query total 分布，不能由各阶段 p95
+直接相加。
+
+| 档位       |      ANN |      局部图 |  KV text | KV tensor | Total p50 |  Total p95 |   候选 Triple/KV 均值 | Answer recall |
+| -------- | -------: | -------: | -------: | --------: | --------: | ---------: | ----------------: | ------------: |
+| `000100` | 0.536 ms | 0.899 ms | 0.510 ms |  1.459 ms |  3.431 ms |   4.320 ms |     19.61 / 39.42 |          0.92 |
+| `000237` | 0.454 ms | 0.606 ms | 0.374 ms |  0.897 ms |  2.353 ms |   2.956 ms |     20.55 / 41.38 |          0.90 |
+| `000537` | 1.145 ms | 1.073 ms | 0.592 ms |  1.569 ms |  4.359 ms |   6.848 ms |     23.35 / 46.98 |          0.88 |
+| `000837` | 0.660 ms | 0.678 ms | 0.408 ms |  0.890 ms |  2.650 ms |   4.750 ms |     26.32 / 52.92 |          0.89 |
+| `016000` | 1.586 ms | 2.193 ms | 1.418 ms |  1.606 ms |  7.065 ms |  96.201 ms |   239.08 / 479.53 |          0.87 |
+| `032000` | 1.448 ms | 3.955 ms | 2.358 ms |  2.384 ms | 10.184 ms | 175.717 ms |  666.73 / 1341.12 |          0.87 |
+| `064000` | 1.473 ms | 5.897 ms | 3.641 ms |  3.092 ms | 13.703 ms | 289.670 ms | 1135.16 / 2296.38 |          0.83 |
+
+在 272,775 entity 档位，warm HNSW p50 仍约 1.5 ms，说明 ANN 本身还不是主要瓶颈。
+但新增训练知识显著改变了 vector top-1 命中的局部图：候选 triple 均值从 26.32
+增到 1135.16，KV 均值从 52.92 增到 2296.38，导致 graph/KV 读 p95 明显膨胀。
+同时纯 vector top-1 answer recall 从 0.92 降到 0.83，额外实体已经带来明显近邻干扰。
+
+### 使用当前在线配置的 hybrid seed
+
+`mention` 是当前实现逐项遍历全部 entity name 的时间。
+
+| 档位       |      ANN | Mention scan |       局部图 |  KV text | KV tensor |   Total p50 |   Total p95 | Answer recall |
+| -------- | -------: | -----------: | --------: | -------: | --------: | ----------: | ----------: | ------------: |
+| `000100` | 0.313 ms |     3.888 ms |  0.621 ms | 0.350 ms |  0.927 ms |    6.102 ms |    9.660 ms |          0.92 |
+| `000237` | 0.483 ms |    11.037 ms |  0.664 ms | 0.379 ms |  0.929 ms |   13.486 ms |   21.415 ms |          0.92 |
+| `000537` | 0.680 ms |    22.122 ms |  0.714 ms | 0.398 ms |  0.981 ms |   24.999 ms |   39.248 ms |          0.92 |
+| `000837` | 0.737 ms |    31.718 ms |  0.674 ms | 0.386 ms |  0.910 ms |   34.463 ms |   36.881 ms |          0.92 |
+| `016000` | 2.248 ms |   474.935 ms |  2.503 ms | 1.521 ms |  1.826 ms |  486.252 ms |  582.920 ms |          0.88 |
+| `032000` | 2.813 ms |   783.265 ms |  4.756 ms | 2.787 ms |  2.951 ms |  802.659 ms |  986.140 ms |          0.90 |
+| `064000` | 3.885 ms |  1230.759 ms | 10.288 ms | 5.790 ms |  4.672 ms | 1267.780 ms | 1664.866 ms |          0.89 |
+
+小规模四档中 hybrid 保持了 0.92 answer recall，但 mention scan 从 1,016 entity
+时的 3.89 ms 增长到 9,253 entity 时的 31.72 ms，已经占 `000837` total p50 的
+92%。训练集前缀继续验证了这个问题：272,775 entity 时 mention scan p50 达到
+1230.76 ms，占 `064000` total p50 的 97%。相比之下，ANN、局部图、KV text 和
+tensor 四项合计约 24.64 ms。也就是说，在进入百万实体之前，当前 hybrid 的
+`O(entity_count)` Python 字符串扫描就已经成为主要瓶颈。
+
+下一步应优先把 mention matching 替换为 Aho-Corasick、Trie 或独立 alias index；
+否则即使 HNSW 保持亚毫秒级，完整候选检索仍会近似线性退化。
+
+## 一致性与限制
+
+- 切片追加得到的 `000237` 与原始完整 2Wiki Store 在 node/triple/KV/source 数量、
+  entity ID 和 KV offset 上一致。
+- GPU 分批编码不保证 bitwise deterministic。本次增量档与原始 `000237` 的最大
+  embedding 绝对差为 `8.24e-4`；样本组成和图结构可精确复现，浮点向量允许微小差异。
+- 当前结果覆盖 1K–273K entity、4K–1.64M KV 的区间。继续扩大前应先修复线性
+  mention scan，并为 KV `.npy` 追加预留额外完整数组空间；在 `064000` 档，一次
+  key 或 value 数组原子追加的额外峰值空间已经约 6.39 GiB。
+- `KV tensor` 阶段读取候选图关联的基础 key/value embedding，不包含 KBEncoder；
+  完整在线路径仍应结合本文前面的 V8 DAG/KBEncoder 分段结果一起评估。
+
+## full-store
+把当前所有样本合并到一个 Store 中，用于评估。
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/2wiki\_dev\_2hop\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/hotpot\_dev\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/musique\_dev\_tripled\_v5-qwen3.5-27B.jsonl
+- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/training\_set/merged\_multi\_hop\_train\_tripled\_v5\_qwen2.5-72B\_4bit.jsonl

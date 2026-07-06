@@ -89,6 +89,10 @@ class GraphStore:
         self._hnsw_meta: dict[str, Any] | None = None
         self._conn = open_sqlite(self.db_path)
         self._create_schema()
+        self._registered_dataset_ids = {
+            str(row["dataset_id"])
+            for row in self._conn.execute("SELECT dataset_id FROM datasets")
+        }
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -156,16 +160,37 @@ class GraphStore:
         self._hnsw_meta = None
         self._conn.close()
 
-    def register_dataset(self, dataset_id: str, source_path: str = "") -> None:
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+        self._registered_dataset_ids = {
+            str(row["dataset_id"])
+            for row in self._conn.execute("SELECT dataset_id FROM datasets")
+        }
+
+    def register_dataset(
+        self,
+        dataset_id: str,
+        source_path: str = "",
+        *,
+        commit: bool = True,
+    ) -> None:
+        dataset_id = str(dataset_id)
+        if dataset_id in self._registered_dataset_ids and not source_path:
+            return
         self._conn.execute(
             """
             INSERT INTO datasets(dataset_id, source_path) VALUES (?, ?)
             ON CONFLICT(dataset_id) DO UPDATE SET
                 source_path = CASE WHEN excluded.source_path != '' THEN excluded.source_path ELSE source_path END
             """,
-            (str(dataset_id), str(source_path)),
+            (dataset_id, str(source_path)),
         )
-        self._conn.commit()
+        self._registered_dataset_ids.add(dataset_id)
+        if commit:
+            self._conn.commit()
 
     def _get_or_add_node(self, name: str, kind: str) -> int:
         if kind not in {ENTITY, LITERAL}:
@@ -252,6 +277,7 @@ class GraphStore:
         source_index: int,
         triple_index: int,
         title: str = "",
+        commit: bool = True,
     ) -> int:
         triple_type = normalize_text(triple_type).upper()
         subject = normalize_text(subject)
@@ -262,7 +288,7 @@ class GraphStore:
         if not subject or not predicate or not object_value:
             raise ValueError("subject, predicate, and object_value must be non-empty")
 
-        self.register_dataset(dataset_id)
+        self.register_dataset(dataset_id, commit=False)
         subject_id = self._get_or_add_node(subject, ENTITY)
         object_kind = ENTITY if triple_type == "RELATION" else LITERAL
         object_id = self._get_or_add_node(object_value, object_kind)
@@ -294,7 +320,8 @@ class GraphStore:
             """,
             (triple_id, str(dataset_id), str(sample_id), int(source_index), int(triple_index), normalize_text(title)),
         )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
         return triple_id
 
     def _get_or_add_triple(

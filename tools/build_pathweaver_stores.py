@@ -118,42 +118,71 @@ def ingest_dataset(
     dataset_id: str,
     kv_store: KVStore,
     graph_store: GraphStore,
+    *,
+    sample_start: int = 0,
+    sample_limit: int | None = None,
+    commit_interval: int = 1,
 ) -> dict[str, int]:
+    if sample_start < 0:
+        raise ValueError("sample_start must be non-negative")
+    if sample_limit is not None and sample_limit <= 0:
+        raise ValueError("sample_limit must be positive when provided")
+    if commit_interval <= 0:
+        raise ValueError("commit_interval must be positive")
     graph_store.register_dataset(dataset_id, str(dataset_path.resolve()))
     stats = IngestStats()
+    deferred_commit = commit_interval > 1
 
-    for source_index, sample in enumerate(load_rows(dataset_path)):
-        stats.samples += 1
-        sample_id = str(sample.get("_id", sample.get("id", source_index)))
-        for triple_index, (title, raw_triple) in enumerate(iter_triples(sample)):
-            triple = ParsedTriple.from_raw(raw_triple)
-            if triple is None:
+    try:
+        for source_index, sample in enumerate(load_rows(dataset_path)):
+            if source_index < sample_start:
                 continue
-            stats.triples_seen += 1
-            kv_offsets = _store_kv_pairs(
-                kv_store,
-                raw_triple.get("kv_lists") or default_kv_pairs(triple),
-                triple,
-                dataset_id,
-                sample_id,
-                triple_index,
-                stats,
-            )
-            if not kv_offsets:
-                continue
-            graph_store.add_triple(
-                triple_type=triple.triple_type,
-                subject=triple.subject,
-                predicate=triple.predicate,
-                object_value=triple.object_value,
-                kv_offsets=kv_offsets,
-                dataset_id=dataset_id,
-                sample_id=sample_id,
-                source_index=source_index,
-                triple_index=triple_index,
-                title=title,
-            )
-            stats.triples_added += 1
+            if sample_limit is not None and stats.samples >= sample_limit:
+                break
+            stats.samples += 1
+            sample_id = str(sample.get("_id", sample.get("id", source_index)))
+            for triple_index, (title, raw_triple) in enumerate(iter_triples(sample)):
+                triple = ParsedTriple.from_raw(raw_triple)
+                if triple is None:
+                    continue
+                stats.triples_seen += 1
+                kv_offsets = _store_kv_pairs(
+                    kv_store,
+                    raw_triple.get("kv_lists") or default_kv_pairs(triple),
+                    triple,
+                    dataset_id,
+                    sample_id,
+                    triple_index,
+                    stats,
+                    commit=not deferred_commit,
+                )
+                if not kv_offsets:
+                    continue
+                graph_store.add_triple(
+                    triple_type=triple.triple_type,
+                    subject=triple.subject,
+                    predicate=triple.predicate,
+                    object_value=triple.object_value,
+                    kv_offsets=kv_offsets,
+                    dataset_id=dataset_id,
+                    sample_id=sample_id,
+                    source_index=source_index,
+                    triple_index=triple_index,
+                    title=title,
+                    commit=not deferred_commit,
+                )
+                stats.triples_added += 1
+            if deferred_commit and stats.samples % commit_interval == 0:
+                kv_store.commit()
+                graph_store.commit()
+        if deferred_commit:
+            kv_store.commit()
+            graph_store.commit()
+    except BaseException:
+        if deferred_commit:
+            kv_store.rollback()
+            graph_store.rollback()
+        raise
     return stats.as_dict()
 
 
@@ -165,6 +194,8 @@ def _store_kv_pairs(
     sample_id: str,
     triple_index: int,
     stats: IngestStats,
+    *,
+    commit: bool = True,
 ) -> list[int]:
     offsets = []
     for kv_index, kv in enumerate(kv_pairs):
@@ -182,6 +213,7 @@ def _store_kv_pairs(
                 sample_id=sample_id,
                 triple_index=triple_index,
                 kv_index=kv_index,
+                commit=commit,
             )
         )
     return offsets
@@ -321,6 +353,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--store-dir", type=Path, required=True)
     parser.add_argument("--dataset-id", type=str, default=None)
+    parser.add_argument(
+        "--sample-start",
+        type=int,
+        default=0,
+        help="Zero-based source row at which ingestion starts.",
+    )
+    parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=None,
+        help="Maximum rows to ingest after --sample-start.",
+    )
+    parser.add_argument(
+        "--commit-interval",
+        type=int,
+        default=1,
+        help="Commit every N selected samples; values >1 accelerate large ingests.",
+    )
     parser.add_argument("--alias-file", type=Path, default=None)
     parser.add_argument(
         "--hnsw-embedding-model",
@@ -363,7 +413,15 @@ def main() -> None:
     with KVStore(kv_dir) as kv_store, GraphStore(graph_dir, resolver=resolver) as graph_store:
         before_kv = len(kv_store)
         before_graph = graph_store.stats()
-        ingest_counts = ingest_dataset(args.dataset_path, dataset_id, kv_store, graph_store)
+        ingest_counts = ingest_dataset(
+            args.dataset_path,
+            dataset_id,
+            kv_store,
+            graph_store,
+            sample_start=args.sample_start,
+            sample_limit=args.sample_limit,
+            commit_interval=args.commit_interval,
+        )
 
         if args.hnsw_embedding_model:
             build_entity_embeddings(
@@ -393,6 +451,9 @@ def main() -> None:
             {
                 "dataset_id": dataset_id,
                 "dataset_path": str(args.dataset_path),
+                "sample_start": args.sample_start,
+                "sample_limit": args.sample_limit,
+                "commit_interval": args.commit_interval,
                 "ingest": ingest_counts,
                 "kv_records_before": before_kv,
                 "kv_records_after": len(kv_store),
