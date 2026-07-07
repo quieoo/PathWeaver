@@ -212,11 +212,10 @@ class GraphStore:
         else:
             node_id = int(row["node_id"])
             if row["kind"] == LITERAL and kind == ENTITY:
-                # An attribute value can later become a relation endpoint. Its
-                # promotion changes the searchable entity set, so stale vectors
-                # must not remain queryable.
-                self._conn.execute("UPDATE nodes SET kind = ? WHERE node_id = ?", (ENTITY, node_id))
-                self._invalidate_entity_vectors()
+                # A node only becomes searchable once it appears as a subject.
+                # If it was previously created as a literal/object-only node,
+                # promote it and repair historical relation edges that point to it.
+                self._promote_node_to_entity(node_id)
 
         alias_name = normalize_text(name)
         alias_key = canonical_entity_key(alias_name)
@@ -226,6 +225,23 @@ class GraphStore:
                 (alias_key, alias_name, node_id),
             )
         return node_id
+
+    def _promote_node_to_entity(self, node_id: int) -> None:
+        row = self._conn.execute("SELECT kind FROM nodes WHERE node_id = ?", (int(node_id),)).fetchone()
+        if row is None:
+            raise KeyError(node_id)
+        if str(row["kind"]) == ENTITY:
+            return
+        self._conn.execute("UPDATE nodes SET kind = ? WHERE node_id = ?", (ENTITY, int(node_id)))
+        self._conn.execute(
+            """
+            UPDATE triples
+            SET object_kind = ?
+            WHERE object_id = ? AND triple_type = 'RELATION'
+            """,
+            (ENTITY, int(node_id)),
+        )
+        self._invalidate_entity_vectors()
 
     def _find_node(self, canonical_key: str, alias_key: str) -> sqlite3.Row | None:
         row = self._conn.execute(
@@ -290,8 +306,16 @@ class GraphStore:
 
         self.register_dataset(dataset_id, commit=False)
         subject_id = self._get_or_add_node(subject, ENTITY)
-        object_kind = ENTITY if triple_type == "RELATION" else LITERAL
+        object_kind = LITERAL
         object_id = self._get_or_add_node(object_value, object_kind)
+        if triple_type == "RELATION":
+            object_row = self._conn.execute(
+                "SELECT kind FROM nodes WHERE node_id = ?",
+                (int(object_id),),
+            ).fetchone()
+            if object_row is None:
+                raise KeyError(object_id)
+            object_kind = str(object_row["kind"])
         triple_key = content_hash(
             triple_type,
             self._node_field(subject_id, "canonical_key"),

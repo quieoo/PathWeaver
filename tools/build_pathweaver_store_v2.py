@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also copy the V1 graph/kv directories under canonical/ for debugging and provenance.",
     )
+    parser.add_argument(
+        "--subject-only-entities",
+        action="store_true",
+        help="Keep only nodes that appear as a triple subject in the V2 entity set.",
+    )
     return parser.parse_args()
 
 
@@ -39,12 +44,18 @@ def main() -> None:
     args = parse_args()
     src = args.source_store_dir
     dst = args.output_store_dir
+    if dst.exists():
+        shutil.rmtree(dst)
     dst.mkdir(parents=True, exist_ok=True)
 
     with KVStore(src / "kv", create=False) as kv_store:
         KVStoreV2.export_from_v1(dst / "kv_v2", kv_store, segment_rows=args.segment_rows).close()
     with GraphStore(src / "graph", create=False) as graph_store:
-        GraphStoreV2.export_from_v1(dst / "graph_v2", graph_store).close()
+        GraphStoreV2.export_from_v1(
+            dst / "graph_v2",
+            graph_store,
+            subject_only_entities=args.subject_only_entities,
+        ).close()
 
     if args.copy_canonical:
         copy_tree(src / "kv", dst / "canonical" / "kv")
@@ -56,6 +67,7 @@ def main() -> None:
         "output_store_dir": str(dst.resolve()),
         "segment_rows": args.segment_rows,
         "copy_canonical": args.copy_canonical,
+        "subject_only_entities": args.subject_only_entities,
     }
     (dst / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))

@@ -188,17 +188,35 @@ class GraphStoreV2:
         return sorted(visited), list(triples.values())
 
     @classmethod
-    def export_from_v1(cls, root: str | Path, source_store: GraphStore) -> "GraphStoreV2":
+    def export_from_v1(
+        cls,
+        root: str | Path,
+        source_store: GraphStore,
+        *,
+        subject_only_entities: bool = False,
+    ) -> "GraphStoreV2":
         dst = cls(root, create=True)
         conn = sqlite3.connect(f"file:{source_store.db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
-            entities = conn.execute(
-                "SELECT node_id, canonical_name FROM nodes WHERE kind = 'entity' ORDER BY node_id"
-            ).fetchall()
+            if subject_only_entities:
+                entities = conn.execute(
+                    """
+                    SELECT DISTINCT n.node_id, n.canonical_name
+                    FROM triples t
+                    JOIN nodes n ON n.node_id = t.subject_id
+                    WHERE n.kind = 'entity'
+                    ORDER BY n.node_id
+                    """
+                ).fetchall()
+            else:
+                entities = conn.execute(
+                    "SELECT node_id, canonical_name FROM nodes WHERE kind = 'entity' ORDER BY node_id"
+                ).fetchall()
             entity_node_ids = np.asarray([int(row["node_id"]) for row in entities], dtype=np.int64)
             entity_names = [str(row["canonical_name"]) for row in entities]
             node_id_to_entity_pos = {int(node_id): idx for idx, node_id in enumerate(entity_node_ids.tolist())}
+            entity_node_id_set = set(entity_node_ids.tolist())
 
             alias_rows = conn.execute(
                 """
@@ -210,7 +228,10 @@ class GraphStoreV2:
             ).fetchall()
             alias_map: dict[int, list[dict[str, str]]] = {node_id: [] for node_id in entity_node_ids.tolist()}
             for row in alias_rows:
-                alias_map[int(row["node_id"])].append(
+                node_id = int(row["node_id"])
+                if node_id not in alias_map:
+                    continue
+                alias_map[node_id].append(
                     {"alias_name": str(row["alias_name"]), "alias_key": str(row["alias_key"])}
                 )
 
@@ -238,6 +259,8 @@ class GraphStoreV2:
                 ORDER BY t.triple_id
                 """
             ).fetchall()
+            if subject_only_entities:
+                triples = [row for row in triples if int(row["subject_id"]) in entity_node_id_set]
 
             triple_ids = np.asarray([int(row["triple_id"]) for row in triples], dtype=np.int64)
             triple_subject_pos = np.asarray(
@@ -305,14 +328,28 @@ class GraphStoreV2:
             np.save(dst.root / "triple_kv_index.npy", np.asarray(triple_kv_index, dtype=np.int64))
             np.save(dst.root / "triple_kv_offsets.npy", np.asarray(triple_kv_offsets, dtype=np.int64))
 
-            if source_store.entity_ids_path.exists():
-                shutil.copy2(source_store.entity_ids_path, dst.entity_ids_path)
-            if source_store.entity_vectors_path.exists():
-                shutil.copy2(source_store.entity_vectors_path, dst.entity_vectors_path)
-            if source_store.hnsw_index_path.exists():
-                shutil.copy2(source_store.hnsw_index_path, dst.hnsw_index_path)
-            if source_store.hnsw_meta_path.exists():
-                shutil.copy2(source_store.hnsw_meta_path, dst.hnsw_meta_path)
+            if source_store.entity_ids_path.exists() and source_store.entity_vectors_path.exists():
+                src_ids, src_vectors = source_store._load_entity_vectors()
+                src_ids_list = [int(node_id) for node_id in src_ids.tolist()]
+                src_pos = {node_id: idx for idx, node_id in enumerate(src_ids_list)}
+                kept_ids = [node_id for node_id in entity_node_ids.tolist() if int(node_id) in src_pos]
+                kept_vectors = np.asarray([src_vectors[src_pos[int(node_id)]] for node_id in kept_ids], dtype=np.float32)
+                np.save(dst.entity_ids_path, np.asarray(kept_ids, dtype=np.int64))
+                np.save(dst.entity_vectors_path, kept_vectors)
+                if source_store.hnsw_index_path.exists() and source_store.hnsw_meta_path.exists():
+                    try:
+                        hnswlib = cls._require_hnswlib()
+                        index = hnswlib.Index(space="cosine", dim=int(kept_vectors.shape[1]))
+                        index.init_index(max_elements=int(len(kept_ids)), ef_construction=200, M=16)
+                        index.add_items(kept_vectors, np.asarray(kept_ids, dtype=np.int64))
+                        index.set_ef(max(50, min(200, int(len(kept_ids)))))
+                        index.save_index(str(dst.hnsw_index_path))
+                        write_json_atomic(
+                            dst.hnsw_meta_path,
+                            {"space": "cosine", "dim": int(kept_vectors.shape[1]), "count": int(len(kept_ids))},
+                        )
+                    except ImportError:
+                        pass
 
             write_json_atomic(
                 dst.manifest_path,
@@ -321,6 +358,7 @@ class GraphStoreV2:
                     "triples": int(triple_ids.shape[0]),
                     "triple_kvs": int(len(triple_kv_offsets)),
                     "exported_from_v1": str(source_store.root),
+                    "subject_only_entities": bool(subject_only_entities),
                 },
             )
             return dst
