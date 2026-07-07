@@ -188,6 +188,8 @@ def prepare_online_retriever(args, encoder) -> OnlineDAGKBRetriever:
         search_backend=args.online_search_backend,
         seed_strategy=args.online_seed_strategy,
         mention_min_chars=args.online_mention_min_chars,
+        store_version=args.online_store_version,
+        entity_candidate_top_k=args.online_entity_candidate_top_k,
         use_multihop_adj=True,
         max_hops=args.max_hops,
         hop_decay=args.hop_decay,
@@ -352,7 +354,9 @@ def main() -> None:
     parser.add_argument("--online_dag_model_ckpt", type=str, default="")
     parser.add_argument("--online_st_model", type=str, default="")
     parser.add_argument("--online_entity_top_k", type=int, default=1)
+    parser.add_argument("--online_entity_candidate_top_k", type=int, default=64)
     parser.add_argument("--online_subgraph_hops", type=int, default=2)
+    parser.add_argument("--online_store_version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--online_search_backend", choices=["hnsw", "exact"], default="hnsw")
     parser.add_argument("--online_seed_strategy", choices=["vector", "hybrid"], default="vector")
     parser.add_argument("--online_mention_min_chars", type=int, default=8)

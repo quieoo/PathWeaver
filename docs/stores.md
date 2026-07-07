@@ -810,10 +810,3 @@ tensor 四项合计约 24.64 ms。也就是说，在进入百万实体之前，�
   key 或 value 数组原子追加的额外峰值空间已经约 6.39 GiB。
 - `KV tensor` 阶段读取候选图关联的基础 key/value embedding，不包含 KBEncoder；
   完整在线路径仍应结合本文前面的 V8 DAG/KBEncoder 分段结果一起评估。
-
-## full-store
-把当前所有样本合并到一个 Store 中，用于评估。
-- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/2wiki\_dev\_2hop\_tripled\_v5-qwen3.5-27B.jsonl
-- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/hotpot\_dev\_tripled\_v5-qwen3.5-27B.jsonl
-- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/test\_set/musique\_dev\_tripled\_v5-qwen3.5-27B.jsonl
-- /mnt/n0/datasets/wiki\_hotspot\_musique/merged\_data/dag-kv/training\_set/merged\_multi\_hop\_train\_tripled\_v5\_qwen2.5-72B\_4bit.jsonl

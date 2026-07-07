@@ -11,6 +11,7 @@ import torch
 
 from kblam.dag_kv_retriever import _build_multihop_adj
 from kblam.dag_store_retriever import DAGKVStoreRetriever, TextEmbedder, TrainableDAGExtractor
+from kblam.dag_store_retriever_v2 import DAGKVStoreRetrieverV2
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,8 @@ class OnlineDAGKBRetriever:
         query_prompt_name: str | None = None,
         seed_strategy: str = "vector",
         mention_min_chars: int = 8,
+        store_version: str = "v1",
+        entity_candidate_top_k: int = 64,
         use_multihop_adj: bool = True,
         max_hops: int = 10,
         hop_decay: float = 1.0,
@@ -50,17 +53,34 @@ class OnlineDAGKBRetriever:
             raise ValueError("Online retrieval requires the answer-blind v8 DAG backend")
         self.encoder = encoder
         self.dag_extractor = dag_extractor
-        self.store_retriever = DAGKVStoreRetriever(
-            store_dir,
-            entity_embedder,
-            entity_top_k=entity_top_k,
-            subgraph_hops=subgraph_hops,
-            max_triples_per_seed=max_triples_per_seed,
-            search_backend=search_backend,
-            query_prompt_name=query_prompt_name,
-            seed_strategy=seed_strategy,
-            mention_min_chars=mention_min_chars,
-        )
+        if store_version not in {"v1", "v2"}:
+            raise ValueError("store_version must be 'v1' or 'v2'")
+        if store_version == "v2":
+            self.store_retriever = DAGKVStoreRetrieverV2(
+                store_dir,
+                entity_embedder,
+                entity_top_k=entity_top_k,
+                entity_candidate_top_k=entity_candidate_top_k,
+                subgraph_hops=subgraph_hops,
+                max_triples_per_seed=max_triples_per_seed,
+                search_backend=search_backend,
+                query_prompt_name=query_prompt_name,
+                seed_strategy=seed_strategy,
+                mention_min_chars=mention_min_chars,
+            )
+        else:
+            self.store_retriever = DAGKVStoreRetriever(
+                store_dir,
+                entity_embedder,
+                entity_top_k=entity_top_k,
+                subgraph_hops=subgraph_hops,
+                max_triples_per_seed=max_triples_per_seed,
+                search_backend=search_backend,
+                query_prompt_name=query_prompt_name,
+                seed_strategy=seed_strategy,
+                mention_min_chars=mention_min_chars,
+            )
+        self.store_version = store_version
         self.use_multihop_adj = use_multihop_adj
         self.max_hops = max_hops
         self.hop_decay = hop_decay
