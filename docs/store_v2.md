@@ -800,8 +800,86 @@ PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/audit_relation_objects.py 
 
 ## 64k 知识库：online generation 全路径
 
+上面的 `subject-only entity` 规则解决了“坏 seed 选到泛化 hub”的问题，但 64k store 的
+`kv_per_entity` 长尾仍然很明显：`p95=36`、`p99=86`、`max=3091`。因此这里继续加一层
+query-time 扩图限流：
+
+- 新参数名：`max_incident_triples_per_node`
+- 语义：`get_local_subgraph(...)` 在扩展每个 entity frontier 时，只读取前
+  `N` 条 incident triples；
+- 作用范围：只影响在线局部图恢复，不改离线 store artifact；
+- 当前实现会同时作用在 seed 和后续 hop frontier 上，因此它更接近“expanded-node cap”，
+  不是 V2 export 阶段的永久裁剪。
+
+代码接入点已经补到：
+
+- `GraphStore.get_local_subgraph(...)`
+- `GraphStoreV2.get_local_subgraph(...)`
+- `DAGKVStoreRetriever{,V2}`
+- `OnlineDAGKBRetriever`
+- `experiments/eval_generation_dag_kv.py`
+- `tools/benchmark_pathweaver_store_v2.py`
+
+### Store-only：cap=32
+
+先在 64k subject-only V2 store 上做 retrieval-only benchmark，确认这层 cap 是否真的把
+candidate graph 再压下去。
+
+```bash
+cd /mnt/n0/PathWeaver
+
+PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_store_v2.py \
+  --store-v1 experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train \
+  --store-v2 experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train-store-v2-subject-only \
+  --queries /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --st-model /mnt/n0/models/bge-en-v1.5/ \
+  --entity-top-k 1 \
+  --entity-candidate-top-k 64 \
+  --subgraph-hops 2 \
+  --max-incident-triples-per-node 32 \
+  --seed-strategy hybrid \
+  --mention-min-chars 8 \
+  --limit 100 \
+  --warmup-queries 10 \
+  --repeats 1 \
+  --search-backend hnsw \
+  --output experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train-store-v2-subject-only/benchmark_v1_vs_v2_subject_only_cap32_r1.json
+```
+
+为了避免把旧 `repeats=3` 和这次新实验混在一起，这里额外保存了一份同配置、同
+`limit=100 / warmup=10 / repeats=1` 的 no-cap 基线：
+
+- `benchmark_v2_subject_only_nocap_store_only.json`
+- `benchmark_v2_subject_only_cap32_store_only.json`
+
+结果如下：
+
+| Metric | subject-only 无 cap | subject-only + cap32 |
+| --- | ---: | ---: |
+| candidate triples mean | 626.18 | 76.98 |
+| candidate KV mean | 1260.04 | 156.39 |
+| answer recall | 1.00 | 1.00 |
+| ann p50 | 1.43 ms | 1.39 ms |
+| mention p50 | 0.148 ms | 0.144 ms |
+| graph p50 | 1.66 ms | 1.03 ms |
+| kv_text p50 | 2.35 ms | 1.28 ms |
+| kv_tensor p50 | 1.26 ms | 0.67 ms |
+| total p50 | 6.95 ms | 4.46 ms |
+| total p95 | 152.33 ms | 9.52 ms |
+| total p99 | 248.52 ms | 11.62 ms |
+
+这个结果说明：
+
+- `cap32` 没有伤到 retrieval-only `answer_recall`；
+- candidate graph 均值从 `626 -> 77`，candidate KV 均值从 `1260 -> 156`；
+- tail 基本被直接截断，`total p95/p99` 从 `152/249 ms` 掉到 `9.5/11.6 ms`；
+- 所以这层限制确实打中了剩下的长尾扩图问题，而不只是“均值略微变小”。
+
+### End-to-End：cap=32
+
 下面这条命令是在 64k subject-only V2 store 上跑完整在线链路：实体检索、局部图恢复、
 V8 answer-blind DAG 提取、KV tensor 恢复、KBEncoder 投影，以及 Qwen3-14B generation。
+和原命令相比，只新增了一行 `--online_max_incident_triples_per_node 32`。
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
@@ -836,6 +914,7 @@ python experiments/eval_generation_dag_kv.py \
   --online_entity_top_k 1 \
   --online_entity_candidate_top_k 64 \
   --online_subgraph_hops 2 \
+  --online_max_incident_triples_per_node 32 \
   --online_search_backend hnsw \
   --online_seed_strategy hybrid \
   --online_mention_min_chars 8 \
@@ -858,19 +937,141 @@ python experiments/eval_generation_dag_kv.py \
   --max_hops 10 \
   --hop_decay 1.0 \
   --dynamic_hops_by_longest_path \
-  --save_json experiments/results/online_dag_eval/online_store_v2_64k_subject_only_hybrid_top1_hop2_sink3_heuristic_100.json
+  --save_json experiments/results/online_dag_eval/online_store_v2_64k_subject_only_cap32_hybrid_top1_hop2_sink3_heuristic_100.json
 ```
 
-当前文档里还没有补入这条命令对应的 subject-only online generation 实测结果；跑完后建议把
-`performance`、`[OnlineDAG]` stage breakdown，以及 `EM / F1 / Faithfulness01` 贴回本节。
+这次 cap32 的 100 条在线结果已经落到：
 
-结果建议单独写到：
+- `experiments/results/online_dag_eval/online_store_v2_64k_subject_only_cap32_hybrid_top1_hop2_sink3_heuristic_100.json`
 
-```text
-experiments/results/online_dag_eval/online_store_v2_64k_subject_only_hybrid_top1_hop2_sink3_heuristic_100.json
-```
+对比现有的 subject-only baseline：
 
-这样可以和 base 2Wiki V2 的在线结果分开保存，避免覆盖。
+- baseline: `online_store_v2_64k_subject_only_hybrid_top1_hop2_sink3_heuristic_100.json`
+- cap32: `online_store_v2_64k_subject_only_cap32_hybrid_top1_hop2_sink3_heuristic_100.json`
+
+| Metric | subject-only baseline | subject-only + cap32 |
+| --- | ---: | ---: |
+| EM | 0.35 | 0.38 |
+| F1 overlap | 0.4719 | 0.5093 |
+| empty DAGs | 0 | 0 |
+| retrieval candidate stage | 53.91 ms | 44.59 ms |
+| retrieval dag stage | 967.89 ms | 1817.28 ms |
+| retrieval total | 1022.97 ms | 1880.26 ms |
+| end-to-end avg latency | 1.39 s | 8.00 s |
+| qps | 0.719 | 0.125 |
+
+几点需要分开看：
+
+- 从任务指标看，`cap32` 这次确实没有伤精度，反而把 `EM` 从 `0.35` 提到 `0.38`，`F1`
+  从 `0.472` 提到 `0.509`；
+- 从 retrieval-only benchmark 看，candidate graph 和 tail latency 也明显变小；
+- 但这次 full end-to-end run 的 wall-clock latency 没有同步下降，反而更慢；
+- 慢的部分主要不在 candidate stage，而是在这次运行里的 DAG stage / generation stage；
+- 因此当前可以比较确定的是：`cap32` 对 candidate graph 控制和答案指标是正向的，但 full
+  online wall-clock 还混入了较强的运行时漂移，不能直接把这次总时延回升解释成“cap32
+  让检索本身变慢了”。
+
+换句话说，现阶段最稳的结论是：
+
+- `subject-only` 负责修 seed；
+- `cap32` 负责进一步砍掉 hub-like frontier 的 incident triples 长尾；
+- 对 candidate graph / retrieval-only latency / EM/F1，这两层都是正向的；
+- 如果后面要进一步判断 end-to-end latency，最好在同一轮环境里把 baseline 和 cap32
+  back-to-back 重跑一次，避免把 generation 侧的漂移误归因到 retrieval。
+
+### cap sweep
+
+
+````bash
+cd /mnt/n0/PathWeaver
+
+CUDA_VISIBLE_DEVICES=0 \
+CAP_LIST="none 64 48 32 24 16" \
+MAX_SAMPLES=100 \
+EVAL_BATCH_SIZE=10 \
+OUTPUT_DIR=experiments/results/online_dag_eval/cap_sweep_64k_subject_only \
+bash tools/run_online_cap_sweep.sh
+````
+
+结论：
+最稳的区间是 24-48，其中我会优先推荐 24 作为新默认，48 作为更保守备选。
+原因很直接：
+none -> 64 -> 48 -> 32 -> 24，时延一路稳定下降，说明这次裁剪确实一直在减轻 DAG 阶段负担。
+EM/F1/Faithfulness 在 48/32/24 这几个点都比 none 好。
+16 虽然更快，但已经开始出现明显退化信号，尤其样例 0 已经答偏，EM 也从 0.39/0.41 掉回 0.36。
+如果按“精度优先但保留明显提速”来选：
+48：EM=0.41，是这轮最高；F1=0.529
+24：EM=0.39，但 F1=0.534、Faithfulness=0.52，而且 retrieval 更快
+32：整体介于两者之间，但没有明显胜过 24 或 48
+
+从 profiling 看，真正的大头一直是 encode：
+none: encode=682 ms
+64: 204 ms
+48: 163 ms
+32: 134 ms
+24: 123 ms
+16: 100 ms
+
+优化encoder：
+- 显式把 ST embedder 固定到 GPU
+- 增大embedding_batch_size
+- 把两组 encode 合并成一次
+
+新的cap=24命令
+````bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python \
+/mnt/n0/PathWeaver/experiments/eval_generation_dag_kv.py \
+  --data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --model_path /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800 \
+  --base_model_name_or_path /mnt/n0/models/qwen3-14B-Instruct \
+  --encoder_path /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_type qwen3 \
+  --kb_layer_frequency 3 \
+  --kb_scale_factor 4 \
+  --path_attn \
+  --path_attn_mix_ratio 0.8 \
+  --step 7999 \
+  --t_step 8000 \
+  --max_samples 100 \
+  --seed 0 \
+  --eval_batch_size 10 \
+  --online_store_dir experiments/stores/scale-sweep-20260706/training-tiers-v2/064000-with-train-store-v2-subject-only \
+  --online_store_version v2 \
+  --online_dag_script docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py \
+  --online_dag_model_ckpt /mnt/n0/KBLAM/KBLaM/experiments/subgraph_mlp/subgraphrag_mlp_v2.1.pt \
+  --online_st_model /mnt/n0/models/bge-en-v1.5/ \
+  --online_entity_top_k 1 \
+  --online_entity_candidate_top_k 64 \
+  --online_subgraph_hops 2 \
+  --online_max_incident_triples_per_node 24 \
+  --online_search_backend hnsw \
+  --online_seed_strategy hybrid \
+  --online_mention_min_chars 8 \
+  --online_infer_batch_size 1024 \
+  --online_embedding_batch_size 256 \
+  --online_topic_top_k 8 \
+  --online_dde_hops 3 \
+  --online_mention_bonus 0.2 \
+  --online_seed_edge_topk 18 \
+  --online_expansion_hops 2 \
+  --online_per_src_cap 3 \
+  --online_max_nodes 30 \
+  --online_max_edges 40 \
+  --online_max_sinks 3 \
+  --online_reverse_sink_edge_topk 2 \
+  --online_reverse_sink_hops 4 \
+  --online_reverse_sink_beam_width 4 \
+  --online_selection_mode legacy \
+  --online_terminal_reranker heuristic \
+  --use_multihop_adj \
+  --max_hops 10 \
+  --hop_decay 1.0 \
+  --dynamic_hops_by_longest_path \
+  --save_json experiments/results/online_dag_eval/online_store_v2_64k_subject_only_cap24_emb256_top1_hop2_sink3_heuristic_100.json
+
+````
+
 
 ## KV per Entity 
 
@@ -920,4 +1121,433 @@ cd /mnt/n0/PathWeaver
     "max": 98
   }
 }
+```
+
+## 从零重建全部 sample size 的 V2 store，并跑到 end2end
+
+如果前一轮 `scale-sweep-20260706` 是按 V1 规则构建的，那么当前要“从头重建一遍
+V2”时，正确做法仍然是：
+
+1. 先从原始数据重新构建 V1 canonical store；
+2. 再逐档导出成 V2 serving snapshot；
+3. 最后在这些 V2 snapshot 上做 retrieval-only 和 end2end online eval。
+
+这是因为当前 V2 的设计本来就是“两层”：
+
+- V1 负责 canonical ingest 和去重；
+- V2 负责 serving/export 和在线热路径。
+
+下面这套命令覆盖之前 `store.md` 里的全部 sample size：
+
+- `000100`
+- `000237`
+- `000537`
+- `000837`
+- `016000`
+- `032000`
+- `064000`
+
+下面这版命令明确采用“全 qwen 对齐”口径：
+
+- entity retrieval embedding: `qwen-embedding-0.6B`
+- DAG feature embedding: `qwen-embedding-0.6B`
+- KV base embedding: `qwen-embedding-0.6B`
+- 统一 profile: `qwen3-embedding-v2`
+- 统一 prompt: `query`
+
+重新训练一版qwen embedding的MLP模型：
+````bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+nohup python -u /mnt/n0/PathWeaver/docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v5_2.py \
+  --mode train \
+  --input /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_hybrid_multihop_training_v2.1.jsonl \
+  --model_ckpt /mnt/n0/PathWeaver/experiments/subgraph_mlp/subgraphrag_mlp_v2.1_qwen.pt \
+  --st_model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --st_encoding_profile qwen3-embedding-v2 \
+  --st_prompt_name query \
+  --batch_size 1024 \
+  --train_batch_size 2048 \
+  --num_workers 0 \
+  --disable_pin_memory \
+  --topic_top_k 6 \
+  --dde_hops 3 \
+  --epochs 100 \
+  --lr 3e-4 \
+  --neg_pos_ratio 5 \
+  --train_cache_path /mnt/n0/PathWeaver/experiments/subgraph_mlp/training_data_cache_merged_v2.1_qwen.pkl \
+  --rebuild_train_cache \
+  --hidden_dim 768 \
+  --patience 10 \
+  --joint_training \
+  --joint_lambda 0.4 \
+  --end_alpha 0.60 \
+  --end_beta 0.35 \
+  --end_gamma 0.25 \
+  --end_threshold 0.3 \
+  > /mnt/n0/PathWeaver/experiments/subgraph_mlp/train_v5_2.log 2>&1 &
+
+echo "PID: $!"
+
+# PID: 2245063
+````
+
+
+
+### 1. 从空目录重建 V1 canonical tiers
+
+先重建最小 base store：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+/mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_stores.py \
+  --dataset-path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --dataset-id 2wiki-dev-v5 \
+  --sample-start 0 \
+  --sample-limit 100 \
+  --store-dir experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki \
+  --hnsw-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --kv-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --hnsw-embedding-batch-size 4096 \
+  --kv-embedding-batch-size 4096 \
+  --hnsw-encoding-profile qwen3-embedding-v2 \
+  --hnsw-prompt-name query \
+  --kv-encoding-profile qwen3-embedding-v2 \
+  --kv-prompt-name query \
+  --build-hnsw
+```
+
+在它基础上继续构建 `000237 / 000537 / 000837`：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+/mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_scale_sweep.py \
+  --base-store experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki \
+  --output-root experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers \
+  --base-label 000100-2wiki \
+  --append-tier '000237-2wiki::2wiki-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl::100::137' \
+  --append-tier '000537-2wiki-hotpot::hotpot-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/hotpot_dev_tripled_v5-qwen3.5-27B.jsonl' \
+  --append-tier '000837-2wiki-hotpot-musique::musique-dev-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/musique_dev_tripled_v5-qwen3.5-27B.jsonl' \
+  --hnsw-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --kv-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --hnsw-embedding-batch-size 4096 \
+  --kv-embedding-batch-size 4096 \
+  --hnsw-encoding-profile qwen3-embedding-v2 \
+  --hnsw-prompt-name query \
+  --kv-encoding-profile qwen3-embedding-v2 \
+  --kv-prompt-name query \
+  --ingest-commit-interval 100
+```
+
+再在 `000837` 基础上继续构建训练集扩容档位 `016000 / 032000 / 064000`：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+/mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_scale_sweep.py \
+  --base-store experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000837-2wiki-hotpot-musique \
+  --output-root experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers \
+  --base-label 000837-2wiki-hotpot-musique \
+  --append-tier '016000-with-train::train-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl::0::15163' \
+  --append-tier '032000-with-train::train-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl::15163::16000' \
+  --append-tier '064000-with-train::train-v5::/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/training_set/merged_multi_hop_train_tripled_v5_qwen2.5-72B_4bit.jsonl::31163::32000' \
+  --hnsw-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --kv-embedding-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --hnsw-embedding-batch-size 4096 \
+  --kv-embedding-batch-size 4096 \
+  --hnsw-encoding-profile qwen3-embedding-v2 \
+  --hnsw-prompt-name query \
+  --kv-encoding-profile qwen3-embedding-v2 \
+  --kv-prompt-name query \
+  --ingest-commit-interval 100
+```
+
+### 2. 逐档导出全部 V2 snapshot
+
+先导出 base/dev 四档：
+
+```bash
+cd /mnt/n0/PathWeaver
+
+for label in \
+  000237-2wiki \
+  000537-2wiki-hotpot \
+  000837-2wiki-hotpot-musique
+do
+  PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_v2.py \
+    --source-store-dir "experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/${label}" \
+    --output-store-dir "experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/${label}-store-v2-subject-only" \
+    --segment-rows 131072 \
+    --subject-only-entities
+done
+```
+
+`000100` 是 base store，本身不在 `tiers/` 目录里，需要单独导出一次：
+
+```bash
+cd /mnt/n0/PathWeaver
+
+PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_v2.py \
+  --source-store-dir experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki \
+  --output-store-dir experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki-store-v2-subject-only \
+  --segment-rows 131072 \
+  --subject-only-entities
+```
+
+再导出训练集扩容三档：
+
+```bash
+cd /mnt/n0/PathWeaver
+
+for label in \
+  016000-with-train \
+  032000-with-train \
+  064000-with-train
+do
+  PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_v2.py \
+    --source-store-dir "experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/${label}" \
+    --output-store-dir "experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/${label}-store-v2-subject-only" \
+    --segment-rows 131072 \
+    --subject-only-entities
+done
+```
+
+<!-- 如果你要继续沿用前面验证过更稳的 `subject-only entity` 规则，可以额外只导出一份
+`064000` 的 subject-only snapshot：
+
+```bash
+cd /mnt/n0/PathWeaver
+
+PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/build_pathweaver_store_v2.py \
+  --source-store-dir experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train \
+  --output-store-dir experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only \
+  --segment-rows 131072 \
+  --subject-only-entities
+``` -->
+
+### 3. 跑全部 sample size 的 retrieval-only V1 vs V2 对比
+
+`benchmark_pathweaver_store_v2.py` 一次只能对比一对 store。下面这组循环会把全部档位都跑一遍：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+QUERY_FILE=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl
+
+declare -A V1_STORES=(
+  [000100]=experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki
+  [000237]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000237-2wiki
+  [000537]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000537-2wiki-hotpot
+  [000837]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000837-2wiki-hotpot-musique
+  [016000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/016000-with-train
+  [032000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/032000-with-train
+  [064000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train
+)
+
+declare -A V2_STORES=(
+  [000100]=experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki-store-v2-subject-only
+  [000237]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000237-2wiki-store-v2-subject-only
+  [000537]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000537-2wiki-hotpot-store-v2-subject-only
+  [000837]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000837-2wiki-hotpot-musique-store-v2-subject-only
+  [016000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/016000-with-train-store-v2-subject-only
+  [032000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/032000-with-train-store-v2-subject-only
+  [064000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only
+)
+
+for label in 000100 000237 000537 000837 016000 032000 064000
+do
+  PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_store_v2.py \
+    --store-v1 "${V1_STORES[$label]}" \
+    --store-v2 "${V2_STORES[$label]}" \
+    --queries "$QUERY_FILE" \
+    --st-model /mnt/n0/models/qwen-embedding-0.6B/ \
+    --st-encoding-profile qwen3-embedding-v2 \
+    --query-prompt-name query \
+    --entity-top-k 1 \
+    --entity-candidate-top-k 64 \
+    --subgraph-hops 2 \
+    --seed-strategy hybrid \
+    --search-backend hnsw \
+    --limit 100 \
+    --warmup-queries 10 \
+    --repeats 3 \
+    --query-batch-size 100 \
+    --output "${V2_STORES[$label]}/benchmark_v1_vs_v2.json"
+done
+```
+
+如果只想单独看 `064000 subject-only + cap24` 的 retrieval-only 路径，可以继续用：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+cd /mnt/n0/PathWeaver
+
+PYTHONPATH=src /mnt/n0/uv_envs/kblam/bin/python tools/benchmark_pathweaver_store_v2.py \
+  --store-v1 experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train \
+  --store-v2 experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only \
+  --queries /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --st-model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --st-encoding-profile qwen3-embedding-v2 \
+  --query-prompt-name query \
+  --entity-top-k 1 \
+  --entity-candidate-top-k 64 \
+  --subgraph-hops 2 \
+  --max-incident-triples-per-node 24 \
+  --seed-strategy hybrid \
+  --search-backend hnsw \
+  --limit 100 \
+  --warmup-queries 10 \
+  --repeats 3 \
+  --query-batch-size 100 \
+  --output experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only/benchmark_v1_vs_v2_subject_only_cap24.json
+```
+
+### 4. 跑全部 sample size 的 end2end online eval
+
+下面这组命令会把全部 V2 sample size 都按同一套在线参数跑一遍。这样你可以直接观察
+knowledge scale 对在线检索时延和最终生成指标的影响。
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+source /mnt/n0/uv_envs/kblam/bin/activate
+cd /mnt/n0/PathWeaver
+
+DATA_FILE=/mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl
+MODEL_DIR=/mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800
+ENCODER=/mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800_encoder/encoder.pt
+
+declare -A ONLINE_STORES=(
+  [000100]=experiments/stores/scale-sweep-20260709-v2-qwen-align/base-000100-2wiki-store-v2-subject-only
+  [000237]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000237-2wiki-store-v2-subject-only
+  [000537]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000537-2wiki-hotpot-store-v2-subject-only
+  [000837]=experiments/stores/scale-sweep-20260709-v2-qwen-align/tiers/000837-2wiki-hotpot-musique-store-v2-subject-only
+  [016000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/016000-with-train-store-v2-subject-only
+  [032000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/032000-with-train-store-v2-subject-only
+  [064000]=experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only
+)
+
+for label in 000100 000237 000537 000837 016000 032000 064000
+do
+  python experiments/eval_generation_dag_kv.py \
+    --data_path "$DATA_FILE" \
+    --model_path "$MODEL_DIR" \
+    --base_model_name_or_path /mnt/n0/models/qwen3-14B-Instruct \
+    --encoder_path "$ENCODER" \
+    --encoder_spec qwen-embedding-0.6B \
+    --llm_type qwen3 \
+    --kb_layer_frequency 3 \
+    --kb_scale_factor 4 \
+    --path_attn \
+    --path_attn_mix_ratio 0.8 \
+    --step 7999 \
+    --t_step 8000 \
+    --max_samples 100 \
+    --seed 0 \
+    --eval_batch_size 10 \
+    --online_store_dir "${ONLINE_STORES[$label]}" \
+    --online_store_version v2 \
+    --online_dag_script docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py \
+    --online_dag_model_ckpt /mnt/n0/PathWeaver/experiments/subgraph_mlp/subgraphrag_mlp_v2.1_qwen.pt \
+    --online_st_model /mnt/n0/models/qwen-embedding-0.6B/ \
+    --online_st_encoding_profile qwen3-embedding-v2 \
+    --online_st_prompt_name query \
+    --online_entity_top_k 1 \
+    --online_entity_candidate_top_k 64 \
+    --online_subgraph_hops 2 \
+    --online_max_incident_triples_per_node 24 \
+    --online_search_backend hnsw \
+    --online_seed_strategy hybrid \
+    --online_mention_min_chars 8 \
+    --online_infer_batch_size 1024 \
+    --online_embedding_batch_size 256 \
+    --online_topic_top_k 8 \
+    --online_dde_hops 3 \
+    --online_mention_bonus 0.2 \
+    --online_seed_edge_topk 18 \
+    --online_expansion_hops 2 \
+    --online_per_src_cap 3 \
+    --online_max_nodes 30 \
+    --online_max_edges 40 \
+    --online_max_sinks 3 \
+    --online_reverse_sink_edge_topk 2 \
+    --online_reverse_sink_hops 4 \
+    --online_reverse_sink_beam_width 4 \
+    --online_selection_mode legacy \
+    --online_terminal_reranker heuristic \
+    --use_multihop_adj \
+    --max_hops 10 \
+    --hop_decay 1.0 \
+    --dynamic_hops_by_longest_path \
+    --save_json "experiments/results/online_dag_eval/${label}_store_v2_subject_only_cap24_emb256_top1_hop2_sink3_heuristic_100_refreshed.json"
+done
+```
+
+### 5. 跑当前推荐的 64k subject-only end2end 配置
+
+如果你的目标不是做全量 scaling report，而是直接复现当前最稳的 64k online 配置，
+建议优先跑下面这条：
+
+```bash
+export CUDA_VISIBLE_DEVICES=3
+source /mnt/n0/uv_envs/kblam/bin/activate
+cd /mnt/n0/PathWeaver
+
+python experiments/eval_generation_dag_kv.py \
+  --data_path /mnt/n0/datasets/wiki_hotspot_musique/merged_data/dag-kv/test_set/2wiki_dev_2hop_tripled_v5-qwen3.5-27B.jsonl \
+  --model_path /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800 \
+  --base_model_name_or_path /mnt/n0/models/qwen3-14B-Instruct \
+  --encoder_path /mnt/n0/PathWeaver/experiments/train/dag_kv_merged_hybrid_training_v2.1_qwen3_14B_aa_B2.1/stage1_lr_0.0005KBTokenLayerFreq3UseOutlier-999999KBSizedynamicSepQueryHeadKeyFromkey_qwen-embedding-0.6B_dag_qwen3_step_15800_encoder/encoder.pt \
+  --encoder_spec qwen-embedding-0.6B \
+  --llm_type qwen3 \
+  --kb_layer_frequency 3 \
+  --kb_scale_factor 4 \
+  --path_attn \
+  --path_attn_mix_ratio 0.8 \
+  --step 7999 \
+  --t_step 8000 \
+  --max_samples 100 \
+  --seed 0 \
+  --eval_batch_size 10 \
+  --online_store_dir experiments/stores/scale-sweep-20260709-v2-qwen-align/training-tiers/064000-with-train-store-v2-subject-only \
+  --online_store_version v2 \
+  --online_dag_script docs/scripts/graph_gen/DAG_KV_SubgraphRAG_trainable_v8_infer_only.py \
+  --online_dag_model_ckpt /mnt/n0/PathWeaver/experiments/subgraph_mlp/subgraphrag_mlp_v2.1_qwen.pt \
+  --online_st_model /mnt/n0/models/qwen-embedding-0.6B/ \
+  --online_st_encoding_profile qwen3-embedding-v2 \
+  --online_st_prompt_name query \
+  --online_entity_top_k 1 \
+  --online_entity_candidate_top_k 64 \
+  --online_subgraph_hops 2 \
+  --online_max_incident_triples_per_node 24 \
+  --online_search_backend hnsw \
+  --online_seed_strategy hybrid \
+  --online_mention_min_chars 8 \
+  --online_infer_batch_size 1024 \
+  --online_embedding_batch_size 256 \
+  --online_topic_top_k 8 \
+  --online_dde_hops 3 \
+  --online_mention_bonus 0.2 \
+  --online_seed_edge_topk 18 \
+  --online_expansion_hops 2 \
+  --online_per_src_cap 3 \
+  --online_max_nodes 30 \
+  --online_max_edges 40 \
+  --online_max_sinks 3 \
+  --online_reverse_sink_edge_topk 2 \
+  --online_reverse_sink_hops 4 \
+  --online_reverse_sink_beam_width 4 \
+  --online_selection_mode legacy \
+  --online_terminal_reranker heuristic \
+  --use_multihop_adj \
+  --max_hops 10 \
+  --hop_decay 1.0 \
+  --dynamic_hops_by_longest_path \
+  --save_json experiments/results/online_dag_eval/online_store_v2_64k_subject_only_cap24_emb256_top1_hop2_sink3_heuristic_100_refreshed.json
 ```

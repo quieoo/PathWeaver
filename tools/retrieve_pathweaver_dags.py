@@ -182,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entity-top-k", type=int, default=1)
     parser.add_argument("--subgraph-hops", type=int, default=2)
     parser.add_argument("--max-triples-per-seed", type=int, default=None)
+    parser.add_argument("--max-incident-triples-per-node", type=int, default=None)
     parser.add_argument("--search-backend", choices=["auto", "hnsw", "exact"], default="auto")
     parser.add_argument("--seed-strategy", choices=["vector", "hybrid"], default="vector")
     parser.add_argument("--mention-min-chars", type=int, default=8)
@@ -269,6 +270,7 @@ def main() -> None:
         entity_top_k=args.entity_top_k,
         subgraph_hops=args.subgraph_hops,
         max_triples_per_seed=args.max_triples_per_seed,
+        max_incident_triples_per_node=args.max_incident_triples_per_node,
         search_backend=args.search_backend,
         query_prompt_name=args.query_prompt_name,
         seed_strategy=args.seed_strategy,

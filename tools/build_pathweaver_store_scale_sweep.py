@@ -263,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LABEL::DATASET_ID::PATH[::START::LIMIT]",
     )
     parser.add_argument("--hnsw-embedding-model", required=True)
+    parser.add_argument(
+        "--hnsw-encoding-profile",
+        choices=["qwen3-embedding-v2", "sentence-transformer"],
+        default="sentence-transformer",
+    )
     parser.add_argument("--kv-embedding-model", required=True)
     parser.add_argument("--hnsw-embedding-batch-size", type=int, default=1024)
     parser.add_argument("--kv-embedding-batch-size", type=int, default=1024)
@@ -292,9 +297,11 @@ def main() -> None:
         raise FileNotFoundError(args.base_store)
     args.output_root.mkdir(parents=True, exist_ok=True)
 
-    from sentence_transformers import SentenceTransformer
-
-    entity_model = SentenceTransformer(args.hnsw_embedding_model)
+    entity_model, effective_hnsw_prompt, _ = _load_kv_model(
+        args.hnsw_embedding_model,
+        args.hnsw_encoding_profile,
+        args.hnsw_prompt_name,
+    )
     kv_model, effective_kv_prompt, kv_device = _load_kv_model(
         args.kv_embedding_model,
         args.kv_encoding_profile,
@@ -308,7 +315,8 @@ def main() -> None:
         "base_label": args.base_label,
         "models": {
             "hnsw_embedding_model": str(Path(args.hnsw_embedding_model).resolve()),
-            "hnsw_prompt_name": args.hnsw_prompt_name,
+            "hnsw_prompt_name": effective_hnsw_prompt,
+            "hnsw_encoding_profile": args.hnsw_encoding_profile,
             "kv_embedding_model": str(Path(args.kv_embedding_model).resolve()),
             "kv_prompt_name": effective_kv_prompt,
             "kv_encoding_profile": args.kv_encoding_profile,
@@ -336,7 +344,7 @@ def main() -> None:
             entity_model=entity_model,
             entity_model_path=args.hnsw_embedding_model,
             entity_batch_size=args.hnsw_embedding_batch_size,
-            entity_prompt_name=args.hnsw_prompt_name,
+            entity_prompt_name=effective_hnsw_prompt,
             kv_model=kv_model,
             kv_model_path=args.kv_embedding_model,
             kv_batch_size=args.kv_embedding_batch_size,

@@ -256,35 +256,7 @@ def _safe_encode_texts(model, texts: list[str], batch_size: int, prompt_name: st
     return np.concatenate(embeddings, axis=0).astype(np.float32, copy=False)
 
 
-def build_entity_embeddings(
-    graph_store: GraphStore,
-    model_path: str,
-    batch_size: int,
-    prompt_name: str | None = None,
-) -> None:
-    from sentence_transformers import SentenceTransformer
-
-    entities = graph_store.entity_nodes()
-    node_ids = [node_id for node_id, _ in entities]
-    names = [name for _, name in entities]
-    model = SentenceTransformer(model_path)
-    vectors = _encode_texts(model, names, batch_size, prompt_name)
-    graph_store.write_entity_embeddings(
-        node_ids,
-        vectors,
-        metadata=_model_metadata("hnsw_entity_embedding", model_path, prompt_name),
-    )
-
-
-def _model_metadata(role: str, model_path: str, prompt_name: str | None) -> dict[str, Any]:
-    return {
-        "role": role,
-        "model_path": str(Path(model_path).expanduser().resolve()),
-        "prompt_name": prompt_name,
-    }
-
-
-def _load_kv_model(model_path: str, profile: str, prompt_name: str | None):
+def _load_text_model(model_path: str, profile: str, prompt_name: str | None):
     from sentence_transformers import SentenceTransformer
     import torch
 
@@ -292,10 +264,8 @@ def _load_kv_model(model_path: str, profile: str, prompt_name: str | None):
         model = SentenceTransformer(model_path)
         return model, prompt_name, str(getattr(model, "device", "auto"))
     if profile != "qwen3-embedding-v2":
-        raise ValueError(f"Unsupported KV encoding profile: {profile}")
+        raise ValueError(f"Unsupported encoding profile: {profile}")
 
-    # Match the successful SentenceTransformer path in embedding_v2.py. These
-    # details materially affect last-token pooled Qwen embeddings.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = False
@@ -310,6 +280,39 @@ def _load_kv_model(model_path: str, profile: str, prompt_name: str | None):
     if first_module is not None and hasattr(first_module, "half"):
         first_module.half()
     return model, prompt_name or "query", device
+
+
+def build_entity_embeddings(
+    graph_store: GraphStore,
+    model_path: str,
+    batch_size: int,
+    prompt_name: str | None = None,
+    encoding_profile: str = "sentence-transformer",
+) -> None:
+    entities = graph_store.entity_nodes()
+    node_ids = [node_id for node_id, _ in entities]
+    names = [name for _, name in entities]
+    model, effective_prompt_name, _ = _load_text_model(model_path, encoding_profile, prompt_name)
+    vectors = _encode_texts(model, names, batch_size, effective_prompt_name)
+    graph_store.write_entity_embeddings(
+        node_ids,
+        vectors,
+        metadata=_model_metadata("hnsw_entity_embedding", model_path, effective_prompt_name),
+    )
+
+
+def _model_metadata(role: str, model_path: str, prompt_name: str | None) -> dict[str, Any]:
+    return {
+        "role": role,
+        "model_path": str(Path(model_path).expanduser().resolve()),
+        "prompt_name": prompt_name,
+    }
+
+
+def _load_kv_model(model_path: str, profile: str, prompt_name: str | None):
+    # Match the successful SentenceTransformer path in embedding_v2.py. These
+    # details materially affect last-token pooled Qwen embeddings.
+    return _load_text_model(model_path, profile, prompt_name)
 
 
 def build_kv_embeddings(
@@ -392,6 +395,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hnsw-prompt-name", type=str, default=None)
     parser.add_argument("--kv-prompt-name", type=str, default=None)
     parser.add_argument(
+        "--hnsw-encoding-profile",
+        choices=["qwen3-embedding-v2", "sentence-transformer"],
+        default="sentence-transformer",
+        help="Entity loading/encoding behavior. Use qwen3-embedding-v2 for full qwen retrieval alignment.",
+    )
+    parser.add_argument(
         "--kv-encoding-profile",
         choices=["qwen3-embedding-v2", "sentence-transformer"],
         default="qwen3-embedding-v2",
@@ -429,6 +438,7 @@ def main() -> None:
                 args.hnsw_embedding_model,
                 args.hnsw_embedding_batch_size or args.embedding_batch_size,
                 args.hnsw_prompt_name,
+                args.hnsw_encoding_profile,
             )
         if args.kv_embedding_model:
             build_kv_embeddings(

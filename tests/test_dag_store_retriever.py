@@ -53,6 +53,28 @@ class OffsetExtractor:
         return output
 
 
+class ProfiledExtractor:
+    backend = "v8-answer-blind"
+
+    def __init__(self):
+        self.last_profile = {
+            "build_graph": 0.01,
+            "encode": 0.02,
+            "feature_prepare": 0.03,
+            "model_score": 0.04,
+            "select_export": 0.05,
+            "total": 0.15,
+        }
+
+    def extract(self, samples):
+        output = []
+        for sample in samples:
+            row = dict(sample)
+            row["dag"] = {"kv_nodes": [], "adj": [], "meta": {"answer_free_inference": True}}
+            output.append(row)
+        return output
+
+
 class FakeEncoder(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -270,6 +292,52 @@ def test_online_retriever_aligns_offsets_tensors_and_adjacency(tmp_path):
     np.testing.assert_allclose(result.kb_values.numpy(), [[102, 103], [104, 105]])
     np.testing.assert_allclose(result.kb_adj.to_dense().numpy(), [[0, 1], [0, 0]])
     assert result.dag["meta"]["answer_free_inference"] is True
+
+
+def test_online_retriever_forwards_incident_triple_cap(tmp_path):
+    _build_store(tmp_path)
+    online = OnlineDAGKBRetriever(
+        encoder=FakeEncoder(),
+        store_dir=str(tmp_path),
+        entity_embedder=FakeEmbedder(),
+        dag_extractor=OffsetExtractor(),
+        entity_top_k=1,
+        subgraph_hops=1,
+        max_incident_triples_per_node=1,
+        search_backend="exact",
+    )
+    try:
+        result = online.get_kb_for_queries(["Who knows whom?"], device="cpu")[0]
+    finally:
+        online.close()
+
+    assert len(result.dag["kv_nodes"]) == 2
+    assert result.dag["meta"]["retrieval"]["candidate_triples"] == 1
+
+
+def test_online_retriever_surfaces_dag_substage_profile(tmp_path):
+    _build_store(tmp_path)
+    online = OnlineDAGKBRetriever(
+        encoder=FakeEncoder(),
+        store_dir=str(tmp_path),
+        entity_embedder=FakeEmbedder(),
+        dag_extractor=ProfiledExtractor(),
+        entity_top_k=1,
+        subgraph_hops=1,
+        search_backend="exact",
+    )
+    try:
+        online.get_kb_for_queries(["Who knows whom?"], device="cpu")
+        stats = online.stats()
+    finally:
+        online.close()
+
+    assert stats["dag_average_seconds"]["build_graph"] == 0.01
+    assert stats["dag_average_seconds"]["encode"] == 0.02
+    assert stats["dag_average_seconds"]["feature_prepare"] == 0.03
+    assert stats["dag_average_seconds"]["model_score"] == 0.04
+    assert stats["dag_average_seconds"]["select_export"] == 0.05
+    assert stats["dag_average_seconds"]["total"] == 0.15
 
 
 def _load_tool_module():

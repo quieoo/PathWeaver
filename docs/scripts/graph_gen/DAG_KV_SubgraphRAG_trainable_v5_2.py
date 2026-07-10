@@ -218,19 +218,54 @@ def value_matches_answer(value: str, answer: str) -> bool:
 # ============================================================
 # 2) Embedding helpers
 # ============================================================
-def embed_texts(embedder: SentenceTransformer, texts: List[str], batch_size: int) -> np.ndarray:
+def embed_texts(
+    embedder: SentenceTransformer,
+    texts: List[str],
+    batch_size: int,
+    prompt_name: Optional[str] = None,
+) -> np.ndarray:
     if not texts:
         return np.zeros((0, 1), dtype=np.float32)
-    emb = embedder.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=False,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
+    encode_kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "show_progress_bar": False,
+        "convert_to_numpy": True,
+        "normalize_embeddings": True,
+    }
+    if prompt_name:
+        encode_kwargs["prompt_name"] = prompt_name
+    emb = embedder.encode(texts, **encode_kwargs)
     if isinstance(emb, list):
         emb = np.array(emb)
     return emb.astype(np.float32)
+
+
+def load_text_embedder(
+    model_path: str,
+    profile: str,
+    *,
+    cpu: bool,
+) -> tuple[SentenceTransformer, Optional[str]]:
+    if profile == 'sentence-transformer':
+        device = 'cpu' if cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
+        return SentenceTransformer(model_path, device=device), None
+    if profile != 'qwen3-embedding-v2':
+        raise ValueError(f'Unsupported --st_encoding_profile: {profile}')
+
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    model = SentenceTransformer(
+        model_path,
+        model_kwargs={'device_map': 'auto'},
+        tokenizer_kwargs={'padding_side': 'left'},
+    )
+    device = 'cpu' if cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    first_module = model._first_module() if hasattr(model, '_first_module') else None
+    if first_module is not None and hasattr(first_module, 'half'):
+        first_module.half()
+    return model, 'query'
 
 
 def cosine_sim_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -500,6 +535,7 @@ def embed_texts_cached(
     embedder: SentenceTransformer,
     texts: List[str],
     batch_size: int,
+    prompt_name: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Encode unique texts once, return {normalized_text: embedding}.
@@ -515,13 +551,15 @@ def embed_texts_cached(
     if not uniq:
         return {}
 
-    emb = embedder.encode(
-        uniq,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
+    encode_kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "show_progress_bar": True,
+        "convert_to_numpy": True,
+        "normalize_embeddings": True,
+    }
+    if prompt_name:
+        encode_kwargs["prompt_name"] = prompt_name
+    emb = embedder.encode(uniq, **encode_kwargs)
     if isinstance(emb, list):
         emb = np.array(emb)
     emb = emb.astype(np.float32)
@@ -532,6 +570,7 @@ def merge_text_embedding_caches(
     embedder: SentenceTransformer,
     text_groups: List[List[str]],
     batch_size: int,
+    prompt_name: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Encode multiple text groups incrementally while deduplicating across groups.
@@ -548,7 +587,14 @@ def merge_text_embedding_caches(
                 uniq_texts.append(t)
         if not uniq_texts:
             continue
-        merged.update(embed_texts_cached(embedder, uniq_texts, batch_size=batch_size))
+        merged.update(
+            embed_texts_cached(
+                embedder,
+                uniq_texts,
+                batch_size=batch_size,
+                prompt_name=prompt_name,
+            )
+        )
     return merged
 
 
@@ -1075,6 +1121,7 @@ def collect_training_examples(
         embedder=embedder,
         texts=all_texts,
         batch_size=train_embed_batch_size,
+        prompt_name=args.st_prompt_name,
     )
     num_unique_emb_texts = len(text_emb_cache)
     print(f'[Collect] embeddings_ready unique_texts={num_unique_emb_texts}')
@@ -3039,6 +3086,7 @@ def create_dag_with_model_batched(
             embedder=embedder,
             text_groups=[question_texts, doc_texts],
             batch_size=infer_batch_size,
+            prompt_name=args.st_prompt_name,
         )
 
         for ctx in prepared:
@@ -3185,6 +3233,7 @@ def create_dag_with_model_profiled(
             embedder=embedder,
             text_groups=[[question]],
             batch_size=1,
+            prompt_name=args.st_prompt_name,
         )
         latency_stats['question_encode_s'] += time.perf_counter() - q_enc_t0
 
@@ -3199,6 +3248,7 @@ def create_dag_with_model_profiled(
             embedder=embedder,
             text_groups=[doc_texts],
             batch_size=doc_batch_size,
+            prompt_name=args.st_prompt_name,
         )
         latency_stats['doc_text_encode_s'] += time.perf_counter() - doc_enc_t0
         text_emb_cache = {**doc_emb_cache, **question_emb_cache}
@@ -3448,6 +3498,16 @@ def main():
     ap.add_argument('--output', default='')
     ap.add_argument('--model_ckpt', default='subgraphrag_mlp.pt')
     ap.add_argument('--st_model', default='sentence-transformers/all-MiniLM-L6-v2')
+    ap.add_argument(
+        '--st_encoding_profile',
+        choices=['sentence-transformer', 'qwen3-embedding-v2'],
+        default='sentence-transformer',
+    )
+    ap.add_argument(
+        '--st_prompt_name',
+        default=None,
+        help='Optional SentenceTransformer prompt_name. For qwen3-embedding-v2 this defaults to query.',
+    )
     ap.add_argument('--batch_size', type=int, default=256)
     ap.add_argument('--infer_batch_size', type=int, default=4096)
     ap.add_argument('--keep_score', action='store_true')
@@ -3559,8 +3619,15 @@ def main():
 
     print(f'Load {len(samples)} samples from {args.input}')
 
+    embedder, default_prompt_name = load_text_embedder(
+        args.st_model,
+        args.st_encoding_profile,
+        cpu=args.cpu,
+    )
+    if args.st_prompt_name is None:
+        args.st_prompt_name = default_prompt_name
+
     if args.mode == 'train':
-        embedder = SentenceTransformer(args.st_model)
         train_model(args, samples, embedder)
         return
 
@@ -3639,7 +3706,6 @@ def main():
     if not args.model_ckpt or not os.path.exists(args.model_ckpt):
         raise FileNotFoundError(f'For --mode infer, model checkpoint is required: {args.model_ckpt}')
 
-    embedder = SentenceTransformer(args.st_model)
     edge_model, node_model, ckpt, device = load_model(args.model_ckpt, cpu=args.cpu)
     print(f'Loaded scorer from {args.model_ckpt}')
     out, answer_unsupported_sample_ids, answer_supported_sample_ids = create_dag_with_model(

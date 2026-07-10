@@ -162,9 +162,12 @@ class GraphStoreV2:
         *,
         hops: int = 1,
         max_triples: int | None = None,
+        max_incident_triples_per_node: int | None = None,
     ) -> tuple[list[int], list[GraphTriple]]:
         if hops < 0:
             raise ValueError("hops must be non-negative")
+        if max_incident_triples_per_node is not None and max_incident_triples_per_node <= 0:
+            raise ValueError("max_incident_triples_per_node must be positive when provided")
         pos_map = self._node_id_to_pos()
         visited: set[int] = {int(node_id) for node_id in seed_node_ids}
         queue = deque((pos_map[int(node_id)], 0) for node_id in seed_node_ids if int(node_id) in pos_map)
@@ -173,7 +176,10 @@ class GraphStoreV2:
             entity_pos, depth = queue.popleft()
             if depth >= hops:
                 continue
-            for triple_idx in self._incident_triple_indexes(entity_pos):
+            triple_indexes = self._incident_triple_indexes(entity_pos)
+            if max_incident_triples_per_node is not None:
+                triple_indexes = triple_indexes[:max_incident_triples_per_node]
+            for triple_idx in triple_indexes:
                 triple = self._get_triple_by_index(triple_idx)
                 triples.setdefault(triple.triple_id, triple)
                 if max_triples is not None and len(triples) >= max_triples:

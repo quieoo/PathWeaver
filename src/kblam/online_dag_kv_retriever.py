@@ -37,6 +37,7 @@ class OnlineDAGKBRetriever:
         entity_top_k: int = 1,
         subgraph_hops: int = 2,
         max_triples_per_seed: int | None = None,
+        max_incident_triples_per_node: int | None = None,
         search_backend: str = "hnsw",
         query_prompt_name: str | None = None,
         seed_strategy: str = "vector",
@@ -63,6 +64,7 @@ class OnlineDAGKBRetriever:
                 entity_candidate_top_k=entity_candidate_top_k,
                 subgraph_hops=subgraph_hops,
                 max_triples_per_seed=max_triples_per_seed,
+                max_incident_triples_per_node=max_incident_triples_per_node,
                 search_backend=search_backend,
                 query_prompt_name=query_prompt_name,
                 seed_strategy=seed_strategy,
@@ -75,6 +77,7 @@ class OnlineDAGKBRetriever:
                 entity_top_k=entity_top_k,
                 subgraph_hops=subgraph_hops,
                 max_triples_per_seed=max_triples_per_seed,
+                max_incident_triples_per_node=max_incident_triples_per_node,
                 search_backend=search_backend,
                 query_prompt_name=query_prompt_name,
                 seed_strategy=seed_strategy,
@@ -88,6 +91,14 @@ class OnlineDAGKBRetriever:
         self._samples = 0
         self._empty_dags = 0
         self._stage_seconds = {"candidate": 0.0, "dag": 0.0, "tensor": 0.0, "total": 0.0}
+        self._dag_stage_seconds = {
+            "build_graph": 0.0,
+            "encode": 0.0,
+            "feature_prepare": 0.0,
+            "model_score": 0.0,
+            "select_export": 0.0,
+            "total": 0.0,
+        }
 
     def close(self) -> None:
         self.store_retriever.close()
@@ -121,6 +132,7 @@ class OnlineDAGKBRetriever:
         stage_started = time.perf_counter()
         extracted = self.dag_extractor.extract(prepared)
         dag_seconds = time.perf_counter() - stage_started
+        dag_profile = getattr(self.dag_extractor, "last_profile", None) or {}
         extracted.sort(key=lambda row: int(row["__online_index"]))
 
         stage_started = time.perf_counter()
@@ -160,6 +172,8 @@ class OnlineDAGKBRetriever:
         self._stage_seconds["dag"] += dag_seconds
         self._stage_seconds["tensor"] += tensor_seconds
         self._stage_seconds["total"] += total_seconds
+        for stage in self._dag_stage_seconds:
+            self._dag_stage_seconds[stage] += float(dag_profile.get(stage, 0.0))
         return results
 
     def get_avg_retrieval_time(self) -> float:
@@ -173,18 +187,27 @@ class OnlineDAGKBRetriever:
             "average_seconds": {
                 stage: elapsed / denominator for stage, elapsed in self._stage_seconds.items()
             },
+            "dag_average_seconds": {
+                stage: elapsed / denominator for stage, elapsed in self._dag_stage_seconds.items()
+            },
         }
 
     def print_metrics(self) -> None:
         stats = self.stats()
         timings = stats["average_seconds"]
+        dag_timings = stats["dag_average_seconds"]
         print(
             "[OnlineDAG] "
             f"samples={stats['samples']} empty_dags={stats['empty_dags']} "
             f"candidate={timings['candidate'] * 1000:.2f}ms "
             f"dag={timings['dag'] * 1000:.2f}ms "
             f"tensor={timings['tensor'] * 1000:.2f}ms "
-            f"total={timings['total'] * 1000:.2f}ms"
+            f"total={timings['total'] * 1000:.2f}ms "
+            f"| dag_substages build_graph={dag_timings['build_graph'] * 1000:.2f}ms "
+            f"encode={dag_timings['encode'] * 1000:.2f}ms "
+            f"feature_prepare={dag_timings['feature_prepare'] * 1000:.2f}ms "
+            f"model_score={dag_timings['model_score'] * 1000:.2f}ms "
+            f"select_export={dag_timings['select_export'] * 1000:.2f}ms"
         )
 
     @staticmethod

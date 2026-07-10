@@ -146,15 +146,59 @@ def get_encoder_out_dim(model_config, kb_layer_frequency: int) -> int:
     return per_slot_dim * slots
 
 
+def load_sentence_transformer_for_profile(
+    model_path: str,
+    profile: str,
+):
+    from sentence_transformers import SentenceTransformer
+
+    if profile == "sentence-transformer":
+        return SentenceTransformer(model_path), None
+    if profile != "qwen3-embedding-v2":
+        raise ValueError(f"Unsupported embedding profile: {profile}")
+
+    import os
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    model = SentenceTransformer(
+        model_path,
+        model_kwargs={"device_map": "auto"},
+        tokenizer_kwargs={"padding_side": "left"},
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    first_module = model._first_module() if hasattr(model, "_first_module") else None
+    if first_module is not None and hasattr(first_module, "half"):
+        first_module.half()
+    return model, "query"
+
+
 def prepare_online_retriever(args, encoder) -> OnlineDAGKBRetriever:
     if not args.online_dag_model_ckpt:
         raise ValueError("--online_dag_model_ckpt is required with --online_store_dir")
-    from sentence_transformers import SentenceTransformer
 
-    st_model = args.online_st_model or entity_embedding_model_path(args.online_store_dir)
-    embedder = SentenceTransformer(st_model)
+    entity_st_model = args.online_st_model or entity_embedding_model_path(args.online_store_dir)
+    entity_embedder, entity_default_prompt_name = load_sentence_transformer_for_profile(
+        entity_st_model,
+        args.online_st_encoding_profile,
+    )
+    entity_prompt_name = args.online_st_prompt_name or entity_default_prompt_name
+    dag_st_model = args.online_dag_st_model or entity_st_model
+    dag_profile = args.online_dag_st_encoding_profile or args.online_st_encoding_profile
+    if dag_st_model == entity_st_model and dag_profile == args.online_st_encoding_profile:
+        dag_embedder = entity_embedder
+        dag_default_prompt_name = entity_default_prompt_name
+    else:
+        dag_embedder, dag_default_prompt_name = load_sentence_transformer_for_profile(
+            dag_st_model,
+            dag_profile,
+        )
+    dag_prompt_name = args.online_dag_st_prompt_name or dag_default_prompt_name
     config = DAGExtractionConfig(
         infer_batch_size=args.online_infer_batch_size,
+        embedding_batch_size=args.online_embedding_batch_size,
         topic_top_k=args.online_topic_top_k,
         dde_hops=args.online_dde_hops,
         mention_bonus=args.online_mention_bonus,
@@ -171,21 +215,24 @@ def prepare_online_retriever(args, encoder) -> OnlineDAGKBRetriever:
         reverse_sink_beam_width=args.online_reverse_sink_beam_width,
         selection_mode=args.online_selection_mode,
         terminal_reranker=args.online_terminal_reranker,
+        st_prompt_name=dag_prompt_name,
     )
     extractor = TrainableDAGExtractor(
         args.online_dag_script,
         args.online_dag_model_ckpt,
-        embedder,
+        dag_embedder,
         config=config,
     )
     return OnlineDAGKBRetriever(
         encoder=encoder,
         store_dir=args.online_store_dir,
-        entity_embedder=embedder,
+        entity_embedder=entity_embedder,
         dag_extractor=extractor,
         entity_top_k=args.online_entity_top_k,
         subgraph_hops=args.online_subgraph_hops,
+        max_incident_triples_per_node=args.online_max_incident_triples_per_node,
         search_backend=args.online_search_backend,
+        query_prompt_name=entity_prompt_name,
         seed_strategy=args.online_seed_strategy,
         mention_min_chars=args.online_mention_min_chars,
         store_version=args.online_store_version,
@@ -277,7 +324,7 @@ def evaluate_generation(
 
             pred = format_output_for_synthetic(_postprocess_generation(output, q))
             ref = format_output_for_synthetic(a)
-            print(f"Q: {q}, A: {a}, Pred: {output}")
+            # print(f"Q: {q}, A: {a}, Pred: {output}")
             preds.append(pred)
             refs.append(ref)
             questions.append(q)
@@ -353,14 +400,29 @@ def main() -> None:
     )
     parser.add_argument("--online_dag_model_ckpt", type=str, default="")
     parser.add_argument("--online_st_model", type=str, default="")
+    parser.add_argument(
+        "--online_st_encoding_profile",
+        choices=["sentence-transformer", "qwen3-embedding-v2"],
+        default="sentence-transformer",
+    )
+    parser.add_argument("--online_st_prompt_name", type=str, default="")
+    parser.add_argument("--online_dag_st_model", type=str, default="")
+    parser.add_argument(
+        "--online_dag_st_encoding_profile",
+        choices=["sentence-transformer", "qwen3-embedding-v2", ""],
+        default="",
+    )
+    parser.add_argument("--online_dag_st_prompt_name", type=str, default="")
     parser.add_argument("--online_entity_top_k", type=int, default=1)
     parser.add_argument("--online_entity_candidate_top_k", type=int, default=64)
     parser.add_argument("--online_subgraph_hops", type=int, default=2)
+    parser.add_argument("--online_max_incident_triples_per_node", type=int, default=None)
     parser.add_argument("--online_store_version", choices=["v1", "v2"], default="v1")
     parser.add_argument("--online_search_backend", choices=["hnsw", "exact"], default="hnsw")
     parser.add_argument("--online_seed_strategy", choices=["vector", "hybrid"], default="vector")
     parser.add_argument("--online_mention_min_chars", type=int, default=8)
     parser.add_argument("--online_infer_batch_size", type=int, default=1024)
+    parser.add_argument("--online_embedding_batch_size", type=int, default=None)
     parser.add_argument("--online_topic_top_k", type=int, default=8)
     parser.add_argument("--online_dde_hops", type=int, default=3)
     parser.add_argument("--online_mention_bonus", type=float, default=0.2)

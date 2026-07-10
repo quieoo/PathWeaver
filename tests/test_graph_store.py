@@ -2,7 +2,7 @@ import numpy as np
 import json
 import pytest
 
-from kblam.stores import EntityResolver, GraphStore
+from kblam.stores import EntityResolver, GraphStore, GraphStoreV2
 
 
 def test_graph_store_deduplicates_triples_and_recovers_local_graph(tmp_path):
@@ -110,6 +110,50 @@ def test_graph_store_entity_vector_search(tmp_path):
         )
         assert not store.entity_vectors_path.exists()
         assert not store.entity_vector_meta_path.exists()
+
+
+def test_graph_store_limits_incident_triples_per_node(tmp_path):
+    with GraphStore(tmp_path / "graph") as store:
+        for index in range(3):
+            store.add_triple(
+                triple_type="RELATION",
+                subject="Hub",
+                predicate=f"connects to {index}",
+                object_value=f"Leaf {index}",
+                kv_offsets=[index * 2, index * 2 + 1],
+                dataset_id="dataset-a",
+                sample_id=f"sample-{index}",
+                source_index=0,
+                triple_index=index,
+            )
+        hub_id = store.resolve_node_id("Hub")
+        assert hub_id is not None
+
+        _, triples = store.get_local_subgraph([hub_id], hops=1, max_incident_triples_per_node=2)
+        assert len(triples) == 2
+
+
+def test_graph_store_v2_limits_incident_triples_per_node(tmp_path):
+    with GraphStore(tmp_path / "graph") as source:
+        for index in range(3):
+            source.add_triple(
+                triple_type="RELATION",
+                subject="Hub",
+                predicate=f"connects to {index}",
+                object_value=f"Leaf {index}",
+                kv_offsets=[index * 2, index * 2 + 1],
+                dataset_id="dataset-a",
+                sample_id=f"sample-{index}",
+                source_index=0,
+                triple_index=index,
+            )
+        hub_id = source.resolve_node_id("Hub")
+        assert hub_id is not None
+        GraphStoreV2.export_from_v1(tmp_path / "graph_v2", source)
+
+    with GraphStoreV2(tmp_path / "graph_v2", create=False) as store:
+        _, triples = store.get_local_subgraph([hub_id], hops=1, max_incident_triples_per_node=2)
+        assert len(triples) == 2
 
 
 def test_graph_store_keeps_unicode_and_symbol_only_nodes(tmp_path):

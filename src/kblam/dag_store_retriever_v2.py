@@ -36,6 +36,7 @@ class DAGKVStoreRetrieverV2:
         entity_candidate_top_k: int = 64,
         subgraph_hops: int = 2,
         max_triples_per_seed: int | None = None,
+        max_incident_triples_per_node: int | None = None,
         search_backend: str = "auto",
         query_prompt_name: str | None = None,
         seed_strategy: str = "vector",
@@ -49,6 +50,7 @@ class DAGKVStoreRetrieverV2:
         self.entity_candidate_top_k = max(entity_top_k, entity_candidate_top_k)
         self.subgraph_hops = subgraph_hops
         self.max_triples_per_seed = max_triples_per_seed
+        self.max_incident_triples_per_node = max_incident_triples_per_node
         self.search_backend = search_backend
         self.query_prompt_name = query_prompt_name
         self.seed_strategy = seed_strategy
@@ -105,6 +107,7 @@ class DAGKVStoreRetrieverV2:
                 [hit.node_id],
                 hops=self.subgraph_hops,
                 max_triples=self.max_triples_per_seed,
+                max_incident_triples_per_node=self.max_incident_triples_per_node,
             )
             node_ids.update(local_nodes)
             triples.update((triple.triple_id, triple) for triple in local_triples)

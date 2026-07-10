@@ -40,9 +40,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--store-v2", type=Path, required=True)
     parser.add_argument("--queries", type=Path, required=True)
     parser.add_argument("--st-model", type=str, default=None)
+    parser.add_argument(
+        "--st-encoding-profile",
+        choices=["sentence-transformer", "qwen3-embedding-v2"],
+        default="sentence-transformer",
+    )
+    parser.add_argument("--query-prompt-name", type=str, default=None)
     parser.add_argument("--entity-top-k", type=int, default=1)
     parser.add_argument("--entity-candidate-top-k", type=int, default=64)
     parser.add_argument("--subgraph-hops", type=int, default=2)
+    parser.add_argument("--max-incident-triples-per-node", type=int, default=None)
     parser.add_argument("--seed-strategy", choices=["vector", "hybrid"], default="hybrid")
     parser.add_argument("--mention-min-chars", type=int, default=8)
     parser.add_argument("--limit", type=int, default=100)
@@ -52,6 +59,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-backend", choices=["auto", "exact", "hnsw"], default="auto")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
+
+
+def load_sentence_transformer_for_profile(model_path: str, profile: str):
+    if SentenceTransformer is None:
+        raise RuntimeError("sentence-transformers is required for benchmark_pathweaver_store_v2.py")
+    if profile == "sentence-transformer":
+        return SentenceTransformer(model_path), None
+    if profile != "qwen3-embedding-v2":
+        raise ValueError(f"Unsupported --st-encoding-profile: {profile}")
+
+    import os
+    import torch
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    model = SentenceTransformer(
+        model_path,
+        model_kwargs={"device_map": "auto"},
+        tokenizer_kwargs={"padding_side": "left"},
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    first_module = model._first_module() if hasattr(model, "_first_module") else None
+    if first_module is not None and hasattr(first_module, "half"):
+        first_module.half()
+    return model, "query"
 
 
 def file_bytes(path: Path) -> int:
@@ -109,17 +143,21 @@ def load_queries(path: Path, limit: int) -> list[QuerySample]:
     return samples
 
 
-def encode_queries(model: Any, questions: list[str], batch_size: int) -> np.ndarray:
-    vectors = np.asarray(
-        model.encode(
-            questions,
-            batch_size=batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ),
-        dtype=np.float32,
-    )
+def encode_queries(
+    model: Any,
+    questions: list[str],
+    batch_size: int,
+    prompt_name: str | None,
+) -> np.ndarray:
+    encode_kwargs = {
+        "batch_size": batch_size,
+        "convert_to_numpy": True,
+        "normalize_embeddings": True,
+        "show_progress_bar": False,
+    }
+    if prompt_name:
+        encode_kwargs["prompt_name"] = prompt_name
+    vectors = np.asarray(model.encode(questions, **encode_kwargs), dtype=np.float32)
     if vectors.ndim == 1:
         vectors = vectors.reshape(1, -1)
     return vectors
@@ -152,7 +190,10 @@ def time_one_query_v1(retriever: DAGKVStoreRetriever, query: str, vector: np.nda
     triples: dict[int, Any] = {}
     for hit in hits:
         local_nodes, local_triples = retriever.graph_store.get_local_subgraph(
-            [hit.node_id], hops=retriever.subgraph_hops, max_triples=retriever.max_triples_per_seed
+            [hit.node_id],
+            hops=retriever.subgraph_hops,
+            max_triples=retriever.max_triples_per_seed,
+            max_incident_triples_per_node=retriever.max_incident_triples_per_node,
         )
         node_ids.update(local_nodes)
         triples.update((triple.triple_id, triple) for triple in local_triples)
@@ -216,7 +257,10 @@ def time_one_query_v2(retriever: DAGKVStoreRetrieverV2, query: str, vector: np.n
     triples: dict[int, Any] = {}
     for hit in hits:
         local_nodes, local_triples = retriever.graph_store.get_local_subgraph(
-            [hit.node_id], hops=retriever.subgraph_hops, max_triples=retriever.max_triples_per_seed
+            [hit.node_id],
+            hops=retriever.subgraph_hops,
+            max_triples=retriever.max_triples_per_seed,
+            max_incident_triples_per_node=retriever.max_incident_triples_per_node,
         )
         node_ids.update(local_nodes)
         triples.update((triple.triple_id, triple) for triple in local_triples)
@@ -263,12 +307,14 @@ def summarize(observations: list[dict[str, float]]) -> dict[str, dict[str, float
 def main() -> None:
     args = parse_args()
     model_path = args.st_model or entity_embedding_model_path(args.store_v1)
-    if SentenceTransformer is None:
-        raise RuntimeError("sentence-transformers is required for benchmark_pathweaver_store_v2.py")
-    embedder = SentenceTransformer(model_path)
+    embedder, default_prompt_name = load_sentence_transformer_for_profile(
+        model_path,
+        args.st_encoding_profile,
+    )
+    query_prompt_name = args.query_prompt_name or default_prompt_name
     samples = load_queries(args.queries, args.limit)
     questions = [sample.question for sample in samples]
-    vectors = encode_queries(embedder, questions, args.query_batch_size)
+    vectors = encode_queries(embedder, questions, args.query_batch_size, query_prompt_name)
     observations_v1: list[dict[str, float]] = []
     observations_v2: list[dict[str, float]] = []
     answer_hits_v1 = 0
@@ -282,7 +328,9 @@ def main() -> None:
         embedder,
         entity_top_k=args.entity_top_k,
         subgraph_hops=args.subgraph_hops,
+        max_incident_triples_per_node=args.max_incident_triples_per_node,
         search_backend=args.search_backend,
+        query_prompt_name=query_prompt_name,
         seed_strategy=args.seed_strategy,
         mention_min_chars=args.mention_min_chars,
     ) as retriever_v1, DAGKVStoreRetrieverV2(
@@ -291,7 +339,9 @@ def main() -> None:
         entity_top_k=args.entity_top_k,
         entity_candidate_top_k=args.entity_candidate_top_k,
         subgraph_hops=args.subgraph_hops,
+        max_incident_triples_per_node=args.max_incident_triples_per_node,
         search_backend=args.search_backend,
+        query_prompt_name=query_prompt_name,
         seed_strategy=args.seed_strategy,
         mention_min_chars=args.mention_min_chars,
     ) as retriever_v2:
@@ -323,6 +373,7 @@ def main() -> None:
             "entity_top_k": args.entity_top_k,
             "entity_candidate_top_k": args.entity_candidate_top_k,
             "subgraph_hops": args.subgraph_hops,
+            "max_incident_triples_per_node": args.max_incident_triples_per_node,
             "seed_strategy": args.seed_strategy,
             "search_backend": args.search_backend,
         },

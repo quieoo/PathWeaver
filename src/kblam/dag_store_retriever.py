@@ -84,12 +84,13 @@ class DAGExtractionConfig:
     terminal_end_weight: float = 0.35
     terminal_path_weight: float = 0.25
     terminal_value_weight: float = 0.20
+    profile_online_latency: bool = False
+    st_prompt_name: str | None = None
 
     def as_namespace(self) -> Namespace:
         return Namespace(
             **self.__dict__,
             limit=None,
-            profile_online_latency=False,
         )
 
 
@@ -104,6 +105,7 @@ class DAGKVStoreRetriever:
         entity_top_k: int = 1,
         subgraph_hops: int = 2,
         max_triples_per_seed: int | None = None,
+        max_incident_triples_per_node: int | None = None,
         search_backend: str = "auto",
         query_prompt_name: str | None = None,
         seed_strategy: str = "vector",
@@ -115,6 +117,8 @@ class DAGKVStoreRetriever:
             raise ValueError("subgraph_hops must be non-negative")
         if max_triples_per_seed is not None and max_triples_per_seed <= 0:
             raise ValueError("max_triples_per_seed must be positive when provided")
+        if max_incident_triples_per_node is not None and max_incident_triples_per_node <= 0:
+            raise ValueError("max_incident_triples_per_node must be positive when provided")
         if seed_strategy not in {"vector", "hybrid"}:
             raise ValueError("seed_strategy must be 'vector' or 'hybrid'")
         if mention_min_chars <= 0:
@@ -127,6 +131,7 @@ class DAGKVStoreRetriever:
         self.entity_top_k = entity_top_k
         self.subgraph_hops = subgraph_hops
         self.max_triples_per_seed = max_triples_per_seed
+        self.max_incident_triples_per_node = max_incident_triples_per_node
         self.search_backend = search_backend
         self.query_prompt_name = query_prompt_name
         self.seed_strategy = seed_strategy
@@ -215,6 +220,7 @@ class DAGKVStoreRetriever:
                 [hit.node_id],
                 hops=self.subgraph_hops,
                 max_triples=self.max_triples_per_seed,
+                max_incident_triples_per_node=self.max_incident_triples_per_node,
             )
             node_ids.update(local_nodes)
             triples.update((triple.triple_id, triple) for triple in local_triples)
@@ -287,6 +293,7 @@ class TrainableDAGExtractor:
         self.module = load_dag_module(script_path)
         self.embedder = embedder
         self.config = config or DAGExtractionConfig()
+        self.last_profile: dict[str, float] | None = None
         if hasattr(self.module, "load_models") and hasattr(self.module, "infer"):
             self.backend = "v8-answer-blind"
             loader = self.module.load_models
@@ -304,7 +311,20 @@ class TrainableDAGExtractor:
 
     def extract(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         args = self.config.as_namespace()
+        self.last_profile = None
         if self.backend == "v8-answer-blind":
+            if hasattr(self.module, "infer_profiled"):
+                output, profile = self.module.infer_profiled(
+                    args,
+                    samples,
+                    self.embedder,
+                    self.edge_model,
+                    self.node_model,
+                    self.checkpoint,
+                    self.device,
+                )
+                self.last_profile = dict(profile)
+                return output
             return self.module.infer(
                 args,
                 samples,

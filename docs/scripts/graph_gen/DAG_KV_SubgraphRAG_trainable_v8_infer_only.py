@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-
+import time
 
 # -----------------------------------------------------------------------------
 # IO and text normalization
@@ -216,31 +216,73 @@ def build_graph(sample: Dict[str, Any]):
     return names, edges, dict(out_adj), dict(in_adj)
 
 
-def encode_unique(embedder: SentenceTransformer, texts: List[str], batch_size: int):
+def encode_unique(
+    embedder: SentenceTransformer,
+    texts: List[str],
+    batch_size: int,
+    prompt_name: Optional[str] = None,
+):
     unique = list(dict.fromkeys(norm_text(x) for x in texts if norm_text(x)))
     if not unique:
         return {}
-    vectors = embedder.encode(
-        unique, batch_size=batch_size, show_progress_bar=True,
-        convert_to_numpy=True, normalize_embeddings=True,
-    )
+    encode_kwargs = {
+        "batch_size": batch_size,
+        "show_progress_bar": True,
+        "convert_to_numpy": True,
+        "normalize_embeddings": True,
+    }
+    if prompt_name:
+        encode_kwargs["prompt_name"] = prompt_name
+    vectors = embedder.encode(unique, **encode_kwargs)
     vectors = np.asarray(vectors, dtype=np.float32)
     return {text: vectors[i] for i, text in enumerate(unique)}
 
 
-def encode_groups(embedder: SentenceTransformer, groups: List[List[str]], batch_size: int):
-    """Match the checkpoint-era encoding order while deduplicating across groups."""
-    cache: Dict[str, np.ndarray] = {}
+def encode_groups(
+    embedder: SentenceTransformer,
+    groups: List[List[str]],
+    batch_size: int,
+    prompt_name: Optional[str] = None,
+):
+    """Deduplicate across all groups, then encode once in a single large batch stream."""
+    merged: List[str] = []
     seen: Set[str] = set()
     for group in groups:
-        pending = []
         for text in group:
             clean = norm_text(text)
             if clean and clean not in seen:
                 seen.add(clean)
-                pending.append(clean)
-        cache.update(encode_unique(embedder, pending, batch_size))
-    return cache
+                merged.append(clean)
+    return encode_unique(embedder, merged, batch_size, prompt_name=prompt_name)
+
+
+def load_text_embedder(
+    model_path: str,
+    profile: str,
+    *,
+    cpu: bool,
+) -> tuple[SentenceTransformer, Optional[str]]:
+    if profile == "sentence-transformer":
+        device = "cpu" if cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+        return SentenceTransformer(model_path, device=device), None
+    if profile != "qwen3-embedding-v2":
+        raise ValueError(f"Unsupported --st_encoding_profile: {profile}")
+
+    # Keep the DAG-side encode path aligned with Store KV base embedding generation.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    model = SentenceTransformer(
+        model_path,
+        model_kwargs={"device_map": "auto"},
+        tokenizer_kwargs={"padding_side": "left"},
+    )
+    device = "cpu" if cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    first_module = model._first_module() if hasattr(model, "_first_module") else None
+    if first_module is not None and hasattr(first_module, "half"):
+        first_module.half()
+    return model, "query"
 
 
 def identify_topics(question: str, names: List[str], node_emb: np.ndarray,
@@ -644,8 +686,9 @@ def export_dag(selected: Set[int], edges: Dict[int, KVEdge], keep_score: bool):
 # -----------------------------------------------------------------------------
 
 def score_and_export_contexts(args, contexts, cache, edge_model, node_model, ckpt,
-                              device, batch_outputs):
+                              device, batch_outputs, timing_stats=None):
     """Build/score only a bounded slice of samples to cap feature-block memory."""
+    stage_started = time.perf_counter()
     prepared = []
     for context in contexts:
         batch_pos, sample, question, names, edges, out_adj, in_adj = context
@@ -654,7 +697,10 @@ def score_and_export_contexts(args, contexts, cache, edge_model, node_model, ckp
             args.topic_top_k, args.dde_hops, args.mention_bonus,
         )
         prepared.append((context, topics, edge_feats, node_feats))
+    if timing_stats is not None:
+        timing_stats["feature_prepare"] += time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     edge_blocks, edge_meta, cursor = [], [], 0
     node_blocks, node_meta, node_cursor = [], [], 0
     for i, (_, _, edge_feats, node_feats) in enumerate(prepared):
@@ -672,7 +718,10 @@ def score_and_export_contexts(args, contexts, cache, edge_model, node_model, ckp
         edge_scores[i] = {eid: float(edge_all[pos + j]) for j, eid in enumerate(ids)}
     for i, ids, pos, length in node_meta:
         node_scores[i] = {nid: float(node_all[pos + j]) for j, nid in enumerate(ids)}
+    if timing_stats is not None:
+        timing_stats["model_score"] += time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     for i, (context, topics, edge_feats, _) in enumerate(prepared):
         batch_pos, sample, question, names, edges, out_adj, in_adj = context
         apply_joint_scores(edges, edge_scores[i], node_scores[i], args.end_alpha, args.end_beta, args.end_gamma)
@@ -701,14 +750,31 @@ def score_and_export_contexts(args, contexts, cache, edge_model, node_model, ckp
             },
         }}
         batch_outputs[batch_pos] = row
+    if timing_stats is not None:
+        timing_stats["select_export"] += time.perf_counter() - stage_started
 
 
 def infer(args, samples, embedder, edge_model, node_model, ckpt, device):
+    outputs, _ = infer_profiled(args, samples, embedder, edge_model, node_model, ckpt, device)
+    return outputs
+
+
+def infer_profiled(args, samples, embedder, edge_model, node_model, ckpt, device):
+    timing_stats = {
+        "build_graph": 0.0,
+        "encode": 0.0,
+        "feature_prepare": 0.0,
+        "model_score": 0.0,
+        "select_export": 0.0,
+        "total": 0.0,
+    }
+    total_started = time.perf_counter()
     outputs = []
     for start in tqdm(range(0, len(samples), args.infer_batch_size), desc="Create answer-blind DAG"):
         batch = samples[start:start + args.infer_batch_size]
         contexts, question_texts, doc_texts = [], [], []
         batch_outputs: List[Optional[Dict[str, Any]]] = [None] * len(batch)
+        stage_started = time.perf_counter()
         for batch_pos, sample in enumerate(batch):
             question = norm_text(sample.get("question", ""))
             names, edges, out_adj, in_adj = build_graph(sample)
@@ -723,20 +789,29 @@ def infer(args, samples, embedder, edge_model, node_model, ckpt, device):
             question_texts.append(question)
             doc_texts.extend(current_docs)
             contexts.append((batch_pos, sample, question, names, edges, out_adj, in_adj))
+        timing_stats["build_graph"] += time.perf_counter() - stage_started
         if not contexts:
             outputs.extend(row for row in batch_outputs if row is not None)
             continue
         embedding_batch_size = args.embedding_batch_size or args.infer_batch_size
-        cache = encode_groups(embedder, [question_texts, doc_texts], embedding_batch_size)
+        stage_started = time.perf_counter()
+        cache = encode_groups(
+            embedder,
+            [question_texts, doc_texts],
+            embedding_batch_size,
+            prompt_name=getattr(args, "st_prompt_name", None),
+        )
+        timing_stats["encode"] += time.perf_counter() - stage_started
         for feature_start in range(0, len(contexts), args.feature_batch_size):
             score_and_export_contexts(
                 args, contexts[feature_start:feature_start + args.feature_batch_size],
-                cache, edge_model, node_model, ckpt, device, batch_outputs,
+                cache, edge_model, node_model, ckpt, device, batch_outputs, timing_stats,
             )
         if any(row is None for row in batch_outputs):
             raise RuntimeError("Internal error: an input row did not receive a DAG")
         outputs.extend(row for row in batch_outputs if row is not None)
-    return outputs
+    timing_stats["total"] = time.perf_counter() - total_started
+    return outputs, timing_stats
 
 
 def build_parser():
@@ -746,6 +821,17 @@ def build_parser():
     ap.add_argument("--output", required=True)
     ap.add_argument("--model_ckpt", required=True)
     ap.add_argument("--st_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument(
+        "--st_encoding_profile",
+        choices=["sentence-transformer", "qwen3-embedding-v2"],
+        default="sentence-transformer",
+        help="How to load/encode --st_model. qwen3-embedding-v2 matches Store KV base encoding.",
+    )
+    ap.add_argument(
+        "--st_prompt_name",
+        default=None,
+        help="Optional SentenceTransformer prompt_name. For qwen3-embedding-v2 this defaults to query.",
+    )
     ap.add_argument("--infer_batch_size", type=int, default=4096)
     ap.add_argument("--embedding_batch_size", type=int, default=None,
                     help="Sentence-transformer encode batch size; defaults to infer_batch_size")
@@ -792,7 +878,13 @@ def main():
         raise RuntimeError(f"Another inference process already owns {lock_path}") from exc
     lock_file.write(str(os.getpid()) + "\n")
     lock_file.flush()
-    embedder = SentenceTransformer(args.st_model)
+    embedder, default_prompt_name = load_text_embedder(
+        args.st_model,
+        args.st_encoding_profile,
+        cpu=args.cpu,
+    )
+    if args.st_prompt_name is None:
+        args.st_prompt_name = default_prompt_name
     edge_model, node_model, ckpt, device = load_models(args.model_ckpt, args.cpu)
     total_input = total_output = nonempty = total_nodes = 0
 
