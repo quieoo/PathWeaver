@@ -247,21 +247,28 @@ class DAGKVKBRetriever:
         kb_keys = kb_keys.to(dev)
         kb_vals = kb_vals.to(dev)
 
-        nz = np.where(adj > 0)
-        if nz[0].size == 0:
-            indices = torch.empty((2, 0), dtype=torch.long, device=dev)
-            values = torch.empty((0,), dtype=kb_keys.dtype, device=dev)
+        if dev.type == "npu":
+            # NPU does not support all sparse COO/CSR dtype conversions used
+            # by path attention. DAGs used for single-sample inference are
+            # small, so use the equivalent dense matmul path only on NPU.
+            kb_adj = torch.as_tensor(adj, dtype=kb_keys.dtype, device=dev)
         else:
-            indices = torch.tensor(np.vstack(nz), dtype=torch.long, device=dev)
-            values = torch.tensor(adj[nz], dtype=kb_keys.dtype, device=dev)
+            # Preserve the original sparse COO representation on CUDA/CPU.
+            nz = np.where(adj > 0)
+            if nz[0].size == 0:
+                indices = torch.empty((2, 0), dtype=torch.long, device=dev)
+                values = torch.empty((0,), dtype=kb_keys.dtype, device=dev)
+            else:
+                indices = torch.tensor(np.vstack(nz), dtype=torch.long, device=dev)
+                values = torch.tensor(adj[nz], dtype=kb_keys.dtype, device=dev)
 
-        kb_adj = torch.sparse_coo_tensor(
-            indices,
-            values,
-            (adj.shape[0], adj.shape[1]),
-            dtype=kb_keys.dtype,
-            device=dev,
-        ).coalesce()
+            kb_adj = torch.sparse_coo_tensor(
+                indices,
+                values,
+                (adj.shape[0], adj.shape[1]),
+                dtype=kb_keys.dtype,
+                device=dev,
+            ).coalesce()
 
         return kb_keys, kb_vals, kb_adj
 

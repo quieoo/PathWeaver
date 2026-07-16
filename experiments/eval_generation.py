@@ -8,8 +8,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import evaluate
-import nltk
 import numpy as np
 import torch
 import transformers
@@ -24,6 +22,7 @@ from kblam.models.olmo3.kblam_olmo3_attention import load_kblam_olmo3_model, rep
 from kblam.models.qwen3.kblam_qwen3_attention import (
     load_kblam_qwen3_model,
     load_qwen3_query_head,
+    resolve_runtime_device,
 )
 from kblam.models.qwen3.kblam_qwen3_moe_attention import (
     load_kblam_qwen3_moe_model,
@@ -65,6 +64,9 @@ from kblam.models.llama3_model import kblam_profile_get, kblam_profile_reset
 from kblam.autoschemakg_kb_retriever import AutoSchemaKGKBRetriever
 from kblam.dag_kv_retriever import DAGKVKBRetriever
 logging.set_verbosity_warning()
+# Preserve the original CUDA default. Set DAG_KV_DEVICE=npu explicitly to
+# activate the Ascend-specific execution path.
+RUNTIME_DEVICE = resolve_runtime_device(os.getenv("DAG_KV_DEVICE", "cuda"))
 
 
 def _get_kb_encoder_out_dim(model_config, kb_layer_frequency: int) -> int:
@@ -127,7 +129,7 @@ def _prepare_models(
         model = load_kblam_qwen3_model(
             base_model_dir=llm_base_dir,
             checkpoint_dir=model_path,
-            device="cuda",
+            device=RUNTIME_DEVICE,
         )
         if query_head_path:
             load_qwen3_query_head(model, query_head_path)
@@ -168,11 +170,22 @@ def _prepare_models(
         out_dim=_get_kb_encoder_out_dim(model.config, kb_layer_frequency),
         frozen_base_model=True,
         projector_kwargs={"mlp_depth": 1, "mlp_hidden_dim": 512},
-        device=torch.device("cuda"),
+        device=RUNTIME_DEVICE,
     )
     # print(f"encoder out_dim: {model.config.hidden_size
         # * (model.config.num_hidden_layers // kb_layer_frequency + 1)}")
-    encoder.load_state_dict(torch.load(encoder_path, weights_only=True))
+    if RUNTIME_DEVICE.type == "npu":
+        # A CUDA-saved checkpoint cannot be deserialized directly by
+        # torch_npu. Load its storage on CPU, then copy it into the NPU model.
+        encoder_state_dict = torch.load(
+            encoder_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    else:
+        # Preserve the original CUDA/CPU checkpoint-loading behavior.
+        encoder_state_dict = torch.load(encoder_path, weights_only=True)
+    encoder.load_state_dict(encoder_state_dict)
     return tokenizer, encoder, model, kb_config
 
 
@@ -419,12 +432,12 @@ def _perform_eval_batched(
                 # kb_keys, kb_vals = kb_retriever.get_kb_batch_by_hnsw(questions, kb_size, device=torch.device("cuda"), true_indices=batch_idx)
                 # kb_keys, kb_vals = kb_retriever.get_kb_batch_by_hnsw(questions, topk=1, device=torch.device("cuda"))
                 # top-1 加 随机KB
-                kb_keys, kb_vals = kb_retriever.get_kb_batch_by_hnsw(questions, topk=1, device=torch.device("cuda"), random_sample=kb_size-1)
+                kb_keys, kb_vals = kb_retriever.get_kb_batch_by_hnsw(questions, topk=1, device=RUNTIME_DEVICE, random_sample=kb_size-1)
             else:
                 if dataset_type == "all_triples":
                     kb_keys, kb_vals = kb_retriever.get_all_triples_embeddings_batch(
                         batch_idx,
-                        device=torch.device("cuda"),
+                        device=RUNTIME_DEVICE,
                     )
                 else:
                     kb_keys, kb_vals = kb_retriever.get_key_embeddings(batch_idx)
@@ -433,7 +446,7 @@ def _perform_eval_batched(
                 rerank_policy=2
                 print(f"[Retrieve] rerank_policy={rerank_policy}")
                 questions = [row["Q"] for row in batch]
-                kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, ann_topk=10, rerank_topk=1, rerank_policy=rerank_policy, device=torch.device("cuda"), random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
+                kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_adj_batch_by_hnsw(questions, ann_topk=10, rerank_topk=1, rerank_policy=rerank_policy, device=RUNTIME_DEVICE, random_sample=kb_size-1, hop_num=2, true_indices=batch_idx)
             else:
                 if "autoschemakg" in dataset_type:
                     kb_keys, kb_vals, kb_adj = kb_retriever.get_kb_embedding_s(
@@ -475,12 +488,12 @@ def _perform_eval_batched(
                             sample_ids = [int(idx), *distractor_ids]
                             k, v, a = kb_retriever.get_kb_embedding_s(
                                 sample_ids,
-                                device=torch.device("cuda"),
+                                device=RUNTIME_DEVICE,
                             )
                         else:
                             k, v, a = kb_retriever.get_kb_embedding(
                                 idx,
-                                device=torch.device("cuda"),
+                                device=RUNTIME_DEVICE,
                             )
                         kb_keys.append(k)
                         kb_vals.append(v)

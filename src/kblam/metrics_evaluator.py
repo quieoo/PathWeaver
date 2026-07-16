@@ -12,11 +12,11 @@ except ImportError:
     _HAS_NUMPY = False
 
 try:
-    import evaluate
-    _HAS_EVALUATE = True
+    from rouge_score import rouge_scorer
+    _HAS_ROUGE_SCORE = True
 except ImportError:
-    evaluate = None
-    _HAS_EVALUATE = False
+    rouge_scorer = None
+    _HAS_ROUGE_SCORE = False
 
 # Faithfulness 本地嵌入模型
 try:
@@ -79,6 +79,29 @@ def f1_overlap(prediction: str, reference: str) -> float:
     precision = len(common) / len(pred_tokens)
     recall = len(common) / len(ref_tokens)
     return 2 * precision * recall / (precision + recall)
+
+
+def calculate_rouge_local(
+    model_outputs: list[str], references: list[str]
+) -> dict[str, float]:
+    """Compute mean ROUGE F1 locally without Hugging Face downloads."""
+    if not _HAS_ROUGE_SCORE:
+        raise ImportError("rouge_score is not installed")
+    if len(model_outputs) != len(references):
+        raise ValueError("model_outputs and references must have the same length")
+    if not model_outputs:
+        raise ValueError("model_outputs must not be empty")
+
+    metric_names = ("rouge1", "rouge2", "rougeL")
+    scorer = rouge_scorer.RougeScorer(metric_names, use_stemmer=True)
+    per_sample_scores = [
+        scorer.score(reference, prediction)
+        for prediction, reference in zip(model_outputs, references)
+    ]
+    return {
+        metric: _mean([score[metric].fmeasure for score in per_sample_scores])
+        for metric in metric_names
+    }
 
 
 def compute_faithfulness_local(model_outputs, references):
@@ -356,12 +379,7 @@ def evaluate_model_outputs(
     # --- ROUGE ---
     try:
         print("Calculating ROUGE scores...")
-        if not _HAS_EVALUATE:
-            raise ImportError("evaluate is not installed")
-        rouge = evaluate.load("rouge")
-        rouge_scores = rouge.compute(predictions=model_outputs, references=references)
-        for key, value in rouge_scores.items():
-            results_dict[key] = float(value)
+        results_dict.update(calculate_rouge_local(model_outputs, references))
         print("✅ ROUGE computed successfully.")
     except Exception as e:
         print(f"❌ Error calculating ROUGE: {e}")
@@ -674,12 +692,7 @@ def simple_evaluation(model_outputs: list[str], references: list[str], lang: str
 
     # --- ROUGE ---
     try:
-        if not _HAS_EVALUATE:
-            raise ImportError("evaluate is not installed")
-        rouge = evaluate.load("rouge")
-        rouge_scores = rouge.compute(predictions=model_outputs, references=references)
-        for key, value in rouge_scores.items():
-            results_dict[key] = float(value)
+        results_dict.update(calculate_rouge_local(model_outputs, references))
     except Exception as e:
         print(f"❌ Error calculating ROUGE: {e}")
     

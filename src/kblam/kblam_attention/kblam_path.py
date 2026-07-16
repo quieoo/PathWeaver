@@ -255,6 +255,19 @@ def get_cached_adj_t(kb_adj, *, K, device, dtype):
     return _PATH_ADJ_CACHE[key]
 
 
+def _sparse_adj_to_dense_for_npu(kb_adj, *, device, dtype):
+    """Materialize a COO adjacency without NPU sparse dtype conversion."""
+    adj = kb_adj.coalesce()
+    dense = torch.zeros(tuple(adj.size()), device=device, dtype=dtype)
+    indices = adj.indices()
+    dense.index_put_(
+        tuple(indices[axis] for axis in range(indices.size(0))),
+        adj.values().to(device=device, dtype=dtype),
+        accumulate=True,
+    )
+    return dense
+
+
 def _apply_kblam_path_attention_impl(
     *,
     attn_weights: torch.Tensor,   # (B,H,Q,K_total)
@@ -276,7 +289,19 @@ def _apply_kblam_path_attention_impl(
     alpha_kb = attn_weights[..., :kb_len]
     B, H, Q, K = alpha_kb.shape
 
-    if kb_adj.is_sparse:
+    if kb_adj.is_sparse and alpha_kb.device.type == "npu":
+        # torch_npu does not implement every sparse COO/CSR operation used by
+        # the CUDA fast path. On NPU, use an equivalent dense adjacency for
+        # every DAG shape, including batched block-diagonal graphs.
+        A = _sparse_adj_to_dense_for_npu(
+            kb_adj,
+            device=alpha_kb.device,
+            dtype=alpha_kb.dtype,
+        )
+        if A.size(-1) != K:
+            A = A[..., :K, :K]
+        beta_kb = alpha_kb @ A
+    elif kb_adj.is_sparse:
         idx = kb_adj.indices()
         if idx.size(0) == 2:
             M = B * H * Q

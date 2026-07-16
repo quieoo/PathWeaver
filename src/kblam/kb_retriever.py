@@ -5,7 +5,11 @@ import random
 from kblam.kb_encoder import KBEncoder
 from kblam.utils.train_utils import context_set_size_scheduler, get_kb_embd
 
-import hnswlib
+try:
+    import hnswlib
+except ImportError:
+    hnswlib = None
+
 import json
 from pathlib import Path
 from tqdm import tqdm
@@ -664,6 +668,12 @@ class KBRetriever:
         """
         Build HNSW index and save to disk.
         """
+        if hnswlib is None:
+            raise ImportError(
+                "HNSW retrieval requires the optional dependency 'hnswlib'. "
+                "Install it with: pip install hnswlib"
+            )
+
         assert self._use_cached_embd(), "HNSW requires cached embeddings"
 
         if not os.path.isdir(self.hnsw_index_path):
@@ -717,6 +727,12 @@ class KBRetriever:
         """
         Load prebuilt HNSW index from disk.
         """
+        if hnswlib is None:
+            raise ImportError(
+                "HNSW retrieval requires the optional dependency 'hnswlib'. "
+                "Install it with: pip install hnswlib"
+            )
+
         index_path = os.path.join(self.hnsw_index_path, "hnsw.index")
         meta_path = os.path.join(self.hnsw_index_path, "hnsw.meta.json")
 

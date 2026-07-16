@@ -3,17 +3,35 @@ import os
 import sys
 from pathlib import Path
 
-from azure.identity import (
-    AuthenticationRecord,
-    DeviceCodeCredential,
-    TokenCachePersistenceOptions,
-    get_bearer_token_provider,
-)
-from openai import AzureOpenAI
-from openai import OpenAI
+try:
+    from azure.identity import (
+        AuthenticationRecord,
+        DeviceCodeCredential,
+        TokenCachePersistenceOptions,
+        get_bearer_token_provider,
+    )
+except ImportError:
+    AuthenticationRecord = None
+    DeviceCodeCredential = None
+    TokenCachePersistenceOptions = None
+    get_bearer_token_provider = None
+
+try:
+    from openai import AzureOpenAI, OpenAI
+except ImportError:
+    AzureOpenAI = None
+    OpenAI = None
 from tqdm import tqdm
 
 valid_models = ["gpt-4o", "ada-embeddings", "text-embedding-3-large"]
+
+
+def _require_dependency(dependency, feature: str, package: str) -> None:
+    if dependency is None:
+        raise ImportError(
+            f"{feature} requires the optional package '{package}'. "
+            f"Install it with: pip install {package}"
+        )
 
 class ALI_Embedding:
     def __init__(
@@ -23,6 +41,7 @@ class ALI_Embedding:
         batch_size: int = 10,
         dimensions: int = 1024,
     ):
+        _require_dependency(OpenAI, "Aliyun embedding generation", "openai")
         self.model_name = model_name
         self.api_key = api_key
         self.batch_size = batch_size
@@ -66,6 +85,10 @@ class GPT:
         presence_penalty: int = 0,
         seed: int = None,
     ):
+        _require_dependency(
+            get_bearer_token_provider, "Azure OpenAI access", "azure-identity"
+        )
+        _require_dependency(AzureOpenAI, "Azure OpenAI access", "openai")
         if model_name not in valid_models:
             raise ValueError(
                 f"Invalid model: {model_name}. Valid models are: {valid_models}"

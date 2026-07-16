@@ -5,7 +5,7 @@ import copy
 import json
 import os
 import types
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,41 @@ from kblam.kblam_attention import (
 )
 from kblam.kblam_attention.kblam_injector import apply_kblam_sep_query_head
 from kblam.models.kblam_config import KBLaMConfig
+
+
+DeviceLike = Union[str, torch.device, None]
+
+
+def resolve_runtime_device(device: DeviceLike = None) -> torch.device:
+    """Resolve and validate a CUDA, Ascend NPU, or CPU device."""
+    if device is None:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            return torch.device("cpu")
+        if torch.npu.is_available():
+            return torch.device("npu")
+        return torch.device("cpu")
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but no CUDA device is available.")
+        return resolved
+
+    if resolved.type == "npu":
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Ascend NPU was requested but torch_npu is not installed."
+            ) from exc
+        if not torch.npu.is_available():
+            raise RuntimeError("Ascend NPU was requested but no NPU device is available.")
+
+    return resolved
 
 
 def replace_attention_with_kblam(model):
@@ -192,7 +227,7 @@ def load_kblam_qwen3_model(
     *,
     base_model_dir: str,
     checkpoint_dir: str | None,
-    device: str = "cuda",
+    device: DeviceLike = None,
     dtype: torch.dtype = torch.bfloat16,
 ):
     """
@@ -204,11 +239,12 @@ def load_kblam_qwen3_model(
       3. optionally load trained checkpoint
       4. assert integrity
     """
+    runtime_device = resolve_runtime_device(device)
     model = AutoModelForCausalLM.from_pretrained(
         base_model_dir,
         torch_dtype=dtype,
         trust_remote_code=True,
-    ).to(device)
+    ).to(runtime_device)
 
     if hasattr(model, "set_attn_implementation"):
         model.set_attn_implementation("eager")
